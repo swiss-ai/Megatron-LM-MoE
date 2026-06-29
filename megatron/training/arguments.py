@@ -3314,8 +3314,17 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--variable-seq-lengths', action='store_true',
+                       help='Compute the length of the tensor you send in PP groups.'
+                       'Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--use-packed-seq-params', action='store_true',
+                       help='Use EOD (End-of-Document) tokens to compute packed sequence parameters. '
+                       'When enabled, attention masking will respect document boundaries marked by '
+                       'EOD tokens, preventing cross-document attention in packed sequences. '
+                       'This is needed because Megatron currently does not use the attention mask from '
+                       'the dataloader (it is ignored), and using it would be inefficient.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
