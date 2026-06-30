@@ -327,10 +327,9 @@ class _ParamAndGradBucketGroup:
             # param gather.
             #
             # Each rank may own a different number of params per bucket, so
-            # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
-            # backend handles uneven tensor sizes in torch.distributed.all_gather
-            # (falling back to grouped send/recv internally when sizes differ),
-            # so no manual padding is needed.
+            # layerwise_param_flat_sizes can vary across ranks. GPU-resident params use
+            # uneven torch.distributed.all_gather below; CPU-offloaded expert params stage
+            # through padded CUDA scratch buffers so the collective is a NCCL all-gather.
             dp_size = self.intra_distributed_optimizer_instance_size
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
@@ -343,6 +342,57 @@ class _ParamAndGradBucketGroup:
                 if max(bucket.layerwise_param_flat_sizes) == 0:
                     # All ranks have empty params for this bucket — skip.
                     bucket.layerwise_gather_list = None
+                    continue
+
+                has_cpu_params = any(
+                    p.device.type == "cpu"
+                    for shard_params in bucket.layerwise_params_list
+                    for p in shard_params
+                )
+                if has_cpu_params:
+                    assert all(
+                        p.device.type == "cpu"
+                        for shard_params in bucket.layerwise_params_list
+                        for p in shard_params
+                    ), "Layer-wise CPU param gather expects a CPU-only bucket"
+
+                    # Offloaded expert weights are CPU-resident, but the DP/EDP process
+                    # groups used by DDP are NCCL groups. Stage synchronously through CUDA:
+                    # CPU -> GPU scratch, sync NCCL all-gather, GPU -> CPU copies.
+                    local_size = bucket.layerwise_param_flat_sizes[local_rank]
+                    max_size = max(bucket.layerwise_param_flat_sizes)
+                    device = torch.cuda.current_device()
+                    flat_local_params = torch.empty(max_size, device=device, dtype=param_dtype)
+                    if local_size > 0:
+                        flat_cpu_params = _flatten_dense_tensors(
+                            bucket.layerwise_params_list[local_rank]
+                        ).detach()
+                        flat_local_params[:local_size].copy_(
+                            flat_cpu_params, non_blocking=False
+                        )
+                    if local_size < max_size:
+                        flat_local_params[local_size:].zero_()
+
+                    gather_flat = torch.empty(
+                        dp_size * max_size, device=device, dtype=param_dtype
+                    )
+                    dist_all_gather_func(
+                        gather_flat, flat_local_params, group=group, async_op=False
+                    )
+
+                    for idx, params in enumerate(bucket.layerwise_params_list):
+                        if len(params) == 0 or idx == local_rank:
+                            continue
+                        shard_start = idx * max_size
+                        shard_end = shard_start + bucket.layerwise_param_flat_sizes[idx]
+                        updated_params = _unflatten_dense_tensors(
+                            gather_flat[shard_start:shard_end], params
+                        )
+                        for updated_p, model_p in zip(updated_params, params):
+                            model_p.data.copy_(updated_p, non_blocking=False)
+
+                    bucket.layerwise_gather_list = None
+                    bucket._layerwise_src_buffer = None
                     continue
 
                 # Flatten local params.  Detach from the autograd graph because

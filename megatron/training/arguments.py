@@ -855,8 +855,8 @@ def validate_args(args, defaults={}):
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer or args.use_megatron_fsdp \
-            or args.optimizer == 'dist_muon', \
-            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+            or args.optimizer == 'dist_muon' or args.optimizer == 'md_decoupling', \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, dist_muon, or layer-wise distributed optimizer'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
