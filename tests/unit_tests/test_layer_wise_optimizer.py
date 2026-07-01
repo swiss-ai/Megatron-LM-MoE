@@ -60,6 +60,58 @@ class TinyModel(nn.Module):
         return self.fc1(x)
 
 
+def test_bucket_layerwise_params_list_handles_singleton_groups(monkeypatch):
+    """Async bucket metadata should be initialized for singleton DP/expert-DP groups."""
+
+    class FakeBucket:
+        def __init__(self, params):
+            self.params_list = params
+            self.params = set(params)
+            self.layerwise_params_list = None
+            self.layerwise_param_flat_sizes = None
+
+        def set_layerwise_params_list(self, layerwise_params_list):
+            self.layerwise_params_list = layerwise_params_list
+            self.layerwise_param_flat_sizes = [
+                sum(p.numel() for p in params) for params in layerwise_params_list
+            ]
+
+    class FakeBucketGroup:
+        def __init__(self, bucket):
+            self.buckets = [bucket]
+
+    dense_param = nn.Parameter(torch.empty(2, 3))
+    expert_param = nn.Parameter(torch.empty(4, 5))
+    dense_bucket = FakeBucket([dense_param])
+    expert_bucket = FakeBucket([expert_param])
+    model_chunk = type(
+        "FakeModelChunk",
+        (),
+        {
+            "bucket_groups": [FakeBucketGroup(dense_bucket)],
+            "expert_parallel_bucket_groups": [FakeBucketGroup(expert_bucket)],
+        },
+    )()
+
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = type(
+        "FakePGCollection", (), {"dp_cp": object(), "expt_dp": object()}
+    )()
+    optimizer.dp_cp_params_list = None
+    optimizer.expt_dp_params_list = None
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.get_pg_size", lambda group: 1
+    )
+
+    optimizer.set_bucket_layerwise_params_list([model_chunk])
+
+    assert dense_bucket.layerwise_params_list[0][0] is dense_param
+    assert dense_bucket.layerwise_param_flat_sizes == [dense_param.numel()]
+    assert expert_bucket.layerwise_params_list[0][0] is expert_param
+    assert expert_bucket.layerwise_param_flat_sizes == [expert_param.numel()]
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )

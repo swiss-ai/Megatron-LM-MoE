@@ -333,11 +333,26 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
+            if dp_size == 1:
+                self.param_gather_handle = None
+                self.param_gather_dispatched = True
+                return
+
             layerwise_work_handles = []
             for bucket in self.buckets:
                 # Use param dtype (e.g., bf16), NOT grad dtype (which may be
                 # fp32 when grad_reduce_in_fp32 is enabled).
                 param_dtype = bucket.params_list[0].dtype
+
+                if (
+                    bucket.layerwise_params_list is None
+                    or bucket.layerwise_param_flat_sizes is None
+                ):
+                    raise RuntimeError(
+                        "Layer-wise parameter sync is missing per-rank bucket metadata. "
+                        "This bucket group was not initialized by "
+                        "LayerWiseDistributedOptimizer.set_bucket_layerwise_params_list()."
+                    )
 
                 if max(bucket.layerwise_param_flat_sizes) == 0:
                     # All ranks have empty params for this bucket — skip.

@@ -165,31 +165,42 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Args:
             model_chunks: DDP-wrapped model chunks with bucket_groups.
         """
+        def _set_bucket_params_list(bucket, sharded_params_list, group_size, group_name):
+            bucket_params_list = [[] for _ in range(group_size)]
+            if sharded_params_list is None:
+                if group_size == 1:
+                    bucket_params_list[0].extend(bucket.params_list)
+                    bucket.set_layerwise_params_list(bucket_params_list)
+                    return
+                raise RuntimeError(
+                    "Layer-wise async all-gather is missing sharded parameter lists "
+                    f"for a non-singleton {group_name} bucket group"
+                )
+
+            for bucket_list, full_params_list in zip(bucket_params_list, sharded_params_list):
+                for param in full_params_list:
+                    if param in bucket.params:
+                        bucket_list.append(param)
+            bucket.set_layerwise_params_list(bucket_params_list)
+
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
                 for bucket in group.buckets:
-                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
-                    for bucket_list, full_params_list in zip(
-                        bucket_params_list, self.dp_cp_params_list
-                    ):
-                        for param in full_params_list:
-                            if param in bucket.params:
-                                bucket_list.append(param)
-                    bucket.set_layerwise_params_list(bucket_params_list)
+                    _set_bucket_params_list(
+                        bucket,
+                        self.dp_cp_params_list,
+                        get_pg_size(self.pg_collection.dp_cp),
+                        "data-parallel",
+                    )
             # Do the same for expert parallel bucket groups.
-            if self.expt_dp_params_list is not None:
-                for group in model_chunk.expert_parallel_bucket_groups:
-                    for bucket in group.buckets:
-                        bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
-                        ]
-                        for bucket_list, full_params_list in zip(
-                            bucket_params_list, self.expt_dp_params_list
-                        ):
-                            for param in full_params_list:
-                                if param in bucket.params:
-                                    bucket_list.append(param)
-                        bucket.set_layerwise_params_list(bucket_params_list)
+            for group in model_chunk.expert_parallel_bucket_groups:
+                for bucket in group.buckets:
+                    _set_bucket_params_list(
+                        bucket,
+                        self.expt_dp_params_list,
+                        get_pg_size(self.pg_collection.expt_dp),
+                        "expert data-parallel",
+                    )
 
     @torch.no_grad()
     def allgather_params(self) -> None:
