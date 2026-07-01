@@ -291,26 +291,33 @@ class _MDDecouplingBase(torch.optim.Optimizer):
     def _orthogonalize_param(self, p, grad, is_qkv: bool = False, flat_mode: bool = False):
         """Newton-Schulz orthogonalization, with optional QKV split. ``flat_mode`` enables the
         init-radius rescale (see _init_radius_scale); it is per-block so Q/K/V get their own factor
-        under split_qkv."""
+        under split_qkv. ``global_partition_dim`` (the param's real shard dim, before blockwise nulls
+        it for NS) lets that rescale use GLOBAL matrix sizes, so it matches the global projection
+        sphere under every tp_mode."""
         if self.pg_collection is not None:
             tp_group = (self.pg_collection.expt_tp
                         if getattr(p, "expert_tp", False)
                         else self.pg_collection.tp)
         else:
             tp_group = None
-        partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            partition_dim = None
+        # Real shard dim of the weight (drives the GLOBAL size for the init rescale). blockwise then
+        # nulls partition_dim for NS so each shard is orthogonalized as a standalone matrix; other
+        # modes run TP-distributed NS with the real shard dim.
+        global_partition_dim = getattr(p, "partition_dim", None)
+        if global_partition_dim == -1:
+            global_partition_dim = None
+        partition_dim = None if self.tp_mode == "blockwise" else global_partition_dim
 
         if self.split_qkv and is_qkv:
             qs, ks, vs = _split_qkv(grad, self.qkv_split_shapes)
-            qs = self._orthogonalize_tensor(qs, tp_group, partition_dim, flat_mode)
-            ks = self._orthogonalize_tensor(ks, tp_group, partition_dim, flat_mode)
-            vs = self._orthogonalize_tensor(vs, tp_group, partition_dim, flat_mode)
+            qs = self._orthogonalize_tensor(qs, tp_group, partition_dim, flat_mode, global_partition_dim)
+            ks = self._orthogonalize_tensor(ks, tp_group, partition_dim, flat_mode, global_partition_dim)
+            vs = self._orthogonalize_tensor(vs, tp_group, partition_dim, flat_mode, global_partition_dim)
             return _merge_qkv((qs, ks, vs), grad.shape, self.qkv_split_shapes)
-        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode)
+        return self._orthogonalize_tensor(grad, tp_group, partition_dim, flat_mode, global_partition_dim)
 
-    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False):
+    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, flat_mode: bool = False,
+                              global_partition_dim=None):
         assert grad.ndim == 2
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
@@ -325,7 +332,15 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         )
         scale = _get_muon_scale_factor(size[0], size[1], mode=self.scale_mode)
         if flat_mode:
-            scale *= self._init_radius_scale(size[0], size[1])
+            # The init-radius rescale is a GLOBAL-sphere concept, so it must use the full matrix
+            # shape even when blockwise nulled partition_dim for NS (size above would then be local).
+            # Matches the projection side, which always globalizes. Same tp_group as NS, so TP=1 and
+            # the distributed/duplicated modes (where global_partition_dim == partition_dim) are
+            # unchanged.
+            gsize = [grad.size(-2), grad.size(-1)]
+            if global_partition_dim is not None and tp_group is not None:
+                gsize[global_partition_dim] *= get_pg_size(tp_group)
+            scale *= self._init_radius_scale(gsize[0], gsize[1])
         return orth * scale * self.extra_scale_factor
 
     def _resolve_mode(self, is_embedding: bool, is_router: bool = False):
