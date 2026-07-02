@@ -118,6 +118,13 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
     Returns (packed_seq_params, modified_batch).
     """
     qkv_format = 'thd'
+
+    # MBS>1: fold (mbs, seq) sequence tensors into one (1, mbs*seq) THD stream
+    if batch["tokens"].shape[0] > 1:
+        for _k in ("tokens", "labels", "loss_mask", "position_ids"):
+            if batch.get(_k) is not None:
+                batch[_k] = batch[_k].reshape(1, -1)
+
     tokens_full_flat = batch["tokens"].view(1, -1)
     total_tokens = tokens_full_flat.size(-1)
 
@@ -126,6 +133,7 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
         torch.arange(0, total_tokens + args.seq_length, args.seq_length, device=device, dtype=torch.int32),
         (tokens_full_flat.flatten() == tokenizer.eod).nonzero()[:, 0].int() + 1)))
         )
+    cu_seq = cu_seq[cu_seq <= total_tokens]
 
     # Step 1b: merge sub-sequences that are too short for CP
     if cp_size > 1:
@@ -345,15 +353,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # Path 1: xdoc packing via --use-packed-seq-params
     if use_xdoc:
-        # THD packing folds the micro-batch into the token dimension, so there is
-        # no batch axis in the packed layout.  micro_batch_size must be 1; with
-        # mbs > 1 the tokens flatten to (1, mbs*seq) while labels stay
-        # (seq, mbs), producing a shape mismatch deep in the loss kernel.
-        assert args.micro_batch_size == 1, (
-            "--use-packed-seq-params (THD cross-document packing) requires "
-            "--micro-batch-size 1 (got {}). Increase --global-batch-size or "
-            "gradient accumulation instead.".format(args.micro_batch_size)
-        )
+
         device = torch.cuda.current_device()
 
         # Middle PP stages (and not MTP): compute packed_seq_params from the
@@ -415,7 +415,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if cu_seqlens is not None:
         assert (
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-        ), "micro-batch-size must be 1 for packing"
+        ), "cu_seqlens must be (1, N) after flatten_batch_for_packed_sequences"
         cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
 
@@ -463,6 +463,7 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
+
 
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
@@ -538,7 +539,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params,
                 )
-                
+
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
