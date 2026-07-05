@@ -140,9 +140,9 @@ def _per_token_cast_to_fp8_kernel(
     gran_k: tl.constexpr,
     use_ue8m0: tl.constexpr,
 ):
-    """Each program handles one group (gran_k columns) for BLOCK_M rows."""
-    group_idx = tl.program_id(0)
-    row_start = tl.program_id(1) * BLOCK_M
+    """Each program handles BLOCK_M rows for one group (gran_k columns)."""
+    row_start = tl.program_id(0) * BLOCK_M
+    group_idx = tl.program_id(1)
 
     rows = row_start + tl.arange(0, BLOCK_M)
     cols = group_idx * gran_k + tl.arange(0, gran_k)
@@ -208,8 +208,14 @@ def per_token_cast_to_fp8(
     x_fp8 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
     sf = torch.empty((m, num_groups), dtype=torch.float32, device=x.device)
 
+    if m == 0 or num_groups == 0:
+        if use_packed_ue8m0:
+            sf = pack_ue8m0_to_int(sf)
+        return x_fp8, sf
+
     BLOCK_M = 4
-    grid = (num_groups, triton.cdiv(m, BLOCK_M))
+    row_blocks = triton.cdiv(m, BLOCK_M)
+    grid = (row_blocks, num_groups)
 
     _per_token_cast_to_fp8_kernel[grid](
         x, x_fp8, sf,
@@ -262,7 +268,12 @@ def per_token_cast_to_fp8_chunked(
             dtype=torch.float32,
             device=x.device,
         )
-        grid = (num_groups, triton.cdiv(cm, BLOCK_M))
+        if cm == 0:
+            sf_chunks.append(sf)
+            continue
+
+        row_blocks = triton.cdiv(cm, BLOCK_M)
+        grid = (row_blocks, num_groups)
         _per_token_cast_to_fp8_kernel[grid](
             xc, fp8c, sf,
             cm, n, padded_n,
@@ -294,16 +305,16 @@ def _per_token_cast_to_fp8_chunked_fused_kernel(
     gran_k: tl.constexpr,
     use_ue8m0: tl.constexpr,
 ):
-    """Fused per-chunk quantize. Grid = (num_groups, num_chunks, ceil(max_cm/BLOCK_M)).
+    """Fused per-chunk quantize. Grid = (ceil(max_cm/BLOCK_M), num_chunks, num_groups).
 
     Each program handles one (chunk, row-tile, column-group). Programs whose
     local_rows fall past the chunk's cm are masked out and become no-ops.
     Scale factors are written into a flat fp32 buffer at per-chunk offsets with
     strides ``(1, align(cm, 4))`` — MN-major TMA-aligned for DeepGEMM.
     """
-    group_idx = tl.program_id(0)
+    row_tile  = tl.program_id(0)
     chunk_id  = tl.program_id(1)
-    row_tile  = tl.program_id(2)
+    group_idx = tl.program_id(2)
 
     cm        = tl.load(chunk_sizes_ptr      + chunk_id)
     row_start = tl.load(chunk_row_starts_ptr + chunk_id)
@@ -391,17 +402,19 @@ def per_token_cast_to_fp8_chunked_fused(
     sf_flat  = torch.empty(total_sf_size, dtype=torch.float32, device=x.device)
 
     BLOCK_M = 4
-    grid = (num_groups, num_chunks, triton.cdiv(max_cm, BLOCK_M))
-    _per_token_cast_to_fp8_chunked_fused_kernel[grid](
-        x, fp8_full, sf_flat,
-        chunk_sizes_cuda, chunk_row_starts_cuda,
-        sf_offsets_cuda, sf_strides_cuda,
-        n, padded_n,
-        x.stride(0), fp8_full.stride(0),
-        BLOCK_M=BLOCK_M,
-        gran_k=gran_k,
-        use_ue8m0=use_ue8m0,
-    )
+    row_blocks = triton.cdiv(max_cm, BLOCK_M)
+    grid = (row_blocks, num_chunks, num_groups)
+    if max_cm != 0:
+        _per_token_cast_to_fp8_chunked_fused_kernel[grid](
+            x, fp8_full, sf_flat,
+            chunk_sizes_cuda, chunk_row_starts_cuda,
+            sf_offsets_cuda, sf_strides_cuda,
+            n, padded_n,
+            x.stride(0), fp8_full.stride(0),
+            BLOCK_M=BLOCK_M,
+            gran_k=gran_k,
+            use_ue8m0=use_ue8m0,
+        )
 
     fp8_chunks = list(torch.split(fp8_full, chunk_sizes, dim=0))
     sf_chunks = [
@@ -431,8 +444,8 @@ def _per_token_dequant_from_fp8_kernel(
     Each program handles one group (gran_k columns) for BLOCK_M rows.
     out[i, j] = x_fp8[i, j].to(fp32) * sf[i, j // gran_k]
     """
-    group_idx = tl.program_id(0)
-    row_start = tl.program_id(1) * BLOCK_M
+    row_start = tl.program_id(0) * BLOCK_M
+    group_idx = tl.program_id(1)
 
     rows = row_start + tl.arange(0, BLOCK_M)
     cols = group_idx * gran_k + tl.arange(0, gran_k)
@@ -479,7 +492,11 @@ def per_token_dequant_from_fp8(
     out = torch.empty((m, n), dtype=out_dtype, device=x_fp8.device)
 
     BLOCK_M = 4
-    grid = (num_groups, triton.cdiv(m, BLOCK_M))
+    if m == 0 or num_groups == 0:
+        return out
+
+    row_blocks = triton.cdiv(m, BLOCK_M)
+    grid = (row_blocks, num_groups)
 
     _per_token_dequant_from_fp8_kernel[grid](
         x_fp8, sf, out,
@@ -516,7 +533,11 @@ def per_token_dequant_from_fp8_chunked(
     BLOCK_M = 4
     for cm, fp8c, sfc, outc in zip(chunk_sizes, fp8_chunks, sf_chunks, out_chunks):
         assert sfc.shape == (cm, num_groups)
-        grid = (num_groups, triton.cdiv(cm, BLOCK_M))
+        if cm == 0:
+            continue
+
+        row_blocks = triton.cdiv(cm, BLOCK_M)
+        grid = (row_blocks, num_groups)
         _per_token_dequant_from_fp8_kernel[grid](
             fp8c, sfc, outc,
             cm, n,
