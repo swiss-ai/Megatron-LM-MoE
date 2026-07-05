@@ -19,6 +19,7 @@ if rank != 0:
 from functools import partial
 from typing import List, Optional, Tuple
 
+import math
 import torch
 import torch.distributed as dist
 
@@ -158,17 +159,31 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         sp_enabled = getattr(args, 'sequence_parallel', False)
+        fp8_enabled = getattr(args, 'fp8', False)
 
-        _divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
+        # Divisibility the padded length of each document must satisfy.
+        #
+        #   cp_req : DualChunkSwap splits each doc into 2*cp_size chunks (and,
+        #            with sequence-parallel, a further tp_size factor), so each
+        #            doc must be divisible by 2*cp_size*(tp if SP).
+        #   fp8_req: the linear_qkv GEMM runs on this rank's slice, whose length
+        #            is doc_len / cp_size.  TE's FP8 kernels require that slice's
+        #            leading (token) dim divisible by 8.  Hence doc_len must be
+        #            divisible by 8*cp_size.  (The last dim / hidden_size must be
+        #            divisible by 16, which hidden_size=768 already satisfies.)
+        cp_req = 2 * cp_size * (tp_size if sp_enabled else 1)
+        if fp8_enabled:
+            fp8_req = 16 * cp_size
+            divisibility = math.lcm(cp_req, fp8_req)
+        else:
+            divisibility = cp_req
 
         _seq_lens = cu_seq[1:] - cu_seq[:-1]
         _keep = torch.cat([
             torch.tensor([True], device=device),
-            _seq_lens >= _divisibility,
+            _seq_lens >= divisibility,
         ])
         cu_seq = cu_seq[_keep]
-
-        divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
 
         cp_group = parallel_state.get_context_parallel_group()
         cp_rank = parallel_state.get_context_parallel_rank()
