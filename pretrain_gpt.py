@@ -64,7 +64,7 @@ except ImportError:
 stimer = StragglerDetector()
 
 def _ensure_complete_batch_on_all_tp_ranks(batch, device):
-    """Broadcast all batch fields from TP-rank-0 to sibling TP ranks.
+    """Broadcast batch fields missing on this PP stage from TP-rank-0 to sibling TP ranks.
 
     When PP > 1, get_batch_on_this_tp_rank leaves some fields as None on
     non-zero TP ranks (e.g. tokens on the last PP stage).  This ensures every TP
@@ -86,6 +86,19 @@ def _ensure_complete_batch_on_all_tp_ranks(batch, device):
         ("loss_mask", torch.float), ("position_ids", torch.long),
     ]
 
+    # Skip fields that get_batch_on_this_tp_rank already broadcast to all TP
+    # ranks on this PP stage (first stage: tokens/position_ids; last stage:
+    # labels/loss_mask; middle stages: none). 
+    if parallel_state.is_pipeline_first_stage():
+        already_complete = {"tokens", "position_ids"}
+    elif parallel_state.is_pipeline_last_stage():
+        already_complete = {"labels", "loss_mask"}
+    else:
+        already_complete = set()
+    fields_and_dtypes = [
+        (k, d) for k, d in fields_and_dtypes if k not in already_complete
+    ]
+
     # Step 1: broadcast shape from TP-rank-0 (which always has all fields).
     shape_buf = torch.zeros(2, device=device, dtype=torch.int64)
     if tp_rank == 0:
@@ -95,8 +108,8 @@ def _ensure_complete_batch_on_all_tp_ranks(batch, device):
     dist.broadcast(shape_buf, src=tp_src, group=tp_group)
     shape = (int(shape_buf[0].item()), int(shape_buf[1].item()))
 
-    # Step 2: broadcast ALL fields unconditionally.  All TP ranks must
-    # participate in every broadcast (it's a collective).
+    # Step 2: broadcast every remaining field unconditionally.  All TP ranks
+    # must participate in every broadcast (it's a collective).
     for key, dtype in fields_and_dtypes:
         val = batch.get(key)
         if val is None:
@@ -147,6 +160,7 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
         sp_enabled = getattr(args, 'sequence_parallel', False)
 
         _divisibility = 2 * cp_size * (tp_size if sp_enabled else 1)
+
         _seq_lens = cu_seq[1:] - cu_seq[:-1]
         _keep = torch.cat([
             torch.tensor([True], device=device),
@@ -266,64 +280,6 @@ def _packed_seq_params_from_batch(batch, args, tokenizer, cp_size, device):
     return packed_seq_params, batch
 
 
-def _compute_and_broadcast_packed_seq_params(batch, args, device):
-    """Compute packed_seq_params on TP-rank-0 and broadcast to sibling TP ranks.
-
-    Used for middle PP stages where only TP-rank-0 has meaningful batch data and
-    the batch itself is discarded (activations arrive via PP P2P).
-
-    Returns packed_seq_params on all TP ranks.
-    """
-    tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    cp_size = parallel_state.get_context_parallel_world_size()
-    tokenizer = get_tokenizer()
-
-    # TP-rank-0 computes; others will receive via broadcast.
-    packed_seq_params = None
-    if tp_rank == 0:
-        packed_seq_params, _ = _packed_seq_params_from_batch(
-            batch, args, tokenizer, cp_size, device
-        )
-
-    # Broadcast packed_seq_params to other TP ranks.
-    tp_size = parallel_state.get_tensor_model_parallel_world_size()
-    if tp_size <= 1:
-        return packed_seq_params
-
-    tp_group = parallel_state.get_tensor_model_parallel_group()
-    tp_src_global = dist.get_global_rank(tp_group, 0)
-
-    # Fixed-size buffer: [n_elements, max_seqlen, cu_seqlens...]
-    buf_size = args.seq_length + 2
-    buf = torch.zeros(buf_size, dtype=torch.int32, device=device)
-
-    if tp_rank == 0:
-        cu_sq = packed_seq_params.cu_seqlens_q
-        msv = packed_seq_params.max_seqlen_q
-        n = cu_sq.shape[0]
-        buf[0] = n
-        buf[1] = int(msv.item() if hasattr(msv, "item") else msv)
-        buf[2:2 + n] = cu_sq.to(dtype=torch.int32, device=device)
-
-    dist.broadcast(buf, src=tp_src_global, group=tp_group)
-
-    if tp_rank != 0:
-        n = int(buf[0].item())
-        max_seqlen = int(buf[1].item())
-        cu_seqlens = buf[2:2 + n].clone()
-        packed_seq_params = PackedSeqParams(
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-            qkv_format='thd',
-            cu_seqlens_q_padded=cu_seqlens,
-            cu_seqlens_kv_padded=cu_seqlens,
-        )
-
-    return packed_seq_params
-
-
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch.
 
@@ -351,31 +307,20 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     is_mtp = mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
     is_first_last = is_first_or_last_pipeline_stage(vp_stage)
 
-    # Path 1: xdoc packing via --use-packed-seq-params
+    # Path 1: xdoc packing via --use-packed-seq-params.
+    #
+    # Every rank computes packed_seq_params locally from EOD token boundaries
+    # (see _packed_seq_params_from_batch); there is no separate cu_seqlens
+    # serialization step.  The only cross-rank communication is filling in batch
+    # fields that get_batch_on_this_tp_rank leaves absent on sibling TP ranks.
     if use_xdoc:
-
         device = torch.cuda.current_device()
 
-        # Middle PP stages (and not MTP): compute packed_seq_params from the
-        # local dataloader on TP-rank-0 and broadcast to sibling TP ranks.
-        if not is_first_last and not is_mtp:
-            batch = get_batch_on_this_tp_rank(
-                data_iterator,
-                mtp_on_this_rank=is_mtp,
-            )
-            packed_seq_params = _compute_and_broadcast_packed_seq_params(batch, args, device)
-            return None, None, None, None, None, packed_seq_params
-
-        # First / last PP stages (and MTP ranks): all TP ranks compute the same
-        # packed_seq_params from identical data.
-        batch = get_batch_on_this_tp_rank(
-            data_iterator,
-            mtp_on_this_rank=is_mtp,
-        )
+        batch = get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank=is_mtp)
 
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        if pp_size > 1 and tp_size > 1:
+        if pp_size > 1 and tp_size > 1 and not is_mtp:
             _ensure_complete_batch_on_all_tp_ranks(batch, device)
 
         cp_size = parallel_state.get_context_parallel_world_size()
@@ -383,6 +328,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         packed_seq_params, batch = _packed_seq_params_from_batch(
             batch, args, tokenizer, cp_size, device
         )
+
+        # Middle PP stages consume only packed_seq_params (for attention
+        # masking); activations arrive via PP P2P, so drop the batch tensors.
+        if not is_first_last and not is_mtp:
+            return None, None, None, None, None, packed_seq_params
 
         # Build the 6-tuple explicitly by key (do NOT rely on dict order).
         return (
