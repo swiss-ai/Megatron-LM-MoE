@@ -113,5 +113,78 @@ def test_mock_gpt_dataset():
     assert not torch.any(sample['loss_mask'])
 
 
+def test_apply_goldfish():
+    from megatron.core.datasets.gpt_dataset import (
+        _GOLDFISH_TOKEN_ID,
+        _create_exemption_lut,
+        _create_hash_table,
+        apply_goldfish,
+    )
+
+    torch.manual_seed(0)
+    seq_length, k, h = 8192, 50, 50
+    # Sample ids in [1, vocab) to avoid the id-0 product-collapse artifact.
+    labels = torch.randint(1, _MOCK_VOCAB_SIZE, (seq_length,), dtype=torch.long)
+    table = _create_hash_table(device=labels.device)
+
+    original = labels.clone()
+    out = apply_goldfish(labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
+
+    # apply_goldfish works on a clone: the input labels are not mutated.
+    assert torch.equal(labels, original)
+
+    # Deterministic: identical inputs -> identical drops.
+    out2 = apply_goldfish(labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
+    assert torch.equal(out, out2)
+
+    # The first h-1 positions are never eligible for dropping (unfold alignment).
+    assert not torch.any(out[: h - 1] == _GOLDFISH_TOKEN_ID)
+
+    # Drop rate over the eligible tail is approximately 1/k.
+    drop_rate = (out[h - 1 :] == _GOLDFISH_TOKEN_ID).float().mean().item()
+    assert abs(drop_rate - 1.0 / k) < 0.01, drop_rate
+
+    # Exemption: no dropped position may carry a label in the exempt band, while drops
+    # still occur outside it. `out` above is the positive control (drops with no exemption).
+    assert torch.any(out == _GOLDFISH_TOKEN_ID)
+    lo, hi = 2000, 6000
+    exemption_lut = _create_exemption_lut(list(range(lo, hi)), _MOCK_VOCAB_SIZE, labels.device)
+    out_exempt = apply_goldfish(
+        labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h, exemption_lut=exemption_lut
+    )
+    dropped = out_exempt == _GOLDFISH_TOKEN_ID
+    assert not torch.any((labels >= lo) & (labels < hi) & dropped), "exempt-band token was dropped"
+    assert torch.any(dropped), "expected drops outside the exempt band"
+
+
+def test_goldfish_config_validation():
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    # A valid goldfish config constructs without error.
+    GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=50, **base)
+
+    # k must be >= 2 (k=1 drops ~100% of tokens).
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=1, goldfish_h=50, **base)
+
+    # h must be < sequence_length (else the unfold has no valid window).
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=1024, **base)
+
+
 if __name__ == "__main__":
     test_mock_gpt_dataset()
+    test_apply_goldfish()
+    test_goldfish_config_validation()

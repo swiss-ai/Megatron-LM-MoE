@@ -29,11 +29,11 @@ from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
 from megatron.training import (
     get_args,
     get_timers,
+    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -282,7 +282,12 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = build_tokenizer(args)
+    # The global tokenizer (built in initialize_megatron) is picklable to dataloader
+    # workers; args.omni_metadata was populated from it at the same time (see
+    # set_global_variables) and is carried on the dataset config so GPTDataset.__getitem__
+    # can use it worker-side. None for non-omni tokenizers.
+    tokenizer = get_tokenizer()
+    omni_metadata = getattr(args, "omni_metadata", None)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -322,6 +327,10 @@ def core_gpt_dataset_config_from_args(args):
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
+        "goldfish_loss": args.goldfish_loss,
+        "goldfish_k": args.goldfish_k,
+        "goldfish_h": args.goldfish_h,
+        "omni_metadata": omni_metadata,
     }
 
     # add FIM args to the config
