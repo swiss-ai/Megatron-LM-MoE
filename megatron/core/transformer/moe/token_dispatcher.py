@@ -38,10 +38,6 @@ from megatron.core.transformer.moe.fp8_utils import (
     fp8_cast,
     fp8_decast,
 )
-from megatron.core.transformer.moe.fp8_jit import (
-    per_token_cast_to_fp8,
-    per_token_dequant_from_fp8,
-)
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -1340,10 +1336,6 @@ class _DeepepManager(_DispatchManager):
                     "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        
-        if self.config.moe_use_fp8_dispatch:
-            hidden_states = per_token_cast_to_fp8(hidden_states, use_ue8m0=False)
-        
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
                 hidden_states,
@@ -1355,10 +1347,6 @@ class _DeepepManager(_DispatchManager):
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
         )
-
-        if self.config.moe_use_fp8_dispatch:
-            assert isinstance(hidden_states, tuple)
-            hidden_states = per_token_dequant_from_fp8(*hidden_states)
         self.handle = handle
         self.tokens_per_expert = num_tokens_per_expert
         self.dispatched_indices = dispatched_indices
