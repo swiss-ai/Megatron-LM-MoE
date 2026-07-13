@@ -917,7 +917,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_use_fp8_dispatch: bool = False
     """Whether to use FP8 for MoE dispatch. Specifically, the token tensors will be
-    quantized into FP8 before dispatch and dequantized back to original precision after dispatch."""
+    quantized into FP8 before dispatch and dequantized back to original precision after dispatch.
+    The dispatch forward wire is FP8 while the backward wire stays BF16 (asymmetric FP8), which
+    is implemented via dedicated ScheduleNodes and therefore requires
+    overlap_moe_expert_parallel_comm=True."""
 
     moe_use_fp8_activation: bool = False
     """Whether to use FP8 activation for MoE layer. Specifically, the activations of MoE layer will
@@ -1673,6 +1676,14 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_use_fp8_dispatch and not self.overlap_moe_expert_parallel_comm:
+            # FP8 dispatch is implemented only via the asymmetric-FP8 ScheduleNodes
+            # (FP8 forward wire / BF16 backward wire), which require EP comm overlap.
+            # The symmetric inline fp8_cast/fp8_decast path has been removed.
+            raise ValueError(
+                "moe_use_fp8_dispatch requires overlap_moe_expert_parallel_comm=True."
+            )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

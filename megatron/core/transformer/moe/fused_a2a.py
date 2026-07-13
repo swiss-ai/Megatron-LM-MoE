@@ -255,6 +255,115 @@ if HAVE_DEEP_EP:
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
+    def fused_fp8_dispatch_fwd(
+        x_fp8,
+        x_sf,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """Pure-FP8 DeepEP dispatch of already-cast tokens. 
+
+        This is the asymmetric-FP8 dispatch forward used under EP comm overlap:
+        - BF16->FP8 cast lives on the compute stream (``moe_pre_dispatch`` node) 
+        - FP8->BF16 decast lives on the compute stream (``moe_post_dispatch`` node)
+
+        The bf16 backward is handled by ``fused_fp8_dispatch_bwd``.
+
+        Returns:
+            (recv_x_fp8, recv_x_sf, recv_token_indices, recv_token_probs,
+             num_recv_tokens_per_expert_list, handle)
+        """
+        previous_event = None
+        if async_finish:
+            previous_event = EventOverlap(EventHandle())
+        # element_size is clamped to >= 2 in get_hidden_bytes, so an FP8 tensor sizes the
+        # buffer identically to the BF16 tensor it was cast from.
+        buffer = get_buffer(group, get_hidden_bytes(x_fp8))
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            event,
+        ) = buffer.get_dispatch_layout(
+            token_indices,
+            num_experts,
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+
+        (
+            recv_x,
+            recv_token_indices,
+            recv_token_probs,
+            num_recv_tokens_per_expert_list,
+            handle,
+            after_event_overlap,
+        ) = buffer.dispatch(
+            (x_fp8, x_sf),
+            topk_idx=token_indices,
+            topk_weights=token_probs,  # DeepEP only supports float32 probs
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            previous_event=event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event_overlap.current_stream_wait()
+
+        recv_x_fp8, recv_x_sf = recv_x
+        # Match FusedDispatch.forward: tokens_per_expert is consumed downstream as a tensor.
+        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
+        return (
+            recv_x_fp8,
+            recv_x_sf,
+            recv_token_indices,
+            recv_token_probs,
+            tokens_per_expert,
+            handle,
+        )
+
+    def fused_fp8_dispatch_bwd(
+        grad_x,
+        grad_token_probs,
+        group,
+        handle,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
+        """`BF16` backward (reverse comm) of a fused fp8 dispatch.
+
+        Mirrors ``FusedDispatch.backward``. The function name might be misleading as
+        the communication in this function is in BF16. 
+        But it is the backward of the forward ``fused_fp8_dispatch_fwd``. 
+
+        Returns:
+            (grad_x, grad_token_probs)
+        """
+        buffer = get_buffer(group, get_hidden_bytes(grad_x))
+        previous_event = None
+        if async_finish:
+            previous_event = EventOverlap(EventHandle())
+        grad_x, grad_token_probs, after_event = buffer.combine(
+            grad_x.contiguous(),
+            handle,
+            topk_weights=(grad_token_probs.float() if grad_token_probs is not None else None),
+            previous_event=previous_event,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        if async_finish:
+            after_event.current_stream_wait()
+        return grad_x, grad_token_probs
+
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP"""
         Buffer.set_num_sms(num_sms)
@@ -262,6 +371,8 @@ if HAVE_DEEP_EP:
 else:
     fused_dispatch = None
     fused_combine = None
+    fused_fp8_dispatch_fwd = None
+    fused_fp8_dispatch_bwd = None
     set_deepep_num_sms = None
 
 

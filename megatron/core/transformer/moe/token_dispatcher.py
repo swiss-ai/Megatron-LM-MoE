@@ -20,6 +20,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
+    fused_fp8_dispatch_fwd,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
@@ -33,10 +34,6 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
-)
-from megatron.core.transformer.moe.fp8_utils import (
-    fp8_cast,
-    fp8_decast,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -106,7 +103,7 @@ class MoETokenDispatcher:
             probs (torch.Tensor): The routing probability tensor, [num_tokens, num_experts].
 
         Returns:
-            A tuple of preprocessed tokens, scale factor (or None), and probabilities.
+            A tuple of preprocessed tokens and probabilities.
         """
         raise NotImplementedError("dispatch_preprocess function not implemented.")
 
@@ -136,7 +133,6 @@ class MoETokenDispatcher:
     def dispatch_postprocess(
         self,
         hidden_states: torch.Tensor,
-        hidden_states_sf: Optional[torch.Tensor],
         probs: torch.Tensor,
     ):
         """Performs local processing after token dispatch communication.
@@ -266,7 +262,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self.routing_map = routing_map
-        return hidden_states, None, probs
+        return hidden_states, probs
 
     def token_dispatch(self, hidden_states, hidden_states_sf, probs):
         """Gathers tokens from all TP*EP ranks using AllGather."""
@@ -292,7 +288,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         return hidden_states, hidden_states_sf, probs
 
-    def dispatch_postprocess(self, hidden_states, hidden_states_sf, probs):
+    def dispatch_postprocess(self, hidden_states, probs):
         """After gathering in token_dispatch, this method identifies tokens for local experts and
         permutes them for expert processing.
         """
@@ -409,7 +405,6 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         ctx.ep_group = ep_group
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
-        ctx.fp8_dispatch = permutated_local_input_tokens_sf is not None
 
         # dispatch probs
         global_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
@@ -417,6 +412,7 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         )
 
         # dispatch tokens
+        # when permutated_local_input_tokens_sf is not None, we do fp8 dispatch
         global_input_tokens_sf = None
         if permutated_local_input_tokens_sf is not None:
             global_input_tokens_sf = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
@@ -441,27 +437,17 @@ class MoEAlltoAllTokenDispatcherFunction(torch.autograd.Function):
         ep_group = ctx.ep_group
         output_splits = ctx.output_splits
         input_splits = ctx.input_splits
-        fp8_dispatch = ctx.fp8_dispatch
 
         # The backward of token dispatch is the same as token combine.
         global_grad_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
             ep_group, grad_probs, input_splits, output_splits
         )
-
-        global_grad_hidden_states_sf = None
-        if fp8_dispatch and grad_hidden_states_sf is not None:
-            global_grad_hidden_states_sf = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-                ep_group, grad_hidden_states_sf, input_splits, output_splits
-            )
-            global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-                ep_group, grad_hidden_states, input_splits, output_splits
-            )
-        else:
-            global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
-                ep_group, grad_hidden_states, input_splits, output_splits
-            )
-        # Trailing None corresponds to the non-tensor `fp8_dispatch` forward arg.
-        return None, None, None, global_grad_hidden_states, global_grad_hidden_states_sf, global_grad_probs
+        global_grad_hidden_states = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+            ep_group, grad_hidden_states, input_splits, output_splits
+        )
+        # Slots 4/5 are the (non-tensor group/splits) and scale-factor forward args, whose
+        # grads are always None.
+        return None, None, None, global_grad_hidden_states, None, global_grad_probs
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
@@ -763,13 +749,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             drop_and_pad=self.drop_and_pad,
         )
 
-        permutated_local_input_tokens_sf = None
-        if self.config.moe_use_fp8_dispatch:
-            permutated_local_input_tokens, permutated_local_input_tokens_sf = fp8_cast(
-                permutated_local_input_tokens
-            )
-
-        return permutated_local_input_tokens, permutated_local_input_tokens_sf, permuted_probs
+        return permutated_local_input_tokens, permuted_probs
 
     def token_dispatch(
         self,
@@ -828,7 +808,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         return global_input_tokens, global_input_tokens_sf, global_probs
 
-    def dispatch_postprocess(self, global_input_tokens, global_input_tokens_sf, global_probs):
+    def dispatch_postprocess(self, global_input_tokens, global_probs):
         """Post-processes tokens after All-to-All communication.
 
         This involves an All-Gather in the tensor parallel dimension and sorting
@@ -836,14 +816,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         Args:
             global_input_tokens (torch.Tensor): Tokens after All-to-All.
-            global_input_tokens_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             global_probs (torch.Tensor): Probabilities after All-to-All.
 
         Returns:
             A tuple of processed tokens, token counts per expert, and processed probabilities.
         """
-        if self.config.moe_use_fp8_dispatch:
-            global_input_tokens = fp8_decast(global_input_tokens, global_input_tokens_sf)
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
 
@@ -1354,6 +1331,54 @@ class _DeepepManager(_DispatchManager):
 
         return hidden_states
 
+    def fp8_dispatch(
+        self,
+        hidden_states_fp8: torch.Tensor,
+        hidden_states_sf: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ):
+        """Asymmetric-FP8 dispatch of already-cast tokens (EP comm overlap path).
+
+        The BF16->FP8 cast happens in the ``moe_quant`` compute-stream node and the
+        FP8->BF16 dequant in the ``moe_dequant`` compute-stream node, so this dispatch
+        stays pure communication and its backward (driven by the ``moe_dispatch``
+        ``ManualGradNode``) is BF16. Sets the same manager state as ``dispatch`` so the
+        downstream postprocess/combine are unchanged.
+
+        Returns:
+            A tuple ``(recv_hidden_states_fp8, recv_hidden_states_sf)``.
+        """
+        # DeepEP only supports float32 probs
+        if self.token_probs.dtype != torch.float32:
+            self.token_probs = self.token_probs.float()
+        (
+            recv_x_fp8,
+            recv_x_sf,
+            dispatched_indices,
+            dispatched_probs,
+            num_tokens_per_expert,
+            handle,
+        ) = fused_fp8_dispatch_fwd(
+            hidden_states_fp8,
+            hidden_states_sf,
+            self.token_indices,
+            self.token_probs,
+            self.num_experts,
+            self.group,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        self.handle = handle
+        self.tokens_per_expert = num_tokens_per_expert
+        self.dispatched_indices = dispatched_indices
+        self.dispatched_probs = dispatched_probs
+        # recv_token_probs feeds the router-probs gradient; the dispatch here is not an
+        # autograd op, so mark it so the experts' backward populates its .grad (read by
+        # the ManualGradNode dispatch backward).
+        self.dispatched_probs.requires_grad_(True)
+        return recv_x_fp8, recv_x_sf
+
     def _indices_to_multihot(self, indices, probs):
         """
         Converts a tensor of indices to a multihot vector.
@@ -1593,7 +1618,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
-        return hidden_states, None, self._comm_manager.token_probs
+        return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(
         self,
@@ -1621,13 +1646,18 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of dispatched tokens, scale factor (or None), and probabilities.
         """
+        if hidden_states_sf is not None:
+            recv_x_fp8, recv_x_sf = self._comm_manager.fp8_dispatch(
+                hidden_states, hidden_states_sf, async_finish, allocate_on_comm_stream
+            )
+            return recv_x_fp8, recv_x_sf, self._comm_manager.dispatched_probs
         return (
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
             hidden_states_sf,
             self._comm_manager.dispatched_probs,
         )
 
-    def dispatch_postprocess(self, hidden_states: torch.Tensor, hidden_states_sf: Optional[torch.Tensor], probs: torch.Tensor):
+    def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Converts dispatched tokens to a per-expert format for expert processing.
 
         This method transforms the output of the fused dispatch into the tensor
@@ -1635,7 +1665,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states (torch.Tensor): Hidden states after fused dispatch
-            hidden_states_sf (torch.Tensor or None): Scale factor for FP8 tokens.
             probs (torch.Tensor): Routing probabilities after fused dispatch
 
         Returns:

@@ -17,6 +17,10 @@ from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.fp8_jit import (
+    per_token_cast_to_fp8,
+    per_token_dequant_from_fp8,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
@@ -356,6 +360,54 @@ class TransformerLayerNode(ScheduleNode):
         self.chunk_state = None
         self.submodule = None
 
+class ManualGradNode(TransformerLayerNode):
+    """Node whose backward publishes input gradients directly, bypassing autograd
+    and the ``.grad`` transport.
+
+    The base node runs autograd in ``backward_impl`` and then reads ``.grad`` off
+    the detached inputs in ``get_grad``. That path can only emit a gradient whose
+    dtype matches the input dtype, and for an FP8 input the ``.grad`` setter either
+    raises or silently cast the gradient to FP8 (a plain, scale-unaware
+    ``.to(fp8)`` that destroys it). 
+    
+    The asymmetric-FP8 MoE comm nodes need an FP8 forward with a BF16 backward (and vice versa), 
+    so they compute gradients in a custom ``backward_submodule`` and hand them out through 
+    ``_manual_grads`` instead of ``.grad``.
+
+    ``backward_submodule(node, outputs, output_grad)`` returns the input gradients
+    (a tensor or a tuple). It must return tensors distinct from ``output_grad``
+    only if ``manual_release_grads`` is ever enabled for the node; today that flag
+    is always False, so an STE pass-through may return the incoming grad as-is.
+    """
+
+    def __init__(self, *args, backward_submodule, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.backward_submodule = backward_submodule
+        self._manual_grads = None
+
+    def backward_impl(self, outputs, output_grad):
+        """Compute input grads via the custom backward and stash them for get_grad."""
+        grads = self.backward_submodule(self, outputs, output_grad)
+        if not isinstance(grads, tuple):
+            grads = (grads,)
+        self._manual_grads = grads
+        # Hand the incoming grads back for the record_stream / release bookkeeping
+        # that ScheduleNode._backward performs on this node's output gradients.
+        return output_grad
+
+    def get_grad(self):
+        """Return the manually published input grads instead of reading ``.grad``."""
+        assert self._manual_grads is not None, (
+            f"{self.name}: backward_submodule did not set _manual_grads"
+        )
+        grads = self._manual_grads
+        self._manual_grads = None
+        return grads[0] if len(grads) == 1 else grads
+
+    def __del__(self):
+        self.backward_submodule = None
+        super().__del__()
+
 
 class _BackwardDWWrapper:
     """Wrapper for managing backward weight gradient computation of attn module.
@@ -443,6 +495,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
 
+    # asymmetric FP8 dispatch: cast/decast live in dedicated compute-stream nodes
+    use_fp8_dispatch_nodes = is_moe and layer.config.moe_use_fp8_dispatch
+
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
         Performs same attnention forward logic as GPT Model and forward pass for
@@ -497,10 +552,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
-                local_tokens, local_tokens_sf, probs = layer.mlp.preprocess(
+                local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
-                return hidden_states, local_tokens, local_tokens_sf, probs, shared_expert_output
+                # NOTE: sf slot is always None as the FP8 cast lives in the moe_pre_dispatch node.
+                return hidden_states, local_tokens, None, probs, shared_expert_output
 
         hidden_states, local_tokens, local_tokens_sf, probs, shared_expert_output = forward_func(
             hidden_states=hidden_states,
@@ -541,6 +597,21 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             local_tokens, local_tokens_sf, probs
         )
 
+        # Asymmetric FP8 dispatch backward runs a BF16 reverse comm in `moe_dispatch`'s
+        # custom backward. Stash the per-microbatch dispatch layout/handle on layer_state
+        # so the backward uses this microbatch's state rather than reading `self.*` off the
+        # dispatcher (which a later forward of an interleaved microbatch may have
+        # overwritten under 1f1b overlap).
+        if use_fp8_dispatch_nodes and enable_deepep:
+            # DeepEP: the reverse comm is a fused_combine keyed by the dispatch handle.
+            node.layer_state.dispatch_ep_group = token_dispatcher._comm_manager.group
+            node.layer_state.dispatch_handle = token_dispatcher._comm_manager.handle
+        elif use_fp8_dispatch_nodes and not enable_hybridep:
+            # alltoall: the reverse comm is a reverse all-to-all keyed by the EP splits.
+            node.layer_state.dispatch_ep_group = token_dispatcher.ep_group
+            node.layer_state.dispatch_input_splits = token_dispatcher.input_splits
+            node.layer_state.dispatch_output_splits = token_dispatcher.output_splits
+
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process
         # of the input tensors.
@@ -564,7 +635,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         expert_output, _ = layer.mlp.routed_experts_compute(
-            dispatched_tokens, dispatched_tokens_sf, dispatched_probs
+            dispatched_tokens, dispatched_probs
         )
 
         # Stash the activation-offload handle (moe_offload_activations) on the per-microbatch
@@ -698,6 +769,108 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, post_combine_func, None]
     backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
     return forward_funcs, backward_dw
+
+
+def build_fp8_dispatch_node_callables(layer):
+    """Forward/backward callables for the asymmetric-FP8 MoE dispatch nodes.
+
+    Under EP comm overlap with ``moe_use_fp8_dispatch``, the FP8 cast and dequant are
+    hoisted out of the dispatcher (which now stays pure communication) into two
+    dedicated compute-stream ScheduleNodes:
+
+    - ``moe_quant``  : BF16 permuted tokens -> (FP8 tokens, scale factor). Backward is a
+      straight-through identity (BF16 -> BF16), so no FP8 gradient is produced.
+    - ``moe_dequant``: (FP8 tokens, scale factor) -> BF16 tokens. Backward is also STE.
+
+    and ``moe_dispatch`` gets a custom BF16 backward so the dispatch a2a is FP8 in the
+    forward and BF16 in the backward. Returns ``None`` when asymmetric FP8 dispatch does not
+    apply, in which case the nodes stay no-ops.
+
+    The ``moe_quant``/``moe_dequant`` nodes are identical across backends; only the dispatch
+    backward differs: the alltoall backend runs a reverse all-to-all, the DeepEP backend runs
+    a ``fused_combine`` (the reverse of its fused dispatch). HybridEP is not supported yet.
+    """
+    config = layer.config
+    is_moe = isinstance(layer.mlp, MoELayer)
+    enable_deepep = (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "deepep"
+    )
+    enable_hybridep = (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+    )
+    if (
+        not (is_moe and config.moe_use_fp8_dispatch and config.overlap_moe_expert_parallel_comm)
+        or enable_hybridep
+    ):
+        return None
+
+    from megatron.core.transformer.moe.fused_a2a import fused_fp8_dispatch_bwd
+    from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcherFunction,
+    )
+
+    def pre_dispatch_fwd(node, local_tokens, local_tokens_sf, probs):
+        assert local_tokens_sf is None
+        fp8_tokens, sf = per_token_cast_to_fp8(local_tokens, use_ue8m0=False)
+        fp8_tokens.requires_grad_(True)
+        return fp8_tokens, sf, probs
+
+    def pre_dispatch_bwd(node, outputs, output_grad):
+        # output_grad = (bf16 token grad, None, probs grad)
+        return output_grad[0], None, output_grad[2]
+
+    def post_dispatch_fwd(node, dispatched_tokens, dispatched_tokens_sf):
+        bf16_tokens = per_token_dequant_from_fp8(dispatched_tokens, dispatched_tokens_sf)
+        bf16_tokens.requires_grad_(True)
+        # Return a None sf slot so the mlp node still receives (tokens, sf) and its
+        # dispatch_postprocess (dequant deferred) treats the input as already BF16.
+        return bf16_tokens, None
+
+    def post_dispatch_bwd(node, outputs, output_grad):
+        return output_grad[0], None
+
+    def dispatch_backward_alltoall(node, outputs, output_grad):
+        # inputs = (local_tokens[FP8], sf, probs); outputs = (dispatched_tokens[FP8], sf).
+        # output_grad[0] is BF16 (from moe_dequant STE); run a BF16 reverse all-to-all.
+        ep_group = node.layer_state.dispatch_ep_group
+        input_splits = node.layer_state.dispatch_input_splits
+        output_splits = node.layer_state.dispatch_output_splits
+        
+        # probs grad flows back from the experts via the detached dispatched_probs.
+        grad_permuted_probs = None
+        grad_dispatched_probs = node.detached[0].grad
+        if grad_dispatched_probs is not None:
+            grad_permuted_probs = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+                ep_group, grad_dispatched_probs.contiguous(), input_splits, output_splits
+            )
+        
+        grad_local_tokens = MoEAlltoAllTokenDispatcherFunction.all2all_dispatch(
+            ep_group, output_grad[0].contiguous(), input_splits, output_splits
+        )
+        return grad_local_tokens, None, grad_permuted_probs
+
+    def dispatch_backward_deepep(node, outputs, output_grad):
+        ep_group = node.layer_state.dispatch_ep_group
+        handle = node.layer_state.dispatch_handle
+        # probs grad flows back from the experts via the detached dispatched_probs.
+        grad_dispatched_probs = node.detached[0].grad
+        grad_local_tokens, grad_permuted_probs = fused_fp8_dispatch_bwd(
+            output_grad[0].contiguous(),
+            grad_dispatched_probs,
+            ep_group,
+            handle,
+        )
+        return grad_local_tokens, None, grad_permuted_probs
+
+    return {
+        "moe_pre_dispatch": (pre_dispatch_fwd, pre_dispatch_bwd),
+        "moe_post_dispatch": (post_dispatch_fwd, post_dispatch_bwd),
+        "moe_dispatch_backward": (
+            dispatch_backward_deepep if enable_deepep else dispatch_backward_alltoall
+        ),
+    }
 
 
 def build_mtp_layer_callables(layer):

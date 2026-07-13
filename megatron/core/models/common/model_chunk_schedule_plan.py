@@ -48,7 +48,9 @@ class TransformerLayerSchedulePlan:
     """
 
     attn = None
+    moe_pre_dispatch = None
     moe_dispatch = None
+    moe_post_dispatch = None
     mlp = None
     moe_combine = None
     moe_post_combine = None
@@ -88,9 +90,15 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'attn') and self.attn is not None:
             del self.attn
             self.attn = None
+        if hasattr(self, 'moe_pre_dispatch') and self.moe_pre_dispatch is not None:
+            del self.moe_pre_dispatch
+            self.moe_pre_dispatch = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
             del self.moe_dispatch
             self.moe_dispatch = None
+        if hasattr(self, 'moe_post_dispatch') and self.moe_post_dispatch is not None:
+            del self.moe_post_dispatch
+            self.moe_post_dispatch = None
         if hasattr(self, 'mlp') and self.mlp is not None:
             del self.mlp
             self.mlp = None
@@ -112,7 +120,9 @@ class TransformerLayerSchedulePlan:
             attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
         """
         from megatron.core.models.gpt.fine_grained_callables import (
+            ManualGradNode,
             TransformerLayerNode,
+            build_fp8_dispatch_node_callables,
             build_layer_callables,
         )
         from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -134,9 +144,12 @@ class TransformerLayerSchedulePlan:
         extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
-        def create_node(stream, module, name):
+        def create_node(stream, module, name, node_cls=TransformerLayerNode, backward_submodule=None):
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
-            return TransformerLayerNode(
+            extra_kwargs = {}
+            if backward_submodule is not None:
+                extra_kwargs["backward_submodule"] = backward_submodule
+            return node_cls(
                 stream,
                 event,
                 self.layer_state,
@@ -145,7 +158,12 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
+                **extra_kwargs,
             )
+
+        # Asymmetric-FP8 dispatch nodes (compute-stream quant/dequant + BF16 dispatch
+        # backward). Returns None unless FP8 dispatch applies on the alltoall backend.
+        fp8_dispatch_nodes = build_fp8_dispatch_node_callables(transformer_layer)
 
         (
             attn_module,
@@ -161,10 +179,32 @@ class TransformerLayerSchedulePlan:
         self.attn = create_node(comp_stream, attn_module, "attn")
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
-            self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
+            if fp8_dispatch_nodes is not None:
+                # FP8 cast/dequant on the compute stream, BF16 dispatch backward.
+                quant_fwd, quant_bwd = fp8_dispatch_nodes["moe_pre_dispatch"]
+                dequant_fwd, dequant_bwd = fp8_dispatch_nodes["moe_post_dispatch"]
+                dispatch_bwd = fp8_dispatch_nodes["moe_dispatch_backward"]
+                self.moe_pre_dispatch = create_node(
+                    comp_stream, quant_fwd, "moe_pre_dispatch",
+                    node_cls=ManualGradNode, backward_submodule=quant_bwd,
+                )
+                self.moe_post_dispatch = create_node(
+                    comp_stream, dequant_fwd, "moe_post_dispatch",
+                    node_cls=ManualGradNode, backward_submodule=dequant_bwd,
+                )
+                self.moe_dispatch = create_node(
+                    comm_stream, moe_dispatch_module, "moe_dispatch",
+                    node_cls=ManualGradNode, backward_submodule=dispatch_bwd,
+                )
+            else:
+                self.moe_pre_dispatch = NoopScheduleNode()
+                self.moe_post_dispatch = NoopScheduleNode()
+                self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
             self.moe_post_combine = create_node(comm_stream, moe_post_combine_module, "moe_post_combine")
         else:
+            self.moe_pre_dispatch = NoopScheduleNode()
+            self.moe_post_dispatch = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
             self.moe_post_combine = NoopScheduleNode()
@@ -223,9 +263,11 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
+                f_input = f_layer.moe_pre_dispatch.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
+            b_grad = b_layer.moe_post_dispatch.backward(b_grad)
 
         # Forward dispatch can be moved before b_layer.mlp.backward(b_grad)
         # to enable an overlap between dispatch and bw + wgard_bw
@@ -242,6 +284,7 @@ class TransformerLayerSchedulePlan:
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
+                f_input = f_layer.moe_post_dispatch.forward(f_input)
                 f_input = f_layer.mlp.forward(f_input)
 
         if f_layer is not None:
@@ -250,6 +293,7 @@ class TransformerLayerSchedulePlan:
                 # f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+            b_grad = b_layer.moe_pre_dispatch.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
         
         if f_layer is not None:
