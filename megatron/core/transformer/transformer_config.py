@@ -1677,13 +1677,19 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
-        if self.moe_use_fp8_dispatch and not self.overlap_moe_expert_parallel_comm:
+        if self.moe_use_fp8_dispatch:
             # FP8 dispatch is implemented only via the asymmetric-FP8 ScheduleNodes
             # (FP8 forward wire / BF16 backward wire), which require EP comm overlap.
             # The symmetric inline fp8_cast/fp8_decast path has been removed.
-            raise ValueError(
-                "moe_use_fp8_dispatch requires overlap_moe_expert_parallel_comm=True."
-            )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_use_fp8_dispatch requires overlap_moe_expert_parallel_comm=True."
+                )
+            if (
+                self.moe_token_dispatcher_type == "flex"
+                and self.moe_flex_dispatcher_backend == "hybridep"
+            ):
+                raise ValueError("moe_use_fp8_dispatch does not support the HybridEP backend.")
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

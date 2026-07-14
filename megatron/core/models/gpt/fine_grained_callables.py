@@ -576,6 +576,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
 
+        # local_tokens_sf is always None, and this is kept for schedule node wiring
+        assert local_tokens_sf is None, "local_tokens_sf should None in submodule_attn_forward"
         return local_tokens, local_tokens_sf, probs
 
     def submodule_dispatch_forward(
@@ -627,6 +629,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
+        assert dispatched_tokens_sf is None, "dispatched_tokens_sf should be consumed before submodule_moe_forward"
         dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
@@ -812,7 +815,7 @@ def build_fp8_dispatch_node_callables(layer):
     )
 
     def pre_dispatch_fwd(node, local_tokens, local_tokens_sf, probs):
-        assert local_tokens_sf is None
+        assert local_tokens_sf is None, "local_tokens_sf should None before pre_dispatch_fwd"
         fp8_tokens, sf = per_token_cast_to_fp8(local_tokens, use_ue8m0=False)
         fp8_tokens.requires_grad_(True)
         return fp8_tokens, sf, probs
@@ -861,6 +864,8 @@ def build_fp8_dispatch_node_callables(layer):
             grad_dispatched_probs,
             ep_group,
             handle,
+            async_finish=True,  # default is True
+            allocate_on_comm_stream=True,   # default is True
         )
         return grad_local_tokens, None, grad_permuted_probs
 
