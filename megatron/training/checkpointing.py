@@ -1625,6 +1625,7 @@ def load_args_from_checkpoint(
     _set_arg('gxr2', force=True)
     _set_arg('xr2glu', force=True)
     _set_arg('xsssglu', force=True)
+    _set_arg('situ_v2', force=True)
     _set_arg('polynorm', force=True)
     _set_arg('downscale_glu', force=True)
     _set_arg('qk_layernorm', force=True)

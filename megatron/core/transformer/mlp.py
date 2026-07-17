@@ -34,6 +34,7 @@ from megatron.core.activations import (
     XR2,
     XR2GLU,
     XSSSGLU,
+    compiled_situ_v2,
     downscale_glu_transform,
     rlglu_act,
 )
@@ -480,6 +481,16 @@ class MLP(MegatronModule):
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.xsssglu_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.situ_v2:
+                # SiTU-v2: silu(x_glu) * x_glu * tanh(x_linear). Non-learnable two-input op, so no
+                # module and no scores fusion -- the shared per_token_scale multiply below applies.
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = compiled_situ_v2(x_glu, x_linear)
             elif self.config.gated_linear_unit:
 
                 def glu(x):

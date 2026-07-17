@@ -1090,7 +1090,7 @@ def validate_args(args, defaults={}):
         if (
             args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
             or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
-            or args.pn3glu
+            or args.situ_v2 or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1810,6 +1810,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'gxr2': args.gxr2,
         'xr2glu': args.xr2glu,
         'xsssglu': args.xsssglu,
+        'situ_v2': args.situ_v2,
         'polynorm': args.polynorm,
     }
     _all_activation_flags = dict(_other_new_activation_flags)
@@ -1858,6 +1859,13 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
     if args.xsssglu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.situ_v2:
+        # SiTU-v2 (silu(x_glu)*x_glu*tanh(x_linear)) is computed by a dedicated branch, not via
+        # config.activation_func; keep SiLU as a harmless placeholder for width-doubling and the
+        # unused non-situ_v2 code paths.
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
@@ -2209,6 +2217,7 @@ def _add_network_size_args(parser):
         "gxr2",
         "xr2glu",
         "xsssglu",
+        "situ_v2",
         "pn3glu",
         "polynorm",
         "downscale_glu",
@@ -2304,6 +2313,11 @@ def _add_network_size_args(parser):
                        '(== sigmoid(x_glu)*tanh(x_glu)*x_linear). Non-learnable and elementwise '
                        'like SwiGLU; implies gated linear units. No fused kernel (runs through the '
                        'generic GLU path).')
+    group.add_argument('--situ-v2', action='store_true',
+                       help='Use SiTU-v2: silu(x_glu)*x_glu*tanh(x_linear) '
+                       '(== x_glu^2*sigmoid(x_glu)*tanh(x_linear)). A two-input gated unit (the '
+                       'linear half goes through tanh), non-learnable; implies gated linear units. '
+                       'No fused kernel (dedicated eager branch).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '

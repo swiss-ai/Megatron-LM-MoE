@@ -934,6 +934,19 @@ def situ_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def compiled_situ_v2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """SiTU-v2 GLU: ``silu(x) * x * tanh(y)`` (``== x**2 * sigmoid(x) * tanh(y)``).
+
+    A genuine two-input gated unit: unlike SiTU (``sigmoid(x)*tanh(x)*y``, where the linear half
+    ``y`` is used linearly and so fits the generic ``gate(x)*y`` path), here the linear half is
+    passed through ``tanh``, so it needs its own dispatch branch (like XSSSGLU/GXPRY). Non-learnable
+    and elementwise; no fused kernel, runs eager. ``x`` is the GLU gate half (``x_glu``), ``y`` the
+    linear half (``x_linear``).
+    """
+    return F.silu(x) * x * torch.tanh(y)
+
+
+@jit_fuser
 def downscale_glu_transform(x: torch.Tensor) -> torch.Tensor:
     """Square-root down-scaling of the GLU projections (``--downscale-glu``): ``x / sqrt(|x|)``.
 
