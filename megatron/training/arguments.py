@@ -29,7 +29,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu, rlglu_act
+from megatron.core.activations import squared_relu, rlglu_act, situ_act
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_sssglu import ssslu
 from megatron.training.utils import (
@@ -1088,8 +1088,9 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.ffn_hidden_size is None:
         if (
-            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.gxpr
-            or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu or args.pn3glu
+            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
+            or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
+            or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1775,6 +1776,15 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = rlglu_act
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.situ:
+        # SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear (== sigmoid(x_glu)*
+        # tanh(x_glu)*x_linear). Non-learnable and elementwise like SwiGLU's SiLU gate, but with no
+        # fused kernel yet -- runs through the generic (non-fused) GLU path with
+        # activation_func == situ_act, so bias_activation_fusion is forced off (like --reglu).
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = situ_act
+        kw_args['bias_activation_fusion'] = False
     if args.pnglu:
         # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
         # gated unit, so it cannot be combined with the non-gated squared-relu.
@@ -1808,6 +1818,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'sssglu': args.sssglu,
         'reglu': args.reglu,
         'rlglu': args.rlglu,
+        'situ': args.situ,
         'squared_relu': args.squared_relu,
         'quick_geglu': args.quick_geglu,
         'pnglu': args.pnglu,
@@ -1851,6 +1862,28 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = F.silu
         kw_args['bias_activation_fusion'] = False
     if args.polynorm:
+        kw_args['bias_activation_fusion'] = False
+    if args.downscale_glu:
+        # downscale_glu is a GLU *modifier* (signed-sqrt down-scaling of both fc1 halves), not an
+        # activation. It is injected in the generic (non-fused) GLU path, so it only composes with
+        # the generic-path GLU gates and forces the bias+activation fusion off. Reject the
+        # learnable-module GLU/activation variants (which have their own dispatch branches that
+        # would silently bypass the transform) and the non-gated activations.
+        _downscale_ok = ('swiglu', 'sssglu', 'reglu', 'rlglu', 'situ', 'quick_geglu')
+        _downscale_active = [n for n in _downscale_ok if _all_activation_flags.get(n)]
+        _downscale_ok_cli = ', '.join('--' + n.replace('_', '-') for n in _downscale_ok)
+        assert _downscale_active, (
+            '--downscale-glu requires a generic-path gated linear unit; combine it with one of: '
+            f'{_downscale_ok_cli}.'
+        )
+        _downscale_bad = [
+            n for n, v in _all_activation_flags.items() if v and n not in _downscale_ok
+        ]
+        assert not _downscale_bad, (
+            f'--downscale-glu is not compatible with {_downscale_bad}; it only supports the '
+            f'generic-path GLU gates {list(_downscale_ok)}.'
+        )
+        kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
@@ -2200,6 +2233,7 @@ def _add_network_size_args(parser):
         "xsssglu",
         "pn3glu",
         "polynorm",
+        "downscale_glu",
         "sandwich_norm",
         "post_attn_norm_zero_init",
         "keel",
@@ -2287,6 +2321,11 @@ def _add_network_size_args(parser):
                        help='Use RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. '
                        'Non-learnable; implies gated linear units. Fused the same way as SwiGLU '
                        '(honors --no-bias-swiglu-fusion); its gate derivative is the SSSGLU gate.')
+    group.add_argument('--situ', action='store_true',
+                       help='Use SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear '
+                       '(== sigmoid(x_glu)*tanh(x_glu)*x_linear). Non-learnable and elementwise '
+                       'like SwiGLU; implies gated linear units. No fused kernel (runs through the '
+                       'generic GLU path).')
     group.add_argument('--pnglu', action='store_true',
                        help='Replace the SiLU gate of SwiGLU with a learnable 2nd-order '
                        'PolyNorm: gate(x) = |a1|*RMSNorm(x) + |a2|*RMSNorm(x**2). '
@@ -2354,6 +2393,13 @@ def _add_network_size_args(parser):
                        help='Use PolyNorm as a standalone (non-gated) activation -- --pn3glu '
                        'without the GLU: |a1|*RMSNorm(x) + |a2|*RMSNorm(x^2) + '
                        '|a3|*RMSNorm(x^3). Each MoE expert gets its own coefficients.')
+    group.add_argument('--downscale-glu', action='store_true',
+                       help='Down-scale both gated-linear-unit fc1 halves by the signed square '
+                       'root before the gate: x_glu -> x_glu/sqrt(|x_glu|) and '
+                       'x_linear -> x_linear/sqrt(|x_linear|) (each == sign(z)*sqrt(|z|), 0 at 0). '
+                       'A GLU modifier (not an activation): requires and composes with a '
+                       'generic-path GLU gate (--swiglu/--sssglu/--reglu/--rlglu/--situ/'
+                       '--quick-geglu) and forces bias+activation fusion off.')
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
                        'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')

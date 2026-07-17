@@ -917,6 +917,42 @@ def rlglu_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def situ_act(x: torch.Tensor) -> torch.Tensor:
+    """SiTU gate: ``f(x) = sigmoid(x) * tanh(x)``.
+
+    Used as the gate of a gated linear unit (``situ_act(x_glu) * x_linear``, i.e.
+    ``sigmoid(x_glu) * tanh(x_glu) * x_linear``) via the generic (non-fused) GLU path —
+    dispatched by ``activation_func == situ_act`` with ``gated_linear_unit=True`` and
+    ``bias_activation_fusion=False``. Elementwise and non-learnable, like SwiGLU's SiLU gate, so
+    it needs no dedicated module or fused kernel (runs eager). Unlike the strictly-non-negative
+    SiLU/GELU gates, the ``tanh`` factor makes the gate change sign with ``x``: it is ~0 near the
+    origin, rises to a bounded positive lobe for ``x > 0`` (``-> +1`` as ``x -> +inf``) and dips
+    to a bounded negative lobe for ``x < 0`` (``-> 0`` as ``x -> -inf``, with a minimum in
+    between), giving a smooth saturating gate on both sides.
+    """
+    return torch.sigmoid(x) * torch.tanh(x)
+
+
+@jit_fuser
+def downscale_glu_transform(x: torch.Tensor) -> torch.Tensor:
+    """Signed square-root down-scaling of a GLU projection half: ``x / sqrt(|x|)``.
+
+    Written as ``sign(x) * sqrt(|x|)`` — algebraically equal to ``x / sqrt(|x|)`` for ``x != 0``
+    but defined (== 0) at ``x == 0`` instead of the literal form's ``0 / 0``. Applied elementwise
+    to *both* GLU halves (the gate/``x_glu`` and up/``x_linear`` projections) before the gate is
+    computed, when ``--downscale-glu`` is set. It compresses large-magnitude pre-activations
+    (output magnitude ``sqrt(|x|)``) while preserving sign — a magnitude-warping of the fc1
+    output that composes with any generic-path GLU gate (SwiGLU, SSSGLU, ReGLU, RLGLU, SiTU,
+    quick-GEGLU).
+
+    Note: the derivative ``0.5 / sqrt(|x|)`` diverges as ``x -> 0``; this is inherent to the
+    requested transform (there is no way to both match ``x / sqrt(|x|)`` and stay
+    Lipschitz at the origin).
+    """
+    return torch.sign(x) * torch.sqrt(torch.abs(x))
+
+
+@jit_fuser
 def quick_gelu(x: torch.Tensor) -> torch.Tensor:
     """Quick GELU activation"""
     return x * torch.sigmoid(1.702 * x)

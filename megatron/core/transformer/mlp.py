@@ -34,6 +34,7 @@ from megatron.core.activations import (
     XR2,
     XR2GLU,
     XSSSGLU,
+    downscale_glu_transform,
     rlglu_act,
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
@@ -481,6 +482,9 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
+                    if self.config.downscale_glu:
+                        x_glu = downscale_glu_transform(x_glu)
+                        x_linear = downscale_glu_transform(x_linear)
                     gate = self.config.activation_func(x_glu)
                     return gate * (x_linear + self.config.glu_linear_offset)
 

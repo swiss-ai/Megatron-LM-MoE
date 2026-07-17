@@ -459,12 +459,13 @@ def num_floating_point_operations(args, batch_size):
         fma_expansion_factor = 2
         # - 3x (gated linear unit): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
         # - 2x (non-gated): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
-        # sssglu/reglu/pnglu/pn3glu/gxpr/gxpry/gxprv2/gxr2/xr2glu/xsssglu (ReLU-, softsign-gated,
-        # PolyNorm-family and XPR-family GLU gates) are also GLUs (fc1 is h->2*ffn_h), so they
-        # count as gated even though they do not set args.swiglu.
+        # sssglu/reglu/rlglu/situ/pnglu/pn3glu/gxpr/gxpry/gxprv2/gxr2/xr2glu/xsssglu (ReLU-,
+        # softsign-, sigmoid*tanh-gated, PolyNorm-family and XPR-family GLU gates) are also GLUs
+        # (fc1 is h->2*ffn_h), so they count as gated even though they do not set args.swiglu.
         ffn_expansion_factor = 3 if (
-            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.pn3glu
-            or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
+            args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
+            or args.pn3glu or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu
+            or args.xsssglu
         ) else 2
 
         if args.multi_latent_attention:
@@ -708,11 +709,12 @@ def num_floating_point_operations(args, batch_size):
             gqa_groups=args.num_query_groups,
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
-            # sssglu/reglu/pnglu/pn3glu/gxpr/gxpry/gxprv2/gxr2/xr2glu/xsssglu are GLUs (gated) but
-            # do not set args.swiglu
+            # sssglu/reglu/rlglu/situ/pnglu/pn3glu/gxpr/gxpry/gxprv2/gxr2/xr2glu/xsssglu are GLUs
+            # (gated) but do not set args.swiglu
             swiglu=(
-                args.swiglu or args.sssglu or args.reglu or args.rlglu or args.pnglu or args.pn3glu
-                or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
+                args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
+                or args.pn3glu or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2
+                or args.xr2glu or args.xsssglu
             ),
             moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None

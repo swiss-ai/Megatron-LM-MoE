@@ -1538,6 +1538,7 @@ def load_args_from_checkpoint(
     _set_arg('sssglu', force=True)
     _set_arg('reglu', force=True)
     _set_arg('rlglu', force=True)
+    _set_arg('situ', force=True)
     _set_arg('pnglu', force=True)
     _set_arg('pnglu_fusion', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
@@ -1625,6 +1626,7 @@ def load_args_from_checkpoint(
     _set_arg('xr2glu', force=True)
     _set_arg('xsssglu', force=True)
     _set_arg('polynorm', force=True)
+    _set_arg('downscale_glu', force=True)
     _set_arg('qk_layernorm', force=True)
 
     # Tokenizer args.
