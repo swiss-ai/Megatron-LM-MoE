@@ -1001,6 +1001,19 @@ def compiled_situ_v2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def situ_v3_act(x: torch.Tensor) -> torch.Tensor:
+    """SiTU-v3 gate: :func:`situ_act` with the positive side replaced by ``0.5x / (1 + |0.5x|)``::
+
+        f(x) = 0.5x / (1 + |0.5x|)    (x > 0)     (softsign of 0.5x)
+             = sigmoid(x) * tanh(x)   (x <= 0)    (SiTU gate)
+
+    Used as the gate of a gated linear unit (``f(x_glu) * x_linear``) via the generic GLU path.
+    Both branches are 0 at ``x == 0`` (continuous there). Non-learnable, no fused kernel.
+    """
+    return torch.where(x > 0, 0.5 * x / (1 + torch.abs(0.5 * x)), torch.sigmoid(x) * torch.tanh(x))
+
+
+@jit_fuser
 def downscale_glu_transform(x: torch.Tensor) -> torch.Tensor:
     """Square-root down-scaling of the GLU projections (``--downscale-glu``): ``x / sqrt(|x|)``.
 

@@ -465,7 +465,7 @@ def num_floating_point_operations(args, batch_size):
         ffn_expansion_factor = 3 if (
             args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
             or args.pn3glu or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu
-            or args.xsssglu or args.situ_v2 or args.lnglu or args.lnglu_v2
+            or args.xsssglu or args.situ_v2 or args.situ_v3 or args.lnglu or args.lnglu_v2
             or args.lnglu_v3 or args.lnglu_v4 or args.tanhglu
         ) else 2
 
@@ -715,7 +715,7 @@ def num_floating_point_operations(args, batch_size):
             swiglu=(
                 args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
                 or args.pn3glu or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2
-                or args.xr2glu or args.xsssglu or args.situ_v2 or args.lnglu
+                or args.xr2glu or args.xsssglu or args.situ_v2 or args.situ_v3 or args.lnglu
                 or args.lnglu_v2 or args.lnglu_v3 or args.lnglu_v4 or args.tanhglu
             ),
             moe_latent_size=args.moe_latent_size,

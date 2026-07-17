@@ -1539,6 +1539,7 @@ def load_args_from_checkpoint(
     _set_arg('reglu', force=True)
     _set_arg('rlglu', force=True)
     _set_arg('situ', force=True)
+    _set_arg('situ_v3', force=True)
     _set_arg('lnglu', force=True)
     _set_arg('lnglu_v2', force=True)
     _set_arg('lnglu_v3', force=True)
