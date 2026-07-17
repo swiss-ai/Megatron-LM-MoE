@@ -988,15 +988,16 @@ def lnglu_v4_act(x: torch.Tensor) -> torch.Tensor:
 
 @jit_fuser
 def compiled_situ_v2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """SiTU-v2 GLU: ``silu(x) * x * tanh(y)`` (``== x**2 * sigmoid(x) * tanh(y)``).
+    """SiTU-v2 GLU: ``softsign(x) * (0.5 + 0.5*softsign(x)) * y``.
 
-    A genuine two-input gated unit: unlike SiTU (``sigmoid(x)*tanh(x)*y``, where the linear half
-    ``y`` is used linearly and so fits the generic ``gate(x)*y`` path), here the linear half is
-    passed through ``tanh``, so it needs its own dispatch branch (like XSSSGLU/GXPRY). Non-learnable
+    The gate is ``softsign(x)`` multiplied by ``softsign(x)`` rescaled from ``(-1, 1)`` to
+    ``(0, 1)`` (``0.5 + 0.5*softsign(x)``); the linear half ``y`` is used linearly. Non-learnable
     and elementwise; no fused kernel, runs eager. ``x`` is the GLU gate half (``x_glu``), ``y`` the
-    linear half (``x_linear``).
+    linear half (``x_linear``). (Kept as a two-input function -- rather than a gate on the generic
+    path -- so its dispatch branch is unchanged.)
     """
-    return F.silu(x) * x * torch.tanh(y)
+    s = F.softsign(x)
+    return s * (0.5 + 0.5 * s) * y
 
 
 @jit_fuser

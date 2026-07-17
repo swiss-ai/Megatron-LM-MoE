@@ -30,7 +30,8 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import (
-    squared_relu, rlglu_act, situ_act, lnglu_act, lnglu_v2_act, lnglu_v3_act, lnglu_v4_act
+    squared_relu, rlglu_act, situ_act,
+    lnglu_act, lnglu_v2_act, lnglu_v3_act, lnglu_v4_act,
 )
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_sssglu import ssslu
@@ -1092,8 +1093,8 @@ def validate_args(args, defaults={}):
         if (
             args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
             or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
-            or args.situ_v2 or args.lnglu or args.lnglu_v2 or args.lnglu_v3 or args.lnglu_v4
-            or args.tanhglu or args.pn3glu
+            or args.situ_v2 or args.lnglu or args.lnglu_v2 or args.lnglu_v3
+            or args.lnglu_v4 or args.tanhglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -2359,10 +2360,10 @@ def _add_network_size_args(parser):
                        'like SwiGLU; implies gated linear units. No fused kernel (runs through the '
                        'generic GLU path).')
     group.add_argument('--situ-v2', action='store_true',
-                       help='Use SiTU-v2: silu(x_glu)*x_glu*tanh(x_linear) '
-                       '(== x_glu^2*sigmoid(x_glu)*tanh(x_linear)). A two-input gated unit (the '
-                       'linear half goes through tanh), non-learnable; implies gated linear units. '
-                       'No fused kernel (dedicated eager branch).')
+                       help='Use SiTU-v2: softsign(x_glu)*(0.5+0.5*softsign(x_glu))*x_linear -- '
+                       'the gate is softsign(x_glu) times softsign(x_glu) rescaled to (0,1), '
+                       'times the linear half. Non-learnable; implies gated linear units. No fused '
+                       'kernel (dedicated eager branch).')
     group.add_argument('--lnglu', action='store_true',
                        help='Use LNGLU: gate f(x)=sign(x)*ln(1+|x|), output f(x_glu)*x_linear '
                        '(== x_glu*ln(|x_glu|+1)/|x_glu| * x_linear). Gate-form and non-learnable '

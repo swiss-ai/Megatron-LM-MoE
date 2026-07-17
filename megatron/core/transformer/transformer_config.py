@@ -311,10 +311,10 @@ class TransformerConfig(ModelParallelConfig):
     offloading-experts path."""
 
     situ_v2: bool = False
-    """If True, use the SiTU-v2 gated unit: ``silu(x_glu) * x_glu * tanh(x_linear)``
-    (``== x_glu**2 * sigmoid(x_glu) * tanh(x_linear)``). A genuine two-input op (the linear half
-    goes through ``tanh``, so unlike SiTU it does not fit the generic ``gate(x)*x_linear`` path) --
-    dispatched by its own branch like XSSSGLU/GXPRY, but non-learnable (no coefficients). Requires
+    """If True, use the SiTU-v2 gated unit:
+    ``softsign(x_glu) * (0.5 + 0.5*softsign(x_glu)) * x_linear`` -- the gate is ``softsign(x_glu)``
+    times ``softsign(x_glu)`` rescaled to ``(0, 1)``, multiplied by the linear half. Non-learnable
+    (no coefficients); dispatched by its own branch like XSSSGLU/GXPRY. Requires
     ``gated_linear_unit=True``. No fused kernel (runs eager). Not compatible with
     ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
 
