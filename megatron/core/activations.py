@@ -934,6 +934,21 @@ def situ_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def lnglu_act(x: torch.Tensor) -> torch.Tensor:
+    """LNGLU gate: ``f(x) = sign(x) * ln(1 + |x|)`` (``== x * ln(|x| + 1) / |x|``).
+
+    Used as the gate of a gated linear unit (``lnglu_act(x_glu) * x_linear``) via the generic
+    (non-fused) GLU path -- dispatched by ``activation_func == lnglu_act`` with
+    ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. Like SiTU the linear half
+    is used linearly, so this is gate-form and needs no dedicated branch. Written with
+    ``torch.sign`` so ``x == 0`` maps to 0 (the literal ``x/|x|`` form is ``0/0`` there); the gate
+    is a sign-preserving, logarithmically-growing (unbounded but slow) odd function whose
+    derivative ``1/(1 + |x|)`` is bounded in ``(0, 1]``, so it needs no epsilon guard.
+    """
+    return torch.sign(x) * torch.log(1 + torch.abs(x))
+
+
+@jit_fuser
 def compiled_situ_v2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """SiTU-v2 GLU: ``silu(x) * x * tanh(y)`` (``== x**2 * sigmoid(x) * tanh(y)``).
 
