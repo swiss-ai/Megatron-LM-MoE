@@ -1540,6 +1540,8 @@ def load_args_from_checkpoint(
     _set_arg('rlglu', force=True)
     _set_arg('situ', force=True)
     _set_arg('lnglu', force=True)
+    _set_arg('lnglu_v2', force=True)
+    _set_arg('tanhglu', force=True)
     _set_arg('pnglu', force=True)
     _set_arg('pnglu_fusion', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)

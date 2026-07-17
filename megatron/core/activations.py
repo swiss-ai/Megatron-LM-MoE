@@ -949,6 +949,16 @@ def lnglu_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def lnglu_v2_act(x: torch.Tensor) -> torch.Tensor:
+    """LNGLU-v2 gate: :func:`lnglu_act` divided by 2 -- ``f(x) = 0.5 * sign(x) * ln(1 + |x|)``.
+
+    Identical to LNGLU in every way (gate-form, generic GLU path, non-learnable, derivative
+    ``0.5 / (1 + |x|)`` bounded in ``(0, 0.5]``) except the gate magnitude is halved.
+    """
+    return 0.5 * torch.sign(x) * torch.log(1 + torch.abs(x))
+
+
+@jit_fuser
 def compiled_situ_v2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """SiTU-v2 GLU: ``silu(x) * x * tanh(y)`` (``== x**2 * sigmoid(x) * tanh(y)``).
 
