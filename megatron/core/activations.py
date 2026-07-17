@@ -960,21 +960,15 @@ def lnglu_v2_act(x: torch.Tensor) -> torch.Tensor:
 
 @jit_fuser
 def lnglu_v3_act(x: torch.Tensor) -> torch.Tensor:
-    """LNGLU-v3 gate: :func:`lnglu_act` with an asymmetric negative branch -- the ``x < 0`` side
-    uses ``|2x|`` (== ``2|x|``) inside the log and is scaled by ``1/2``::
+    """LNGLU-v3 gate: logarithmic on the positive side, SiLU on the negative side::
 
-        f(x) = ln(1 + |x|)             (x >= 0)
-             = -0.5 * ln(1 + |2x|)     (x < 0)
+        f(x) = ln(1 + |x|)     (x > 0)
+             = silu(x)         (x <= 0)
 
-    Same gate-form / generic GLU path / non-learnable behavior as LNGLU. Still 0 at ``x == 0`` and
-    derivative bounded.
+    Used as the gate of a gated linear unit (``f(x_glu) * x_linear``) via the generic GLU path.
+    Both branches are 0 at ``x == 0`` (continuous there). Non-learnable, no fused kernel.
     """
-    abs_x = torch.abs(x)
-    return torch.where(
-        x < 0,
-        -0.5 * torch.log(1 + 2.0 * abs_x),
-        torch.sign(x) * torch.log(1 + abs_x),
-    )
+    return torch.where(x > 0, torch.log(1 + torch.abs(x)), F.silu(x))
 
 
 @jit_fuser

@@ -1804,8 +1804,8 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = lnglu_v2_act
         kw_args['bias_activation_fusion'] = False
     elif args.lnglu_v3:
-        # LNGLU-v3: LNGLU with an asymmetric negative branch, f(x)=ln(1+|x|) for x>=0 and
-        # -0.5*ln(1+|2x|) for x<0. Same generic GLU path (activation_func == lnglu_v3_act).
+        # LNGLU-v3: gate f(x)=ln(1+|x|) for x>0 and silu(x) for x<=0, output f(x_glu)*x_linear.
+        # Same generic GLU path (activation_func == lnglu_v3_act).
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = lnglu_v3_act
@@ -2363,9 +2363,8 @@ def _add_network_size_args(parser):
                        help='Use LNGLU-v2: --lnglu with the gate divided by 2, '
                        'f(x)=0.5*sign(x)*ln(1+|x|). Implies gated linear units; no fused kernel.')
     group.add_argument('--lnglu-v3', action='store_true',
-                       help='Use LNGLU-v3: --lnglu with an asymmetric negative branch, '
-                       'f(x)=ln(1+|x|) for x>=0 and -0.5*ln(1+|2x|) for x<0. Implies gated linear '
-                       'units; no fused kernel.')
+                       help='Use LNGLU-v3: gate f(x)=ln(1+|x|) for x>0 and silu(x) for x<=0, '
+                       'output f(x_glu)*x_linear. Implies gated linear units; no fused kernel.')
     group.add_argument('--tanhglu', action='store_true',
                        help='Use TanhGLU: gate f(x)=tanh(x), output tanh(x_glu)*x_linear. '
                        'Gate-form and non-learnable; implies gated linear units. No fused kernel '
