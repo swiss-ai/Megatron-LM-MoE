@@ -972,6 +972,21 @@ def lnglu_v3_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def lnglu_v4_act(x: torch.Tensor) -> torch.Tensor:
+    """LNGLU-v4 gate: :func:`lnglu_v3_act` with the positive branch replaced by ``x / (1 + |x|)``
+    (softsign on the positive side)::
+
+        f(x) = x / (1 + |x|)   (x > 0)
+             = silu(x)         (x <= 0)
+
+    Used as the gate of a gated linear unit (``f(x_glu) * x_linear``) via the generic GLU path.
+    Both branches are 0 at ``x == 0`` (continuous there); the positive branch is bounded (-> 1)
+    unlike v3's logarithm. Non-learnable, no fused kernel.
+    """
+    return torch.where(x > 0, x / (1 + torch.abs(x)), F.silu(x))
+
+
+@jit_fuser
 def compiled_situ_v2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """SiTU-v2 GLU: ``silu(x) * x * tanh(y)`` (``== x**2 * sigmoid(x) * tanh(y)``).
 

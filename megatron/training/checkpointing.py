@@ -1542,6 +1542,7 @@ def load_args_from_checkpoint(
     _set_arg('lnglu', force=True)
     _set_arg('lnglu_v2', force=True)
     _set_arg('lnglu_v3', force=True)
+    _set_arg('lnglu_v4', force=True)
     _set_arg('tanhglu', force=True)
     _set_arg('pnglu', force=True)
     _set_arg('pnglu_fusion', force=True)

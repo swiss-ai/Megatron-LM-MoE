@@ -30,7 +30,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import (
-    squared_relu, rlglu_act, situ_act, lnglu_act, lnglu_v2_act, lnglu_v3_act
+    squared_relu, rlglu_act, situ_act, lnglu_act, lnglu_v2_act, lnglu_v3_act, lnglu_v4_act
 )
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_sssglu import ssslu
@@ -1092,8 +1092,8 @@ def validate_args(args, defaults={}):
         if (
             args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
             or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
-            or args.situ_v2 or args.lnglu or args.lnglu_v2 or args.lnglu_v3 or args.tanhglu
-            or args.pn3glu
+            or args.situ_v2 or args.lnglu or args.lnglu_v2 or args.lnglu_v3 or args.lnglu_v4
+            or args.tanhglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1810,6 +1810,13 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = lnglu_v3_act
         kw_args['bias_activation_fusion'] = False
+    elif args.lnglu_v4:
+        # LNGLU-v4: LNGLU-v3 with the positive branch replaced by x/(1+|x|), i.e. gate f(x)=
+        # x/(1+|x|) for x>0 and silu(x) for x<=0. Same generic GLU path.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = lnglu_v4_act
+        kw_args['bias_activation_fusion'] = False
     elif args.tanhglu:
         # TanhGLU: gate f(x)=tanh(x), output tanh(x_glu)*x_linear. Gate-form and non-learnable;
         # torch.tanh is used directly as activation_func (like --reglu uses F.relu). No fused kernel
@@ -1856,6 +1863,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'lnglu': args.lnglu,
         'lnglu_v2': args.lnglu_v2,
         'lnglu_v3': args.lnglu_v3,
+        'lnglu_v4': args.lnglu_v4,
         'tanhglu': args.tanhglu,
         'squared_relu': args.squared_relu,
         'quick_geglu': args.quick_geglu,
@@ -2365,6 +2373,10 @@ def _add_network_size_args(parser):
     group.add_argument('--lnglu-v3', action='store_true',
                        help='Use LNGLU-v3: gate f(x)=ln(1+|x|) for x>0 and silu(x) for x<=0, '
                        'output f(x_glu)*x_linear. Implies gated linear units; no fused kernel.')
+    group.add_argument('--lnglu-v4', action='store_true',
+                       help='Use LNGLU-v4: --lnglu-v3 with the positive branch replaced by '
+                       'x/(1+|x|), i.e. gate f(x)=x/(1+|x|) for x>0 and silu(x) for x<=0. Implies '
+                       'gated linear units; no fused kernel.')
     group.add_argument('--tanhglu', action='store_true',
                        help='Use TanhGLU: gate f(x)=tanh(x), output tanh(x_glu)*x_linear. '
                        'Gate-form and non-learnable; implies gated linear units. No fused kernel '
