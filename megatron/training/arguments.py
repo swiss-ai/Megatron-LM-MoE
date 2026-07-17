@@ -1863,28 +1863,6 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['bias_activation_fusion'] = False
     if args.polynorm:
         kw_args['bias_activation_fusion'] = False
-    if args.downscale_glu:
-        # downscale_glu is a GLU *modifier* (signed-sqrt down-scaling of both fc1 halves), not an
-        # activation. It is injected in the generic (non-fused) GLU path, so it only composes with
-        # the generic-path GLU gates and forces the bias+activation fusion off. Reject the
-        # learnable-module GLU/activation variants (which have their own dispatch branches that
-        # would silently bypass the transform) and the non-gated activations.
-        _downscale_ok = ('swiglu', 'sssglu', 'reglu', 'rlglu', 'situ', 'quick_geglu')
-        _downscale_active = [n for n in _downscale_ok if _all_activation_flags.get(n)]
-        _downscale_ok_cli = ', '.join('--' + n.replace('_', '-') for n in _downscale_ok)
-        assert _downscale_active, (
-            '--downscale-glu requires a generic-path gated linear unit; combine it with one of: '
-            f'{_downscale_ok_cli}.'
-        )
-        _downscale_bad = [
-            n for n, v in _all_activation_flags.items() if v and n not in _downscale_ok
-        ]
-        assert not _downscale_bad, (
-            f'--downscale-glu is not compatible with {_downscale_bad}; it only supports the '
-            f'generic-path GLU gates {list(_downscale_ok)}.'
-        )
-        kw_args['gated_linear_unit'] = True
-        kw_args['bias_activation_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -2394,12 +2372,10 @@ def _add_network_size_args(parser):
                        'without the GLU: |a1|*RMSNorm(x) + |a2|*RMSNorm(x^2) + '
                        '|a3|*RMSNorm(x^3). Each MoE expert gets its own coefficients.')
     group.add_argument('--downscale-glu', action='store_true',
-                       help='Down-scale both gated-linear-unit fc1 halves by the signed square '
-                       'root before the gate: x_glu -> x_glu/sqrt(|x_glu|) and '
-                       'x_linear -> x_linear/sqrt(|x_linear|) (each == sign(z)*sqrt(|z|), 0 at 0). '
-                       'A GLU modifier (not an activation): requires and composes with a '
-                       'generic-path GLU gate (--swiglu/--sssglu/--reglu/--rlglu/--situ/'
-                       '--quick-geglu) and forces bias+activation fusion off.')
+                       help='Down-scale the fc1 output (both GLU projections) by x/sqrt(|x|) before '
+                       'the activation: gate -> gate/sqrt(|gate|), up -> up/sqrt(|up|) '
+                       '(sign-preserving). Plain elementwise op applied to the whole fc1 output; '
+                       'composes with any activation and keeps the fused kernels.')
     group.add_argument('--sandwich-norm', action='store_true',
                        help='Apply an extra normalization to each sublayer output before the '
                        'residual add (sandwich / post-norm): x = x + Norm(Sublayer(Norm(x))).')

@@ -312,6 +312,11 @@ class MLP(MegatronModule):
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
+        # Down-scale both GLU projections by sqrt(|.|) before the activation. Applied to the whole
+        # fc1 output (== both halves), so the fused/generic activation below is untouched.
+        if self.config.downscale_glu:
+            intermediate_parallel = downscale_glu_transform(intermediate_parallel)
+
         nvtx_range_push(suffix="activation")
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
@@ -482,9 +487,6 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
-                    if self.config.downscale_glu:
-                        x_glu = downscale_glu_transform(x_glu)
-                        x_linear = downscale_glu_transform(x_linear)
                     gate = self.config.activation_func(x_glu)
                     return gate * (x_linear + self.config.glu_linear_offset)
 

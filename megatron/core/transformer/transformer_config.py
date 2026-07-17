@@ -327,16 +327,11 @@ class TransformerConfig(ModelParallelConfig):
     ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
 
     downscale_glu: bool = False
-    """If True, down-scale *both* halves of a gated linear unit's fc1 output by the signed
-    square root before the gate is applied: ``x_glu -> x_glu / sqrt(|x_glu|)`` and
-    ``x_linear -> x_linear / sqrt(|x_linear|)`` (each computed as ``sign(z) * sqrt(|z|)`` so
-    ``z == 0`` maps to 0). This compresses large-magnitude pre-activations while preserving sign.
-    A GLU *modifier*, not an activation: it requires ``gated_linear_unit=True`` and composes with
-    the generic-path (non-module) GLU gates -- SwiGLU (``--swiglu``), SSSGLU (``--sssglu``),
-    ReGLU (``--reglu``), RLGLU (``--rlglu``), SiTU (``--situ``) and quick-GEGLU
-    (``--quick-geglu``). Because the transform is injected in the generic GLU path, it forces
-    ``bias_activation_fusion=False`` and is not compatible with the learnable-module GLU/activation
-    variants (pnglu/pn3glu/gxpr*/gxr2/xr2glu/xsssglu/xpr/xr2/polynorm) or ``use_te_activation_func``."""
+    """If True, down-scale the fc1 output (both GLU projections) by ``x / sqrt(|x|)`` before the
+    activation, i.e. ``gate -> gate / sqrt(|gate|)`` and ``up -> up / sqrt(|up|)`` (sign-preserving,
+    with a small floor inside the sqrt so ``x == 0`` maps to 0). Applied to the whole fc1 output as
+    a plain elementwise op, so it composes with whatever activation follows (fused or not) and adds
+    no restrictions."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -1570,40 +1565,6 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_use_offloading_experts:
                 raise ValueError(
                     f"{_active_name}=True is not wired into the offloading-experts path yet."
-                )
-
-        # downscale_glu is a GLU modifier (signed-sqrt down-scaling of both fc1 halves) injected in
-        # the generic (non-fused) GLU path. It needs a gated linear unit, cannot run under the fused
-        # bias+activation kernels / TE activation builder (the transform lives only in the eager
-        # path), is not wired into the offloading-experts path, and cannot be combined with the
-        # learnable-module GLU/activation variants (their dedicated dispatch branches would bypass
-        # the transform).
-        if self.downscale_glu:
-            if not self.gated_linear_unit:
-                raise ValueError(
-                    "downscale_glu=True requires gated_linear_unit=True (it rescales the two GLU "
-                    "halves)."
-                )
-            if self.bias_activation_fusion:
-                raise ValueError(
-                    "downscale_glu=True is incompatible with bias_activation_fusion: the transform "
-                    "is only applied in the generic GLU path. Disable bias-activation fusion "
-                    "(e.g. --no-bias-swiglu-fusion)."
-                )
-            if self.use_te_activation_func:
-                raise ValueError(
-                    "downscale_glu=True is incompatible with use_te_activation_func (the transform "
-                    "is only applied in the generic GLU path)."
-                )
-            if self.moe_use_offloading_experts:
-                raise ValueError(
-                    "downscale_glu=True is not wired into the offloading-experts path yet."
-                )
-            if _active_new_activations:
-                raise ValueError(
-                    f"downscale_glu=True cannot be combined with {_active_new_activations[0]}=True; "
-                    "it only supports the generic-path GLU gates (swiglu/sssglu/reglu/rlglu/situ/"
-                    "quick_geglu)."
                 )
 
         # SSSGLU (activation_func == ssslu) is wired into the offloading experts' fp8 lane

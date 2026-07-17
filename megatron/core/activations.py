@@ -935,21 +935,14 @@ def situ_act(x: torch.Tensor) -> torch.Tensor:
 
 @jit_fuser
 def downscale_glu_transform(x: torch.Tensor) -> torch.Tensor:
-    """Signed square-root down-scaling of a GLU projection half: ``x / sqrt(|x|)``.
+    """Square-root down-scaling of the GLU projections (``--downscale-glu``): ``x / sqrt(|x|)``.
 
-    Written as ``sign(x) * sqrt(|x|)`` — algebraically equal to ``x / sqrt(|x|)`` for ``x != 0``
-    but defined (== 0) at ``x == 0`` instead of the literal form's ``0 / 0``. Applied elementwise
-    to *both* GLU halves (the gate/``x_glu`` and up/``x_linear`` projections) before the gate is
-    computed, when ``--downscale-glu`` is set. It compresses large-magnitude pre-activations
-    (output magnitude ``sqrt(|x|)``) while preserving sign — a magnitude-warping of the fc1
-    output that composes with any generic-path GLU gate (SwiGLU, SSSGLU, ReGLU, RLGLU, SiTU,
-    quick-GEGLU).
-
-    Note: the derivative ``0.5 / sqrt(|x|)`` diverges as ``x -> 0``; this is inherent to the
-    requested transform (there is no way to both match ``x / sqrt(|x|)`` and stay
-    Lipschitz at the origin).
+    Sign-preserving (``== sign(x) * sqrt(|x|)`` for ``|x|`` >> the floor). Applied elementwise to
+    the whole fc1 output (i.e. to both the gate and up projections) before the activation, so it
+    composes with whatever GLU gate follows. The ``1e-6`` floor inside the sqrt avoids the ``0/0``
+    at ``x == 0`` (giving 0 there) and keeps the backward gradient finite instead of NaN.
     """
-    return torch.sign(x) * torch.sqrt(torch.abs(x))
+    return x / torch.sqrt(torch.abs(x) + 1e-6)
 
 
 @jit_fuser
