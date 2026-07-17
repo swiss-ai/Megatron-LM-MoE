@@ -1811,8 +1811,8 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = lnglu_v3_act
         kw_args['bias_activation_fusion'] = False
     elif args.lnglu_v4:
-        # LNGLU-v4: LNGLU-v3 with the positive branch replaced by x/(1+|x|), i.e. gate f(x)=
-        # x/(1+|x|) for x>0 and silu(x) for x<=0. Same generic GLU path.
+        # LNGLU-v4: LNGLU-v3 with the positive branch replaced by 0.5x/(1+|0.5x|), i.e. gate f(x)=
+        # 0.5x/(1+|0.5x|) for x>0 and silu(x) for x<=0. Same generic GLU path.
         assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = lnglu_v4_act
@@ -2375,8 +2375,8 @@ def _add_network_size_args(parser):
                        'output f(x_glu)*x_linear. Implies gated linear units; no fused kernel.')
     group.add_argument('--lnglu-v4', action='store_true',
                        help='Use LNGLU-v4: --lnglu-v3 with the positive branch replaced by '
-                       'x/(1+|x|), i.e. gate f(x)=x/(1+|x|) for x>0 and silu(x) for x<=0. Implies '
-                       'gated linear units; no fused kernel.')
+                       '0.5x/(1+|0.5x|), i.e. gate f(x)=0.5x/(1+|0.5x|) for x>0 and silu(x) for '
+                       'x<=0. Implies gated linear units; no fused kernel.')
     group.add_argument('--tanhglu', action='store_true',
                        help='Use TanhGLU: gate f(x)=tanh(x), output tanh(x_glu)*x_linear. '
                        'Gate-form and non-learnable; implies gated linear units. No fused kernel '
