@@ -1014,6 +1014,19 @@ def situ_v3_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def situ_v4_act(x: torch.Tensor) -> torch.Tensor:
+    """SiTU-v4 gate: ``f(x) = sign(x - 1) * ln(|x - 1| + 1) + ln(2)``.
+
+    The antiderivative of ``1 / (1 + |x - 1|)`` (its derivative is exactly that, bounded in
+    ``(0, 1]``), plus the ``+ln(2)`` bias so the gate passes through the origin: ``f(0) == 0``.
+    Used as the gate of a gated linear unit (``f(x_glu) * x_linear``) via the generic GLU path.
+    Non-learnable, no fused kernel.
+    """
+    xm1 = x - 1
+    return torch.sign(xm1) * torch.log(torch.abs(xm1) + 1) + 0.6931471805599453
+
+
+@jit_fuser
 def downscale_glu_transform(x: torch.Tensor) -> torch.Tensor:
     """Square-root down-scaling of the GLU projections (``--downscale-glu``): ``x / sqrt(|x|)``.
 
