@@ -1541,6 +1541,7 @@ def load_args_from_checkpoint(
     _set_arg('situ', force=True)
     _set_arg('situ_v3', force=True)
     _set_arg('situ_v4', force=True)
+    _set_arg('situ_v5', force=True)
     _set_arg('lnglu', force=True)
     _set_arg('lnglu_v2', force=True)
     _set_arg('lnglu_v3', force=True)

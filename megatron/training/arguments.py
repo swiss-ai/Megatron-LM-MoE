@@ -30,7 +30,7 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import (
-    squared_relu, rlglu_act, situ_act, situ_v3_act, situ_v4_act,
+    squared_relu, rlglu_act, situ_act, situ_v3_act, situ_v4_act, situ_v5_act,
     lnglu_act, lnglu_v2_act, lnglu_v3_act, lnglu_v4_act,
 )
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -1093,8 +1093,8 @@ def validate_args(args, defaults={}):
         if (
             args.swiglu or args.sssglu or args.reglu or args.rlglu or args.situ or args.pnglu
             or args.gxpr or args.gxpry or args.gxprv2 or args.gxr2 or args.xr2glu or args.xsssglu
-            or args.situ_v2 or args.situ_v3 or args.situ_v4 or args.lnglu or args.lnglu_v2
-            or args.lnglu_v3 or args.lnglu_v4 or args.tanhglu or args.pn3glu
+            or args.situ_v2 or args.situ_v3 or args.situ_v4 or args.situ_v5 or args.lnglu
+            or args.lnglu_v2 or args.lnglu_v3 or args.lnglu_v4 or args.tanhglu or args.pn3glu
         ):
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
@@ -1804,6 +1804,13 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = situ_v4_act
         kw_args['bias_activation_fusion'] = False
+    elif args.situ_v5:
+        # SiTU-v5: gate f(x)=softsign(x-1)+0.5, output f(x_glu)*x_linear. Gate-form, generic GLU
+        # path (activation_func == situ_v5_act).
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = situ_v5_act
+        kw_args['bias_activation_fusion'] = False
     elif args.lnglu:
         # LNGLU: gate f(x)=sign(x)*ln(1+|x|), output f(x_glu)*x_linear (== x_glu*ln(|x_glu|+1)/
         # |x_glu| * x_linear). Gate-form like SiTU (linear half used linearly), non-learnable, no
@@ -1878,6 +1885,7 @@ def core_transformer_config_from_args(args, config_class=None):
         'situ': args.situ,
         'situ_v3': args.situ_v3,
         'situ_v4': args.situ_v4,
+        'situ_v5': args.situ_v5,
         'lnglu': args.lnglu,
         'lnglu_v2': args.lnglu_v2,
         'lnglu_v3': args.lnglu_v3,
@@ -2389,6 +2397,9 @@ def _add_network_size_args(parser):
                        help='Use SiTU-v4: gate f(x)=sign(x-1)*ln(|x-1|+1)+ln(2) (integral of '
                        '1/(1+|x-1|), biased through the origin), output f(x_glu)*x_linear. Implies '
                        'gated linear units; no fused kernel (generic GLU path).')
+    group.add_argument('--situ-v5', action='store_true',
+                       help='Use SiTU-v5: gate f(x)=softsign(x-1)+0.5, output f(x_glu)*x_linear. '
+                       'Implies gated linear units; no fused kernel (generic GLU path).')
     group.add_argument('--lnglu', action='store_true',
                        help='Use LNGLU: gate f(x)=sign(x)*ln(1+|x|), output f(x_glu)*x_linear '
                        '(== x_glu*ln(|x_glu|+1)/|x_glu| * x_linear). Gate-form and non-learnable '

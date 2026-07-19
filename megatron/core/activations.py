@@ -1027,6 +1027,17 @@ def situ_v4_act(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def situ_v5_act(x: torch.Tensor) -> torch.Tensor:
+    """SiTU-v5 gate: ``f(x) = softsign(x - 1) + 0.5``.
+
+    Softsign shifted right by 1 and up by 0.5, so ``f(0) == 0`` (passes through the origin) and
+    ``f -> 1.5`` as ``x -> +inf``, ``f -> -0.5`` as ``x -> -inf``. Used as the gate of a gated
+    linear unit (``f(x_glu) * x_linear``) via the generic GLU path. Non-learnable, no fused kernel.
+    """
+    return F.softsign(x - 1) + 0.5
+
+
+@jit_fuser
 def downscale_glu_transform(x: torch.Tensor) -> torch.Tensor:
     """Square-root down-scaling of the GLU projections (``--downscale-glu``): ``x / sqrt(|x|)``.
 
