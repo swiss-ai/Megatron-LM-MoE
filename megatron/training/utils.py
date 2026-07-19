@@ -46,6 +46,18 @@ from megatron.core.utils import (
 from megatron.core.transformer.module import param_is_not_shared
 
 
+def _calc_cpu_tensors_l2_norm_squared(tensors, chunk_numel=16 * 1024 * 1024):
+    """Calculate a squared L2 norm for CPU tensors without a full FP32 copy."""
+    norm_2 = torch.zeros((), dtype=torch.float64, device='cpu')
+    for tensor in tensors:
+        flat_tensor = tensor.detach().reshape(-1)
+        for start in range(0, flat_tensor.numel(), chunk_numel):
+            chunk = flat_tensor[start : start + chunk_numel]
+            chunk_norm = torch.linalg.vector_norm(chunk, ord=2, dtype=torch.float32)
+            norm_2 += chunk_norm.double().square()
+    return norm_2
+
+
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters"""
     args = get_args()
@@ -94,7 +106,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                     else:
                         # Fallback to original logic of making a fp32 copy of the
                         # parameter if `.main_param` attribute is not available.
-                        moe_params_data.append(param.data.float())
+                        param_data = param.data
+                        moe_params_data.append(
+                            param_data if param_data.device.type == 'cpu' else param_data.float()
+                        )
                 else:
                     moe_params_data.append(param.data)
             else:
@@ -154,13 +169,26 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
-        moe_norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [moe_params_data],
-            False,  # no per-parameter norm.
-        )
-        moe_norm_2 = moe_norm * moe_norm
+        cuda_moe_params = [param for param in moe_params_data if param.device.type == 'cuda']
+        cpu_moe_params = [param for param in moe_params_data if param.device.type == 'cpu']
+        if len(cuda_moe_params) + len(cpu_moe_params) != len(moe_params_data):
+            devices = sorted({str(param.device) for param in moe_params_data})
+            raise RuntimeError(f'Unsupported devices for MoE parameter norm: {devices}')
+
+        moe_norm_2 = torch.zeros_like(norm_2)
+        if len(cuda_moe_params) > 0:
+            moe_norm, _ = multi_tensor_applier(
+                multi_tensor_l2norm,
+                dummy_overflow_buf,
+                [cuda_moe_params],
+                False,  # no per-parameter norm.
+            )
+            moe_norm_2 += moe_norm * moe_norm
+
+        if len(cpu_moe_params) > 0:
+            # multi_tensor_l2norm is CUDA-only.
+            cpu_moe_norm_2 = _calc_cpu_tensors_l2_norm_squared(cpu_moe_params)
+            moe_norm_2 += cpu_moe_norm_2.to(device=norm_2.device, dtype=norm_2.dtype)
 
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.

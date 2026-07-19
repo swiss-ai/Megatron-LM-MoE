@@ -357,6 +357,61 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
     _deinit_distributed()
 
 
+@pytest.mark.internal
+def test_param_norm_cpu_offloaded_expert_bypasses_cuda_fused_norm():
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Module()
+    model.register_parameter(
+        'dense_weight', torch.nn.Parameter(torch.ones(1, dtype=torch.float32, device='cuda'))
+    )
+    model.register_parameter(
+        'expert_weight', torch.nn.Parameter(torch.ones(1, dtype=torch.float32, device='cpu'))
+    )
+    model.expert_weight.allreduce = False
+
+    def fake_multi_tensor_applier(_op, _overflow_buf, tensor_lists, _per_parameter):
+        tensors = tensor_lists[0]
+        assert all(tensor.device.type == 'cuda' for tensor in tensors)
+        norm = sum(tensor.float().pow(2).sum().item() for tensor in tensors) ** 0.5
+        return torch.tensor([norm], dtype=torch.float32, device=tensors[0].device), None
+
+    reduced_devices = []
+
+    def record_all_reduce(tensor, *args, **kwargs):
+        reduced_devices.append(tensor.device.type)
+
+    mock_args = SimpleNamespace(bf16=False, use_megatron_fsdp=False)
+    with (
+        mock.patch.object(training_util, 'get_args', new=lambda: mock_args),
+        mock.patch.object(
+            training_util, 'multi_tensor_applier', side_effect=fake_multi_tensor_applier
+        ),
+        mock.patch.object(torch.distributed, 'all_reduce', side_effect=record_all_reduce),
+    ):
+        assert training_util.calc_params_l2_norm(model) == pytest.approx(2**0.5)
+
+    assert reduced_devices
+    assert set(reduced_devices) == {'cuda'}
+
+    _deinit_distributed()
+
+
+def test_cpu_tensors_l2_norm_squared():
+    tensors = [
+        torch.tensor([3.0, 4.0], dtype=torch.bfloat16),
+        torch.tensor([5.0, 12.0], dtype=torch.float32),
+    ]
+
+    norm_2 = training_util._calc_cpu_tensors_l2_norm_squared(tensors, chunk_numel=1)
+
+    assert norm_2.item() == pytest.approx(194.0)
+
+
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_straggler_detector():
