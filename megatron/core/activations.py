@@ -894,6 +894,78 @@ class XSSSGLU(MegatronModule):
         return out
 
 
+class SiTUV6(MegatronModule):
+    """SiTU-v6 GLU: ``(softsign(x_glu - |beta|) + softsign(|beta|)) * x_linear`` with a learnable
+    shift ``beta``.
+
+    :func:`situ_v5_act` (``softsign(x - 1) + 0.5``) with the fixed ``1`` replaced by a **trainable**
+    ``beta``, constrained positive via ``abs``, and the fixed ``0.5`` offset replaced by
+    ``softsign(|beta|)`` so the gate passes through the origin for any ``beta`` (at ``x == 0`` the
+    two softsign terms cancel by oddness). Init ``beta == 1`` gives ``softsign(1) == 0.5``, so at
+    init this is exactly SiTU-v5.
+    Like the PolyNorm/XPR/XSSSGLU family, ``beta`` is **per (local) expert**: shape
+    ``(num_local_experts,)``, expanded to per-token via ``tokens_per_expert`` (each token uses the
+    ``beta`` of the expert it was routed to). A dense MLP (or a SequentialMLP / shared expert)
+    has ``num_local_experts == 1`` and the single ``beta`` broadcasts to all tokens. The linear half
+    ``x_linear`` is used linearly. No fused kernel (runs eager).
+
+    As with the other ``abs``-constrained coefficients in this file, ``beta`` needs a nonzero init
+    (``d|b|/db == sign(0) == 0`` in PyTorch, so a zero init would receive a permanent zero gradient);
+    the default ``1.0`` satisfies this.
+
+    Tensor parallelism: the gate half is sharded over the ffn feature dim across ``tp_group`` (main
+    TP for a dense MLP, expert-TP for MoE experts), so each rank computes only a partial ``beta``
+    gradient (a sum over its feature shard). The gradient is all-reduced over ``tp_group`` (forward
+    is identity) so the replicated ``beta`` stays in sync at any TP/ETP degree.
+    """
+
+    def __init__(self, num_local_experts: int = 1, config=None, beta_init: float = 1.0, tp_group=None):
+        super().__init__(config=config)
+        self.num_local_experts = num_local_experts
+        self.beta = nn.Parameter(torch.full((num_local_experts,), beta_init))
+        self.tp_group = tp_group
+        if tp_group is not None and torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.tp_size = torch.distributed.get_world_size(group=tp_group)
+        else:
+            self.tp_size = 1
+
+    def _coeffs(self, x, tokens_per_expert):
+        """Return ``|beta|``, positive and expanded per-token (broadcastable against ``x``)."""
+        beta = self.beta
+        if self.tp_size > 1:
+            # Replicated across the feature-sharded group: sum its partial gradient across the
+            # group so the replicas stay in sync (forward unchanged).
+            beta = _SyncGradSum.apply(beta, self.tp_group)
+        beta = torch.abs(beta)  # keep the shift positive (beta > 0)
+
+        if self.num_local_experts == 1 or tokens_per_expert is None:
+            if self.num_local_experts > 1:
+                raise ValueError(
+                    "SiTUV6 with num_local_experts > 1 requires `tokens_per_expert` so the "
+                    "per-expert beta can be mapped onto the concatenated tokens."
+                )
+            return beta  # (1,) broadcasts against x
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+        tpe = torch.tensor(tokens_per_expert, device=x.device)
+        return torch.repeat_interleave(beta, tpe).unsqueeze(-1)  # (num_tokens, 1)
+
+    def forward(self, x_glu, x_linear, tokens_per_expert=None, scores=None):
+        """Return ``(softsign(x_glu - |beta|) + softsign(|beta|)) * x_linear * [scores]``.
+
+        The additive term is ``softsign(|beta|)`` (not a fixed 0.5) so the gate passes through the
+        origin for any ``beta``: at ``x_glu == 0`` it is ``softsign(-|beta|) + softsign(|beta|) == 0``
+        (softsign is odd). At init ``|beta| == 1`` this is ``softsign(1) == 0.5``, recovering SiTU-v5.
+        """
+        beta = self._coeffs(x_glu, tokens_per_expert).to(x_glu.dtype)
+        gate = F.softsign(x_glu - beta) + F.softsign(beta)
+        out = gate * x_linear
+        if scores is not None:
+            original_dtype = out.dtype
+            out = (out * scores).to(original_dtype)
+        return out
+
+
 @jit_fuser
 def squared_relu(x: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation"""

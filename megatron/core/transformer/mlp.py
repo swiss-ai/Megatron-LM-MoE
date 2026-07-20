@@ -34,6 +34,7 @@ from megatron.core.activations import (
     XR2,
     XR2GLU,
     XSSSGLU,
+    SiTUV6,
     compiled_situ_v2,
     downscale_glu_transform,
     rlglu_act,
@@ -284,6 +285,11 @@ class MLP(MegatronModule):
             self.xr2glu = XR2GLU(num_local_experts=1, config=self.config)
         if self.config.xsssglu:
             self.xsssglu_glu = XSSSGLU(num_local_experts=1, config=self.config)
+        if self.config.situ_v6:
+            # Per-expert trainable beta; a dense MLP owns one. tp_group for its gradient sync.
+            self.situ_v6_glu = SiTUV6(
+                num_local_experts=1, config=self.config, tp_group=self.tp_group
+            )
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=1, config=self.config, tp_group=self.tp_group
@@ -480,6 +486,16 @@ class MLP(MegatronModule):
                     x_linear = x_linear + self.config.glu_linear_offset
                 scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
                 intermediate_parallel = self.xsssglu_glu(x_glu, x_linear, scores=scores)
+                scale_fused = per_token_scale is not None
+            elif self.config.gated_linear_unit and self.config.situ_v6:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                scores = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+                intermediate_parallel = self.situ_v6_glu(x_glu, x_linear, scores=scores)
                 scale_fused = per_token_scale is not None
             elif self.config.gated_linear_unit and self.config.situ_v2:
                 # SiTU-v2: silu(x_glu) * x_glu * tanh(x_linear). Non-learnable two-input op, so no

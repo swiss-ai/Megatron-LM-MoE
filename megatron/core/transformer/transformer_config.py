@@ -310,6 +310,17 @@ class TransformerConfig(ModelParallelConfig):
     yet. Not compatible with ``bias_activation_fusion``, ``use_te_activation_func``, or the
     offloading-experts path."""
 
+    situ_v6: bool = False
+    """If True, use the SiTU-v6 gated unit:
+    ``(softsign(x_glu - |beta|) + softsign(|beta|)) * x_linear`` where ``beta`` is a trainable shift,
+    constrained positive via ``abs`` (init 1.0, so it starts identical to SiTU-v5). The
+    ``softsign(|beta|)`` offset makes the gate pass through the origin for any ``beta``. A
+    normalization-style learnable bias, one per (local) expert
+    (``tokens_per_expert``-expanded like the PolyNorm/XSSSGLU family; a dense MLP has one). Its
+    gradient is all-reduced across the tensor-parallel group so it stays consistent at any TP/ETP
+    degree. Requires ``gated_linear_unit=True``. No fused kernel. Not compatible with
+    ``bias_activation_fusion``, ``use_te_activation_func``, or the offloading-experts path."""
+
     situ_v2: bool = False
     """If True, use the SiTU-v2 gated unit:
     ``softsign(x_glu) * (0.5 + 0.5*softsign(x_glu)) * x_linear`` -- the gate is ``softsign(x_glu)``
@@ -1541,6 +1552,7 @@ class TransformerConfig(ModelParallelConfig):
             'xr2glu': self.xr2glu,
             'xsssglu': self.xsssglu,
             'situ_v2': self.situ_v2,
+            'situ_v6': self.situ_v6,
             'pn3glu': self.pn3glu,
             'polynorm': self.polynorm,
         }
@@ -1553,7 +1565,8 @@ class TransformerConfig(ModelParallelConfig):
         if _active_new_activations:
             _active_name = _active_new_activations[0]
             _is_gated = _active_name in (
-                'gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'xsssglu', 'situ_v2', 'pn3glu',
+                'gxpr', 'gxpry', 'gxprv2', 'gxr2', 'xr2glu', 'xsssglu', 'situ_v2', 'situ_v6',
+                'pn3glu',
             )
             if _is_gated and not self.gated_linear_unit:
                 raise ValueError(

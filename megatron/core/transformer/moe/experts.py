@@ -25,6 +25,7 @@ from megatron.core.activations import (
     XR2,
     XR2GLU,
     XSSSGLU,
+    SiTUV6,
     compiled_situ_v2,
     downscale_glu_transform,
     squared_relu,
@@ -294,6 +295,13 @@ class TEGroupedMLP(MegatronModule):
             self.xsssglu_glu = XSSSGLU(
                 num_local_experts=self.num_local_experts, config=self.config
             )
+        if self.config.situ_v6:
+            # Per-expert trainable beta; tp_group is the expert-TP group for its gradient sync.
+            self.situ_v6_glu = SiTUV6(
+                num_local_experts=self.num_local_experts,
+                config=self.config,
+                tp_group=self.tp_group,
+            )
         if self.config.polynorm:
             self.polynorm_act = PolyNormAct(
                 num_local_experts=self.num_local_experts,
@@ -542,6 +550,17 @@ class TEGroupedMLP(MegatronModule):
                     x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
                 )
                 probs_fused = True
+            elif self.config.gated_linear_unit and self.config.situ_v6:
+                x_glu, x_linear = torch.chunk(intermediate_parallel, 2, dim=-1)
+                if (val := self.config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                if self.config.glu_linear_offset != 0.0:
+                    x_linear = x_linear + self.config.glu_linear_offset
+                intermediate_parallel = self.situ_v6_glu(
+                    x_glu, x_linear, tokens_per_expert=tokens_per_expert, scores=permuted_probs
+                )
+                probs_fused = True
             elif self.config.gated_linear_unit and self.config.situ_v2:
                 # SiTU-v2: silu(x_glu) * x_glu * tanh(x_linear). Non-learnable two-input op (no
                 # per-expert coefficients, so tokens_per_expert is unused and no fp8-padding
@@ -622,6 +641,7 @@ class TEGroupedMLP(MegatronModule):
                 or self.config.gxr2
                 or self.config.xr2glu
                 or self.config.xsssglu
+                or self.config.situ_v6
                 or self.config.polynorm
             ):
                 # These all have the same per-expert-coefficient repeat_interleave gradient
@@ -709,7 +729,7 @@ class TEGroupedMLP(MegatronModule):
             module_sharded_offsets = sharded_offsets
             if name in (
                 'polynorm_glu', 'xpr_act', 'gxpr_glu', 'gxpry_glu', 'gxprv2_glu', 'xr2_act',
-                'gxr2_glu', 'xr2glu', 'xsssglu_glu', 'polynorm_act',
+                'gxr2_glu', 'xr2glu', 'xsssglu_glu', 'situ_v6_glu', 'polynorm_act',
             ) and not singleton_local_shards:
                 # The PolyNorm/XPR/GXPR/XR2/GXR2/XR2GLU/XSSSGLU/PolyNormAct coefficients are stored as a single
                 # (num_local_experts,) tensor. Prepend an expert-parallel sharding axis so this rank's coefficients
