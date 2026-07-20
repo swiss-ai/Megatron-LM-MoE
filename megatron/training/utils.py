@@ -645,7 +645,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         cu_seqlens = None
-        if args.hybrid_context_parallel or args.sft:
+        if (
+            args.hybrid_context_parallel
+            or args.sft
+            or getattr(args, 'dataloader_inter_document_masking', False)
+        ):
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
