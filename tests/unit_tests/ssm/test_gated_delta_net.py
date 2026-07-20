@@ -16,6 +16,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -139,6 +140,44 @@ class TestGatedDeltaNet:
         assert (
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+    def test_forward_thd_correctness(self):
+        """Packed (THD) forward with cross-document masking must match running each
+        document independently in dense (SBHD) mode -- i.e. cu_seqlens correctly
+        resets the chunkwise recurrence at every document boundary."""
+        if self.cp_size > 1 or self.sp_size > 1:
+            pytest.skip("Packed-sequence GDN forward does not support CP/SP yet.")
+        gdn = self.gdn
+
+        num_docs = 4
+        doc_len = 32
+        total_len = num_docs * doc_len
+        hidden = gdn.config.hidden_size
+
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            total_len, 1, hidden, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+
+        cu_seqlens = torch.arange(
+            0, total_len + doc_len, doc_len, device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=doc_len,
+            max_seqlen_kv=doc_len,
+        )
+        packed_out, _ = gdn(hidden_states, attention_mask=None, packed_seq_params=packed_seq_params)
+
+        # Dense reference: same tokens, reshaped so each document is its own batch
+        # element, run with no packed_seq_params (plain SBHD path).
+        dense_hidden_states = hidden_states.view(num_docs, doc_len, hidden).transpose(0, 1).contiguous()
+        dense_out, _ = gdn(dense_hidden_states, attention_mask=None)
+        dense_out_flat = dense_out.transpose(0, 1).reshape(total_len, 1, hidden)
+
+        torch.testing.assert_close(packed_out, dense_out_flat, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize(
