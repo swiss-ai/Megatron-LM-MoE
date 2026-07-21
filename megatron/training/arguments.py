@@ -3580,13 +3580,9 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
-    group.add_argument('--linear-attention-backend', type=str, default='fla',
-                       choices=['fla', 'flash_qla'],
-                       help='Kernel backend for the gated delta rule. "fla" uses '
-                            'flash-linear-attention Triton kernels (portable). "flash_qla" uses '
-                            'the FlashQLA TileLang kernels (2-3x faster forward, 2x faster '
-                            'backward) but requires SM90/SM100 (Hopper/Blackwell) and the '
-                            'flash-qla package.')
+    # NOTE: --linear-attention-backend is auto-generated from the TransformerConfig
+    # `linear_attention_backend` field by ArgumentGroupFactory (see _add_transformer_args).
+    # Do not add it manually here or argparse will raise a conflicting-option error.
     return parser
 
 def _add_heterogeneous_args(parser):
