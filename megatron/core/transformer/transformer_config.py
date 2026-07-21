@@ -484,6 +484,11 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    linear_attention_backend: Literal['fla', 'flash_qla'] = 'fla'
+    """Kernel backend for the gated delta rule. 'fla' uses flash-linear-attention's Triton
+    kernels (portable). 'flash_qla' uses the FlashQLA TileLang kernels (2-3x faster fwd, 2x
+    faster bwd) but requires SM90/SM100 (Hopper/Blackwell) and the flash-qla package."""
+
     ####################
     # initialization
     ####################
@@ -1404,6 +1409,12 @@ class TransformerConfig(ModelParallelConfig):
                 f"Gated delta net does not support context parallel for now,"
                 f" but got {self.context_parallel_size=}."
             )
+
+            if self.linear_attention_backend == "flash_qla":
+                assert not self.deterministic_mode, (
+                    "linear_attention_backend='flash_qla' has no deterministic path; "
+                    "use --linear-attention-backend fla with --deterministic-mode."
+                )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

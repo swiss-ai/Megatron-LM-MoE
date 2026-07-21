@@ -47,6 +47,15 @@ except ImportError:
     HAVE_FLA = False
 
 try:
+    from flash_qla import chunk_gated_delta_rule as flash_qla_chunk_gated_delta_rule
+
+    HAVE_FLASH_QLA = True
+except ImportError:
+    flash_qla_chunk_gated_delta_rule = None
+
+    HAVE_FLASH_QLA = False
+
+try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
     causal_conv1d_fn = None
@@ -381,6 +390,26 @@ class GatedDeltaNet(MegatronModule):
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=False,
+            )
+        elif self.config.linear_attention_backend == "flash_qla":
+            if not HAVE_FLASH_QLA:
+                raise ImportError(
+                    "linear_attention_backend='flash_qla' was requested but flash-qla is not "
+                    "installed. Install it with `pip install flash-qla` (requires SM90/SM100)."
+                )
+            # FlashQLA has no `use_qk_l2norm_in_kernel` argument (L2 norm is applied above), and
+            # requires `scale` to be passed explicitly, whereas FLA defaults it to
+            # key_head_dim ** -0.5 internally. Layout ([B, T, H, D]) matches FLA.
+            core_attn_out, last_recurrent_state = flash_qla_chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                scale=self.key_head_dim**-0.5,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=None,
             )
         else:
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(

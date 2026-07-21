@@ -38,6 +38,13 @@ try:
 except ImportError:
     HAVE_FLA = False
 
+try:
+    import flash_qla
+
+    HAVE_FLASH_QLA = True
+except ImportError:
+    HAVE_FLASH_QLA = False
+
 
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
@@ -140,6 +147,88 @@ class TestGatedDeltaNet:
         assert (
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(not HAVE_FLASH_QLA, reason="FlashQLA is not installed.")
+@pytest.mark.internal
+def test_flash_qla_matches_fla():
+    """FlashQLA and FLA backends should produce numerically equivalent GDN outputs
+    (and input gradients) for identical weights and inputs.
+
+    Requires an SM90/SM100 (Hopper/Blackwell) GPU for FlashQLA.
+    """
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    model_parallel_cuda_manual_seed(123)
+
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    cp_group = parallel_state.get_context_parallel_group()
+    pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+    config = TransformerConfig(
+        hidden_size=256,
+        linear_conv_kernel_dim=2,
+        linear_key_head_dim=64,
+        linear_value_head_dim=64,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        num_layers=1,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        layernorm_zero_centered_gamma=True,
+        num_attention_heads=8,
+        activation_func=F.silu,
+        bf16=True,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
+        linear_attention_backend="fla",
+    )
+    gdn_submodules = get_experimental_attention_variant_module_spec(config=config).submodules
+    gdn = GatedDeltaNet(
+        config,
+        submodules=gdn_submodules,
+        layer_number=1,
+        bias=False,
+        conv_bias=False,
+        conv_init=1.0,
+        use_qk_l2norm=True,
+        A_init_range=(1, 16),
+        pg_collection=pg_collection,
+    ).cuda().bfloat16()
+
+    micro_batch_size = 2
+    seq_length = 64
+    torch.manual_seed(123)
+    base_input = torch.rand(
+        (seq_length, micro_batch_size, config.hidden_size),
+        device=torch.cuda.current_device(),
+        dtype=torch.bfloat16,
+    )
+
+    def run(backend):
+        gdn.config.linear_attention_backend = backend
+        x = base_input.clone().detach().requires_grad_(True)
+        out, _ = gdn(x, attention_mask=None)
+        out.sum().backward()
+        return out.detach(), x.grad.detach()
+
+    out_fla, grad_fla = run("fla")
+    out_qla, grad_qla = run("flash_qla")
+
+    # bf16 kernels with different reduction orders; tolerances match the TP-correctness test.
+    torch.testing.assert_close(
+        out_fla, out_qla, atol=5e-3, rtol=5e-3,
+        msg=lambda m: f"FlashQLA vs FLA output mismatch: {m}",
+    )
+    torch.testing.assert_close(
+        grad_fla, grad_qla, atol=5e-3, rtol=5e-3,
+        msg=lambda m: f"FlashQLA vs FLA input-grad mismatch: {m}",
+    )
+
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize(
