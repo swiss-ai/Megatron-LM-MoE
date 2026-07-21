@@ -236,9 +236,44 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         if inference_context is not None:
             raise NotImplementedError("KDA does not support inference for now.")
-        if packed_seq_params is not None:
-            raise NotImplementedError("KDA does not support packed sequence for now.")
         assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
+
+        cu_seqlens = None
+        if packed_seq_params is not None:
+            assert packed_seq_params.qkv_format == 'thd', (
+                "KDA packed-sequence support expects THD-format packed_seq_params "
+                f"(got qkv_format={packed_seq_params.qkv_format!r})."
+            )
+            if self.cp_size > 1:
+                # TODO: support packed sequence + CP. Needs a THD-aware CP all-to-all
+                # permutation (cf. tensor_a2a_cp2hp/hp2cp in gated_delta_net.py), which
+                # this repo's CP scheme does not implement yet.
+                raise NotImplementedError(
+                    "KDA does not support packed sequence (cross-document masking) "
+                    "together with context parallelism yet."
+                )
+            if self.sp_size > 1:
+                # TODO: support packed sequence + sequence-parallelism. The TP-sharded
+                # sequence chunk each rank sees would need to carry its own slice of
+                # cu_seqlens, which nothing here computes yet.
+                raise NotImplementedError(
+                    "KDA does not support packed sequence (cross-document masking) "
+                    "together with sequence-parallelism yet."
+                )
+            if self.config.deterministic_mode:
+                # chunk_kda itself is always used regardless of deterministic_mode
+                # (unlike GDN, KDA has no torch-native fallback), but deterministic_mode
+                # routes conv1d through a plain F.conv1d that has no cu_seqlens/document-
+                # boundary awareness, letting the causal window leak across documents.
+                raise NotImplementedError(
+                    "KDA packed sequence requires the FLA causal_conv1d kernel; "
+                    "deterministic_mode's F.conv1d fallback does not support cu_seqlens."
+                )
+            assert batch == 1, "Packed sequence expects batch dimension to be 1"
+            assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv), (
+                "KDA packed sequence requires cu_seqlens_q == cu_seqlens_kv."
+            )
+            cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -313,6 +348,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             qkv, _ = causal_conv1d(
                 x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
                 activation=self.activation, initial_state=None, output_final_state=False,
+                cu_seqlens=cu_seqlens,
             )
         nvtx_range_pop(suffix="conv1d")
 
@@ -363,6 +399,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             output_final_state=need_final_state,
             use_qk_l2norm_in_kernel=False,
             use_gate_in_kernel=False,
+            cu_seqlens=cu_seqlens,
         )
         nvtx_range_pop(suffix="chunk_kda")
 
