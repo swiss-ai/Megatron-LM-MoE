@@ -2870,6 +2870,11 @@ def _add_training_args(parser):
     group.add_argument('--output-lr', type=float, default=None,
                        help='Absolute LR for the (untied) output LM-head params under '
                        'md_decoupling. When unset, the output layer uses the base --lr.')
+    group.add_argument('--router-lr', type=float, default=None,
+                       help='Absolute LR for MoE router weights under --optimizer md_decoupling. '
+                       'When set, routers use this LR instead of --matrix-lr (Muon routers) or '
+                       '--lr (Adam routers), and are excluded from the matrix-LR group. When '
+                       'unset, the existing router LR behavior applies.')
     group.add_argument('--min-lr-mode', dest='min_lr_mode', type=str, default='relative',
                        choices=['relative', 'absolute'],
                        help='How per-group min_lr is set for any group with a custom max_lr. '

@@ -330,6 +330,12 @@ class OptimizerConfig:
     """Absolute LR for the (untied) output LM-head params under md_decoupling. When unset, the
     output layer uses the base --lr."""
 
+    router_lr: Optional[float] = None
+    """Absolute LR for MoE router weights under md_decoupling. When set, routers use this LR
+    instead of --matrix-lr (Muon routers) or --lr (Adam routers) and are excluded from the
+    matrix-LR group. When unset, the existing router LR behavior applies. (md_decoupling only;
+    the plain muon/dist_muon path keeps routers on --matrix-lr.)"""
+
     min_lr_mode: str = 'relative'
     """How per-group min_lr is set for any group with a custom max_lr. 'relative' (default):
     every group decays by the same fraction (config.min_lr / config.lr). 'absolute': every group

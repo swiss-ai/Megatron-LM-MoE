@@ -1383,25 +1383,33 @@ def _mddecoupling_config_overrides(
         or (config.md_router_use_orthogonal_updates is None
             and not config.use_orthogonal_updates)
     )
+    # A router gets its own LR group (excluded from the matrix-LR group below) when either an
+    # explicit --router-lr is set, or it runs on the Adam branch (matrix_lr is Muon-tuned).
+    router_has_own_lr = config.router_lr is not None or router_uses_adam
     router_override: ParamGroupOverride = {}
     if config.md_router_use_orthogonal_updates is not None:
         router_override['use_orthogonal_updates'] = config.md_router_use_orthogonal_updates
-    if router_uses_adam:
+    if config.router_lr is not None:
+        # Explicit absolute router LR — takes precedence over both the Muon matrix_lr and the
+        # Adam base-lr paths, applying to Muon and Adam routers alike.
+        router_override['max_lr'] = config.router_lr
+        router_override['min_lr'] = _group_min_lr(config, config.router_lr)
+    elif router_uses_adam:
         # Adam routers use base lr (matrix_lr is Muon-tuned; doesn't fit Adam).
         router_override['max_lr'] = config.lr
         router_override['min_lr'] = _group_min_lr(config, config.lr)
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
-    # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
-    # get base lr from the router_override above.
+    # Matrix LR for non-embedding/non-output matrix weights. Routers with their own LR group
+    # (--router-lr, or the Adam branch) are excluded — they get their LR from router_override above.
     # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
         name="md_non_embedding_or_output_matrix",
         fn=lambda p: (not getattr(p, "is_embedding_or_output_parameter", False)
                       and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
-                      and not (router_uses_adam and getattr(p, "is_router", False))),
+                      and not (router_has_own_lr and getattr(p, "is_router", False))),
     )
     overrides[ParamKey(predicate=non_emb_2d)] = {
         'max_lr': matrix_lr,
