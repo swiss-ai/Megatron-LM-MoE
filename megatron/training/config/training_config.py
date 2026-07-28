@@ -264,6 +264,10 @@ class LoggerConfig:
     log_memory_to_tensorboard: bool = False
     """Enable memory logging to tensorboard."""
 
+    log_memory_to_wandb: bool = False
+    """Enable memory logging to wandb (every `log_interval` iterations). Logs the stats of
+    the wandb rank, their max over all ranks, and their max per pipeline stage."""
+
     memory_keys: dict[str, str] | None = None
     """Names of memory statistics to log from `torch.cuda.memory_stats()`"""
 

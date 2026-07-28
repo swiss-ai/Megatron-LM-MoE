@@ -320,6 +320,59 @@ def report_memory(name):
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 
+def get_memory_stats(prefix='mem', gather_across_ranks=False):
+    """GPU memory stats (in MB) as a flat dict, for tensorboard/wandb logging.
+
+    Always reports the caller's own stats under `<prefix>/<stat>-MB`.
+
+    If `gather_across_ranks` is set, every rank's stats are gathered so that a single
+    rank (e.g. the one holding the wandb writer) can report the whole job: the max over
+    all ranks under `<stat>-MB-max`, and, when pipelining, the max within each pipeline
+    stage under `<prefix>/pp<stage>/<stat>-MB-max`. The per-stage max is taken over the
+    DP/CP/TP/EP ranks of that stage, which hold the same layers, so it is that stage's
+    worst-case rank. This path is a collective and must be called on every rank.
+    """
+    args = get_args()
+    mega_bytes = 1024.0 * 1024.0
+    values = {
+        'allocated': torch.cuda.memory_allocated(),
+        'max-allocated': torch.cuda.max_memory_allocated(),
+        'reserved': torch.cuda.memory_reserved(),
+        'max-reserved': torch.cuda.max_memory_reserved(),
+    }
+    if args.log_device_memory_used:
+        values['device-used'] = torch.cuda.device_memory_used()
+    stats = {f'{prefix}/{name}-MB': value / mega_bytes for name, value in values.items()}
+    if not (gather_across_ranks and torch.distributed.is_initialized()):
+        return stats
+
+    local = torch.tensor(
+        [float(mpu.get_pipeline_model_parallel_rank())] + list(values.values()),
+        dtype=torch.float64,
+        device=torch.cuda.current_device(),
+    )
+    gathered = torch.empty(
+        (torch.distributed.get_world_size(), local.numel()), dtype=local.dtype, device=local.device
+    )
+    torch.distributed.all_gather_into_tensor(gathered, local)
+    gathered = gathered.cpu()
+    pp_ranks, per_rank_values = gathered[:, 0].to(torch.int64), gathered[:, 1:]
+
+    for index, name in enumerate(values.keys()):
+        stats[f'{prefix}/{name}-MB-max'] = per_rank_values[:, index].max().item() / mega_bytes
+    pipeline_size = mpu.get_pipeline_model_parallel_world_size()
+    if pipeline_size > 1:
+        for stage in range(pipeline_size):
+            in_stage = pp_ranks == stage
+            if not bool(in_stage.any()):
+                continue
+            for index, name in enumerate(values.keys()):
+                stats[f'{prefix}/pp{stage}/{name}-MB-max'] = (
+                    per_rank_values[in_stage, index].max().item() / mega_bytes
+                )
+    return stats
+
+
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
     index = 0

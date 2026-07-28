@@ -238,6 +238,7 @@ from .utils import (
     check_adlr_autoresume_termination,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
+    get_memory_stats,
     is_last_rank,
     print_rank_0,
     print_rank_last,
@@ -2398,9 +2399,16 @@ def training_log(
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
-        if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
+        if args.log_memory_interval is not None and (iteration+50) % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(f'(after {iteration} iterations)')
+        if args.log_memory_to_wandb and (args.log_memory_interval is not None and (iteration+50) % args.log_memory_interval == 0 and \
+            not reported_memory_in_this_iteration):
+            # Gathering the stats is a collective, so it has to run on every rank; only the
+            # wandb rank (the last rank) then actually logs the result.
+            mem_stats = get_memory_stats(gather_across_ranks=True)
+            if wandb_writer:
+                wandb_writer.log(mem_stats, iteration)
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
