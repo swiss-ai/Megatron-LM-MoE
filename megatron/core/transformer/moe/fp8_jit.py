@@ -58,6 +58,8 @@ def _per_block_cast_to_fp8_kernel(
 
     sf = x_amax / 448.0
     sf = tl.where(sf == 0.0, 1.0, sf)
+    # Floor sf so inv_sf cannot overflow when a token's group amax is tiny but nonzero
+    sf = tl.maximum(sf, 1e-30)
     inv_sf = 1.0 / sf
     x_scaled = x * inv_sf
     # x_scaled = tl.clamp(x_scaled, -448.0, 448.0).to(tl.float8e4nv)
