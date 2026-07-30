@@ -939,10 +939,12 @@ def lglu_act(x: torch.Tensor) -> torch.Tensor:
 def situ_act(x: torch.Tensor) -> torch.Tensor:
     """SiTU gate: ``f(x) = sigmoid(x) * tanh(x)``.
 
-    Used as the gate of a gated linear unit (``situ_act(x_glu) * x_linear``) via the generic
-    (non-fused) GLU path -- dispatched by ``activation_func == situ_act`` with
-    ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. No fused kernel (the user
-    only requested kernel fusion for SSSGLU), so it always runs eager.
+    Used as the gate of a gated linear unit (``situ_act(x_glu) * x_linear``), dispatched by
+    ``activation_func == situ_act`` with ``gated_linear_unit=True``. Fused kernels mirror SSSGLU:
+    the dense/TE bias-activation path runs through ``megatron.core.fusions.fused_bias_situ`` and the
+    routed-MoE (incl. fp8 dispatch / offloading-fp8) path through ``situ_jit.py`` -- keep the gate
+    math (and its derivative) in sync across all three. Falls back to this eager def only where no
+    fused path is taken.
 
     A "sigmoid-times-tanh" gate: ``-> 1`` as ``x -> +inf``, ``-> 0`` as ``x -> -inf`` (the sigmoid
     and tanh factors both vanish/saturate together), and ``f(0) = 0``. Unlike a plain sigmoid gate

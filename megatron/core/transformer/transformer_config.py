@@ -1582,12 +1582,13 @@ class TransformerConfig(ModelParallelConfig):
                 "(moe_use_offloading_experts=True)."
             )
 
-        # RLGLU (gate max(x,0)-0.5*ln(1+|x|)) and SSSGLU (gate softsign(x-1)+0.5) each have their
-        # own Triton kernels (rlglu_jit.py / sssglu_jit.py) wired into the offloading experts' fp8
-        # lane (moe_use_inplace_fp8_param), exactly like SSGLU; the bf16 lane hardcodes SiLU, so
-        # guard against them and fail loudly instead of silently running SwiGLU. LGLU/SiTU have no
-        # fused kernel and are not wired into the offloading path at all, so they fail loudly like
-        # ReGLU. Lazy import avoids a transformer_config <- activations <- module cycle.
+        # RLGLU (gate max(x,0)-0.5*ln(1+|x|)), SSSGLU (gate softsign(x-1)+0.5) and SiTU (gate
+        # sigmoid(x)*tanh(x)) each have their own Triton kernels (rlglu_jit.py / sssglu_jit.py /
+        # situ_jit.py) wired into the offloading experts' fp8 lane (moe_use_inplace_fp8_param),
+        # exactly like SSGLU; the bf16 lane hardcodes SiLU, so guard against them and fail loudly
+        # instead of silently running SwiGLU. LGLU has no fused kernel and is not wired into the
+        # offloading path at all, so it fails loudly like ReGLU. Lazy import avoids a
+        # transformer_config <- activations <- module cycle.
         if self.gated_linear_unit and self.moe_use_offloading_experts:
             from megatron.core.activations import rlglu_act as _rlglu_act
             from megatron.core.activations import sssglu_act as _sssglu_act
@@ -1603,9 +1604,14 @@ class TransformerConfig(ModelParallelConfig):
                     "SSSGLU (--sssglu) with offloading experts is only supported on the fp8 path; "
                     "enable --moe-use-inplace-fp8-param."
                 )
-            if self.activation_func in (_lglu_act, _situ_act):
+            if self.activation_func == _situ_act:
+                assert self.moe_use_inplace_fp8_param, (
+                    "SiTU (--situ) with offloading experts is only supported on the fp8 path; "
+                    "enable --moe-use-inplace-fp8-param."
+                )
+            if self.activation_func == _lglu_act:
                 raise ValueError(
-                    "LGLU (--lglu) / SiTU (--situ) are not wired into the offloading-experts path "
+                    "LGLU (--lglu) is not wired into the offloading-experts path "
                     "(moe_use_offloading_experts=True)."
                 )
 
@@ -2153,11 +2159,14 @@ class TransformerConfig(ModelParallelConfig):
             # so a top-level import here would create a cycle. Mirrors the rlglu offloading guard.
             from megatron.core.activations import rlglu_act as _rlglu_act
             from megatron.core.activations import sssglu_act as _sssglu_act
+            from megatron.core.activations import situ_act as _situ_act
 
-            if self.activation_func not in [F.gelu, F.silu, quick_gelu, sslu, _rlglu_act, _sssglu_act]:
+            if self.activation_func not in [
+                F.gelu, F.silu, quick_gelu, sslu, _rlglu_act, _sssglu_act, _situ_act
+            ]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
-                    "gelu, swiglu, quick_geglu, ssglu, rlglu, or sssglu"
+                    "gelu, swiglu, quick_geglu, ssglu, rlglu, sssglu, or situ"
                 )
             if (
                 self.activation_func == F.gelu
@@ -2203,14 +2212,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.activation_func_fp8_input_store:
             from megatron.core.activations import rlglu_act as _rlglu_act
             from megatron.core.activations import sssglu_act as _sssglu_act
+            from megatron.core.activations import situ_act as _situ_act
 
             if (
-                self.activation_func not in (F.silu, sslu, _rlglu_act, _sssglu_act)
+                self.activation_func not in (F.silu, sslu, _rlglu_act, _sssglu_act, _situ_act)
                 or not self.gated_linear_unit
             ):
                 raise ValueError(
                     "Storing activation input in FP8 is supported only for SwiGLU, SSGLU, "
-                    "RLGLU and SSSGLU."
+                    "RLGLU, SSSGLU and SiTU."
                 )
 
         if self.apply_rope_fusion:

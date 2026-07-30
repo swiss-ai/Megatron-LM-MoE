@@ -33,25 +33,39 @@ from megatron.core.transformer.moe.sssglu_jit import (
     sssglu_forward,
     sssglu_backward,
 )
+from megatron.core.transformer.moe.situ_jit import (
+    situ_forward,
+    situ_backward,
+)
 from megatron.core.fusions.fused_bias_ssglu import sslu
-from megatron.core.activations import rlglu_act, sssglu_act
+from megatron.core.activations import rlglu_act, sssglu_act, situ_act
 
 
-def _glu_forward_fn(*, use_ssglu: bool = False, use_rlglu: bool = False, use_sssglu: bool = False):
-    """Select the Triton GLU forward kernel. RLGLU/SSSGLU/SSGLU/SwiGLU are mutually exclusive."""
+def _glu_forward_fn(
+    *, use_ssglu: bool = False, use_rlglu: bool = False, use_sssglu: bool = False,
+    use_situ: bool = False,
+):
+    """Select the Triton GLU forward kernel. RLGLU/SSSGLU/SiTU/SSGLU/SwiGLU are mutually exclusive."""
     if use_rlglu:
         return rlglu_forward
     if use_sssglu:
         return sssglu_forward
+    if use_situ:
+        return situ_forward
     return ssglu_forward if use_ssglu else swiglu_forward
 
 
-def _glu_backward_fn(*, use_ssglu: bool = False, use_rlglu: bool = False, use_sssglu: bool = False):
-    """Select the Triton GLU backward kernel. RLGLU/SSSGLU/SSGLU/SwiGLU are mutually exclusive."""
+def _glu_backward_fn(
+    *, use_ssglu: bool = False, use_rlglu: bool = False, use_sssglu: bool = False,
+    use_situ: bool = False,
+):
+    """Select the Triton GLU backward kernel. RLGLU/SSSGLU/SiTU/SSGLU/SwiGLU are mutually exclusive."""
     if use_rlglu:
         return rlglu_backward
     if use_sssglu:
         return sssglu_backward
+    if use_situ:
+        return situ_backward
     return ssglu_backward if use_ssglu else swiglu_backward
 
 
@@ -60,6 +74,7 @@ def _glu_forward_from_config(config: TransformerConfig):
         use_ssglu=config.activation_func == sslu,
         use_rlglu=config.activation_func == rlglu_act,
         use_sssglu=config.activation_func == sssglu_act,
+        use_situ=config.activation_func == situ_act,
     )
 
 
@@ -68,6 +83,7 @@ def _glu_backward_from_config(config: TransformerConfig):
         use_ssglu=config.activation_func == sslu,
         use_rlglu=config.activation_func == rlglu_act,
         use_sssglu=config.activation_func == sssglu_act,
+        use_situ=config.activation_func == situ_act,
     )
 
 
@@ -316,13 +332,14 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         use_ssglu: bool = False,
         use_rlglu: bool = False,
         use_sssglu: bool = False,
+        use_situ: bool = False,
     ):
         """dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
         With k-grouped fp8: grad_y [m, h] @ s [m, H]."""
         assert fuse_gradient_accumulation, \
             "ExpertsFP8GroupedSwiMLP currently only supports fuse_gradient_accumulation."
 
-        glu_forward = _glu_forward_fn(use_ssglu=use_ssglu, use_rlglu=use_rlglu, use_sssglu=use_sssglu)
+        glu_forward = _glu_forward_fn(use_ssglu=use_ssglu, use_rlglu=use_rlglu, use_sssglu=use_sssglu, use_situ=use_situ)
         s = glu_forward(a, permuted_probs.unsqueeze(-1))
         # s = MergedSwiGLU.call_forward(a, permuted_probs.unsqueeze(-1))
         fp8_s = per_channel_cast_to_fp8(s, use_ue8m0=False, gran_k=128, transpose=False)
@@ -532,13 +549,14 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         use_ssglu: bool = False,
         use_rlglu: bool = False,
         use_sssglu: bool = False,
+        use_situ: bool = False,
     ) -> torch.Tensor:
         """BF16 reference for ``call_backward_grad_w2``.
 
         dw2[e] = grad_y[e].T @ s[e], shape (h, H). If fuse_gradient_accumulation,
         accumulate into w2.main_grad in-place (matching the FP8 path).
         """
-        glu_forward = _glu_forward_fn(use_ssglu=use_ssglu, use_rlglu=use_rlglu, use_sssglu=use_sssglu)
+        glu_forward = _glu_forward_fn(use_ssglu=use_ssglu, use_rlglu=use_rlglu, use_sssglu=use_sssglu, use_situ=use_situ)
         s = glu_forward(a, permuted_probs.unsqueeze(-1))
         # s = MergedSwiGLU.call_forward(a, permuted_probs.unsqueeze(-1))
         E = w2.shape[0]
@@ -716,6 +734,7 @@ class ExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             use_ssglu=(config.activation_func == sslu),
             use_rlglu=(config.activation_func == rlglu_act),
             use_sssglu=(config.activation_func == sssglu_act),
+            use_situ=(config.activation_func == situ_act),
         )
         # ExpertsFP8GroupedSwiMLP.call_backward_grad_w2_ref(
         #     grad_y, fc1_output, w2, permuted_probs, tokens_per_expert, config.gradient_accumulation_fusion,
