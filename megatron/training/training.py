@@ -186,6 +186,7 @@ from megatron.core.optimizer.muon_logging import (
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
+    compare_grad_norms,
     RerunDataIterator,
     RerunMode,
 )
@@ -1067,6 +1068,7 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
+    _register_router_rerun_state(model)
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1819,6 +1821,48 @@ def setup_model_and_optimizer(
     return model, optimizer, opt_param_scheduler
 
 
+# persistent MoE router buffers
+_RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta')
+
+def _save_router_state(model):
+    state = {}
+    for chunk_idx, model_chunk in enumerate(model):
+        for name, module in get_attr_wrapped_model(model_chunk, 'named_modules')():
+            for buf_name in _RERUN_ROUTER_BUFFERS:
+                buf = getattr(module, buf_name, None)
+                if buf is not None:
+                    state[(chunk_idx, name, buf_name)] = buf.detach().clone()
+    return state
+
+def _restore_router_state(model, state):
+    for chunk_idx, model_chunk in enumerate(model):
+        for name, module in get_attr_wrapped_model(model_chunk, 'named_modules')():
+            for buf_name in _RERUN_ROUTER_BUFFERS:
+                buf = getattr(module, buf_name, None)
+                saved = state.get((chunk_idx, name, buf_name))
+                if buf is not None and saved is not None:
+                    buf.copy_(saved)
+
+def _register_router_rerun_state(model):
+    """Add the MoE router buffers to the rerun state machine's save/restore hooks"""
+    rerun_state_machine = get_rerun_state_machine()
+    prev_save = rerun_state_machine.state_save_func
+    prev_restore = rerun_state_machine.state_restore_func
+
+    def state_save_func():
+        return {
+            'prev': prev_save() if prev_save is not None else None,
+            'router': _save_router_state(model),
+        }
+
+    def state_restore_func(state_dict):
+        if prev_restore is not None and state_dict['prev'] is not None:
+            prev_restore(state_dict['prev'])
+        _restore_router_state(model, state_dict['router'])
+
+    rerun_state_machine.state_save_func = state_save_func
+    rerun_state_machine.state_restore_func = state_restore_func
+
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
@@ -1840,6 +1884,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
+    grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -1915,6 +1960,27 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
+        if args.optimizer == 'md_decoupling' and args.check_grad_norm:
+            from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+            from functools import partial
+            if isinstance(optimizer, LayerWiseDistributedOptimizer):
+                found_inf_flag, grad_norm = optimizer.prepare_grad_norm()
+                rerun_state_machine.validate_result(
+                    result=(found_inf_flag, grad_norm),
+                    rejection_func=partial(
+                        rerun_state_machine.is_spiky_grad_norm,
+                        context="grad_norm",
+                        num_samples=50,
+                        reload=args.load is not None and args.iteration > 0,
+                        threshold=args.check_grad_norm_threshold,
+                    ),
+                    message="Spiky grad_norm",
+                    comparison_func=compare_grad_norms,
+                    tolerance=0.0,
+                    fatal=False,
+                )
+        # end of rerun_state_machine region
+
     # Checkpoint main_grads.
     if save_wgrads_in_this_iteration:
         # Collect state_dict of wgrads (each param's .main_grad field).
@@ -1946,7 +2012,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
