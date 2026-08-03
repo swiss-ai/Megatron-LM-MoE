@@ -3,18 +3,21 @@
 """Helpers for tokenizer-provided omni metadata propagation.
 
 Expected metadata is read from the HuggingFace tokenizer's ``init_kwargs`` (i.e. the
-keys stored in ``tokenizer_config.json``), reached by walking the wrapper chain:
+keys stored in ``tokenizer_config.json``) plus its added-token table, reached by
+walking the wrapper chain:
 - legacy path:  wrapper -> ``_tokenizer`` -> HF tokenizer (has ``init_kwargs``)
 - core  path:  wrapper -> ``_tokenizer`` -> library wrapper -> ``tokenizer`` -> HF tokenizer
 
-The ``omnimodal_config`` payload comes in two shapes (produced by
-https://github.com/swiss-ai/apertus-omni-tokenizer):
+The ``omnimodal_config`` payload (contract: ``docs/omnimodal_config.md`` in
+https://github.com/swiss-ai/apertus-omni-tokenizer) carries ``omni_special_token_offset``
+(== ``base_vocab_size``, which is a top-level ``tokenizer_config.json`` key) and one
+entry per modality; content ids are contiguous (``id = offset + index``). Two shipped
+geometries::
 
-- append mode -- omni special tokens are a contiguous block right after the text
-  vocab; each modality records its content block plus start/end boundary ids::
-
+    # Apertus 1.5 -- append: structure tokens sit in the gap
+    # [base_vocab_size, min modality offset), content blocks after them.
     {
-      "omni_special_token_offset": 131072,  # in artifacts (== base_vocab_size); not parsed here
+      "omni_special_token_offset": 131072,
       "modalities": [
         {"name": "vision", "offset": 131272, "vocab_size": 131072,
          "start_token": 131073, "end_token": 131074},
@@ -23,31 +26,34 @@ https://github.com/swiss-ai/apertus-omni-tokenizer):
       ]
     }
 
-- in_place mode -- the base tokenizer pre-bakes ALL of its special tokens (text
-  bos/eos/pad/chat tokens, omni structure tokens, reserve pool) as one contiguous
-  block inside the base vocab, recorded as ``special_token_offset`` +
-  ``special_token_count``; only content tokens are appended::
-
+    # Apertus 2 -- structure tokens at low ids INSIDE the base vocab; each modality
+    # additionally publishes its full name -> id map as structure_token_ids.
     {
-      "allocation": "in_place",
-      "base_vocab_size": 200064,
-      "special_token_offset": 0,
-      "special_token_count": 124,
+      "omni_special_token_offset": 200064,
       "modalities": [
         {"name": "vision", "offset": 200064, "vocab_size": 131072,
-         "start_token": 27, "end_token": 28},
+         "start_token": 27, "end_token": 28,
+         "structure_token_ids": {"<|image|>": 18, "<|img_start|>": 27, ...}},
         {"name": "audio",  "offset": 331136, "vocab_size": 4096,
-         "start_token": 33, "end_token": 34}
+         "start_token": 33, "end_token": 34,
+         "structure_token_ids": {"<|audio|>": 19, "<|audio_start|>": 33, ...}}
       ]
     }
 
-Either shape may additionally carry an explicit ``special_token_ids`` list; when
-present it is authoritative for the special-token id set. The extracted set always
-means ALL of the model's special tokens (text control tokens AND omni structure
-tokens), so it is only derivable from that list or from the in_place
-``special_token_offset``/``count`` block. Whenever an ``omnimodal_config`` is present
-the set is required -- append configs without the list are rejected (the appended omni
-block alone would miss the base text specials).
+The model's FULL special-token id set (text control tokens AND omni structure tokens;
+consumers like the goldfish exemption rely on that completeness) is not enumerable from
+the config alone, and ``all_special_ids`` is version-dependent (the contract forbids
+it). It is derived instead as::
+
+    {added tokens with special=True}          # from the tokenizer's added_tokens_decoder
+      MINUS  content ranges [offset, offset + vocab_size) of every modality
+      UNION  every modality's structure_token_ids values + start_token/end_token
+
+The MINUS matters: omni CONTENT tokens are also flagged ``special=True`` (all 135k of
+them in Apertus 2), and exempting them would shield real content from goldfish drops.
+An explicit ``special_token_ids`` list in the config, when present, is authoritative
+and skips the derivation. Whenever an ``omnimodal_config`` is present the set is
+required -- if neither source is available the extraction raises.
 """
 
 import logging
@@ -61,22 +67,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ModelSpecialTokens:
-    """ALL of the model's special-token ids, extracted from a tokenizer's ``omnimodal_config``.
+    """ALL of the model's special-token ids, extracted for a tokenizer with an ``omnimodal_config``.
 
     This is the complete special-token set of the vocabulary (text control tokens such
     as bos/eos/pad/chat tokens AND omni structure tokens), not just the omni subset --
-    consumers like the goldfish exemption rely on that completeness. It is only
-    constructed from config shapes that can actually describe the full set: an explicit
-    ``special_token_ids`` list, or the in_place ``special_token_offset``/``count`` block.
+    consumers like the goldfish exemption rely on that completeness. Omni CONTENT
+    tokens are deliberately excluded even though the tokenizer flags them special.
 
     Attributes:
-        allocation: ``"append"`` or ``"in_place"`` -- the tokenizer's allocation mode.
+        source: ``"explicit"`` (config ``special_token_ids`` list) or ``"derived"``
+            (added-token derivation described in the module docstring).
         full_ids: Sorted list of every special-token id (always populated).
         id_range: Contiguous ``(start, end)`` span when ``full_ids`` is one run,
-            ``None`` for scattered explicit lists.
+            ``None`` when the ids are scattered.
     """
 
-    allocation: str
+    source: str
     full_ids: List[int]
     id_range: Optional[Tuple[int, int]] = None
 
@@ -92,6 +98,10 @@ class ModalityInfo:
         offset: Content-token block start id, or ``None`` if absent.
         vocab_size: Number of content tokens, or ``None``.
         start_token / end_token: Boundary special-token ids, or ``None``.
+        structure_token_ids: Full structure-token name -> id map (Apertus 2+); ``None``
+            for 1.5-era configs that don't publish it. Structure tokens resolve by
+            name -- do not assume geometry (1.5 puts them above the base vocab,
+            2 at low ids inside it).
     """
 
     name: str
@@ -99,6 +109,7 @@ class ModalityInfo:
     vocab_size: Optional[int] = None
     start_token: Optional[int] = None
     end_token: Optional[int] = None
+    structure_token_ids: Optional[Dict[str, int]] = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +153,16 @@ def _contiguous_range(sorted_ids: List[int]) -> Optional[Tuple[int, int]]:
     return (start, end) if end - start == len(sorted_ids) else None
 
 
+def _content_ranges(omnimodal_config: Dict[str, Any]) -> List[Tuple[int, int]]:
+    """Half-open content-token id ranges ``[offset, offset + vocab_size)`` per modality."""
+    ranges = []
+    for modality in omnimodal_config.get("modalities", []):
+        offset, vocab_size = modality.get("offset"), modality.get("vocab_size")
+        if offset is not None and vocab_size is not None:
+            ranges.append((int(offset), int(offset) + int(vocab_size)))
+    return ranges
+
+
 def _iter_tokenizer_wrappers(tokenizer: Any):
     """Yield tokenizer and nested wrapper objects linked by ``_tokenizer``/``tokenizer`` attrs.
 
@@ -180,89 +201,133 @@ def extract_tokenizer_init_kwargs(tokenizer: Any) -> Dict[str, Any]:
     return {}
 
 
+def extract_added_special_token_ids(tokenizer: Any) -> Optional[List[int]]:
+    """Collect the ids of added tokens flagged ``special=True`` from the wrapper chain.
+
+    Reads the first non-empty ``added_tokens_decoder`` found -- preferably the live HF
+    tokenizer property (the Apertus 2 artifact keeps ``tokenizer_config.json``'s copy
+    empty; the table lives in ``tokenizer.json``), falling back to a serialized copy in
+    ``init_kwargs``. Handles both value shapes: ``AddedToken`` objects (``.special``
+    attribute, int keys) and plain dicts (``{"special": true}``, str keys).
+
+    Returns ``None`` when no added-token table is reachable at all.
+    """
+    for obj in _iter_tokenizer_wrappers(tokenizer):
+        decoder = getattr(obj, "added_tokens_decoder", None)
+        if not (isinstance(decoder, dict) and decoder):
+            init_kwargs = getattr(obj, "init_kwargs", None)
+            decoder = init_kwargs.get("added_tokens_decoder") if isinstance(init_kwargs, dict) else None
+        if not (isinstance(decoder, dict) and decoder):
+            continue
+        ids = []
+        for token_id, token in decoder.items():
+            special = (
+                token.get("special") if isinstance(token, dict) else getattr(token, "special", False)
+            )
+            if special:
+                ids.append(int(token_id))
+        return sorted(ids)
+    return None
+
+
 def extract_model_special_tokens(
-    omnimodal_config: Optional[Dict[str, Any]]
+    omnimodal_config: Optional[Dict[str, Any]],
+    added_special_ids: Optional[List[int]] = None,
 ) -> Optional[ModelSpecialTokens]:
-    """Extract the model's FULL special-token id set from an ``omnimodal_config``.
+    """Extract the model's FULL special-token id set for an ``omnimodal_config``.
 
     Resolution order:
 
-    1. Explicit ``special_token_ids`` list (either allocation), authoritative when
-       present; handles ids scattered across disjoint ranges (how "append" builds of
-       https://github.com/swiss-ai/apertus-omni-tokenizer expose base text specials
-       plus the appended omni block).
-    2. ``in_place``: the contiguous ``special_token_offset`` + ``special_token_count``
-       block (the base's FULL special-token block -- text control tokens, omni
-       structure tokens, and the reserve pool).
+    1. Explicit ``special_token_ids`` list in the config, authoritative when present.
+    2. Derivation from ``added_special_ids`` (the tokenizer's ``special=True`` added
+       tokens): drop every modality's content range ``[offset, offset + vocab_size)``
+       (content tokens are also flagged special and must stay goldfish-droppable),
+       then union every modality's ``structure_token_ids`` values and
+       ``start_token``/``end_token``. Handles both shipped geometries (Apertus 1.5's
+       appended structure block and Apertus 2's in-base-vocab structure ids) without
+       version switches.
 
-    Whenever omni metadata is present, the full special-token set is REQUIRED: a config
-    that cannot describe it raises. There is deliberately no derived fallback for
-    ``append`` configs without an explicit list -- the omni block
-    ``[base_vocab_size, min modality offset)`` covers only the omni structure tokens,
-    not the base text specials, so it cannot stand in for the full set.
+    Whenever omni metadata is present, the full special-token set is REQUIRED: failing
+    loudly beats silently disabling downstream consumers such as the goldfish exemption.
 
     Returns a :class:`ModelSpecialTokens`, or ``None`` only when ``omnimodal_config``
     is ``None`` (non-omni tokenizer).
 
     Raises:
-        ValueError: When the config cannot describe the full set -- ``in_place``
-            without ``special_token_offset``/``special_token_count``, or ``append``
-            without ``special_token_ids``. Failing loudly beats silently disabling
-            downstream consumers such as the goldfish exemption.
+        ValueError: When the config has no ``special_token_ids`` and no added-token
+            table was reachable, or when a config-declared structure/boundary id falls
+            inside a content range (malformed config).
     """
     if omnimodal_config is None:
         return None
 
-    allocation = omnimodal_config.get("allocation", "append")
-
-    # 1. Explicit id list: authoritative for both allocations.
+    # 1. Explicit id list: authoritative when present.
     explicit_ids = omnimodal_config.get("special_token_ids")
     if explicit_ids:
         full_ids = sorted({int(i) for i in explicit_ids})
         return ModelSpecialTokens(
-            allocation=allocation, full_ids=full_ids, id_range=_contiguous_range(full_ids)
+            source="explicit", full_ids=full_ids, id_range=_contiguous_range(full_ids)
         )
 
-    # 2. in_place: the base's full special block as offset + count.
-    if allocation == "in_place":
-        offset = omnimodal_config.get("special_token_offset")
-        count = omnimodal_config.get("special_token_count")
-        if offset is None or count is None:
-            raise ValueError(
-                "omnimodal_config has allocation=in_place but no special_token_offset/"
-                "special_token_count (and no special_token_ids); cannot derive the "
-                "special-token id set (malformed or unsupported config)."
-            )
-        start, end = int(offset), int(offset) + int(count)
-        return ModelSpecialTokens(
-            allocation="in_place", full_ids=list(range(start, end)), id_range=(start, end)
+    # 2. Derive from the tokenizer's special-flagged added tokens.
+    if not added_special_ids:
+        raise ValueError(
+            "omnimodal_config is present but the model's FULL special-token set cannot "
+            "be determined: the config has no special_token_ids list and no added-token "
+            "table (added_tokens_decoder) was reachable on the tokenizer. Without it the "
+            "goldfish exemption would silently vanish."
         )
 
-    # append without an explicit list: the config cannot describe the full set.
-    raise ValueError(
-        "append-mode omnimodal_config carries no special_token_ids list; when omni "
-        "metadata is present the model's FULL special-token set is required, and the "
-        "derivable [base_vocab_size, min modality offset) omni block would miss the "
-        "base text specials. Rebuild the tokenizer with a special_token_ids list."
+    content_ranges = _content_ranges(omnimodal_config)
+
+    def in_content(token_id: int) -> bool:
+        return any(start <= token_id < end for start, end in content_ranges)
+
+    special_ids = {int(i) for i in added_special_ids if not in_content(int(i))}
+
+    structure_ids = set()
+    for modality in omnimodal_config.get("modalities", []):
+        for token_id in (modality.get("structure_token_ids") or {}).values():
+            structure_ids.add(int(token_id))
+        for key in ("start_token", "end_token"):
+            if modality.get(key) is not None:
+                structure_ids.add(int(modality[key]))
+
+    misplaced = sorted(i for i in structure_ids if in_content(i))
+    if misplaced:
+        raise ValueError(
+            f"omnimodal_config declares structure/boundary token ids {misplaced} inside a "
+            "modality's content range [offset, offset + vocab_size); exempting them would "
+            "shield real content tokens from goldfish drops (malformed config)."
+        )
+
+    full_ids = sorted(special_ids | structure_ids)
+    return ModelSpecialTokens(
+        source="derived", full_ids=full_ids, id_range=_contiguous_range(full_ids)
     )
 
 
 def extract_omni_metadata(
-    base_vocab_size: Optional[int], omnimodal_config: Optional[Dict[str, Any]]
+    base_vocab_size: Optional[int],
+    omnimodal_config: Optional[Dict[str, Any]],
+    added_special_ids: Optional[List[int]] = None,
 ) -> Optional[OmniMetadata]:
     """Read all omni metadata into an :class:`OmniMetadata` dataclass.
 
-    Pure function of the resolved ``base_vocab_size`` + ``omnimodal_config``; it does not
-    touch ``args`` or the tokenizer, so the read model is decoupled from how the values
-    are later distributed. Returns ``None`` only when both inputs are ``None``.
+    Pure function of the resolved ``base_vocab_size`` + ``omnimodal_config`` + the
+    tokenizer's special-flagged added-token ids; it does not touch ``args`` or the
+    tokenizer, so the read model is decoupled from how the values are later
+    distributed. Returns ``None`` only when both config inputs are ``None``.
     """
     if base_vocab_size is None and omnimodal_config is None:
         return None
 
-    # in_place configs duplicate base_vocab_size inside the omnimodal_config; fall back
-    # to it when the top-level/init_kwargs value is absent.
+    # base_vocab_size is a top-level tokenizer_config.json key; fall back to copies
+    # inside the omnimodal_config (omni_special_token_offset is defined as equal to it).
     if base_vocab_size is None and omnimodal_config is not None:
         base_vocab_size = omnimodal_config.get("base_vocab_size")
+        if base_vocab_size is None:
+            base_vocab_size = omnimodal_config.get("omni_special_token_offset")
 
     modalities: List[ModalityInfo] = []
     if omnimodal_config is not None:
@@ -270,6 +335,7 @@ def extract_omni_metadata(
             name = modality.get("name")
             if not name:
                 continue
+            structure_token_ids = modality.get("structure_token_ids")
             modalities.append(
                 ModalityInfo(
                     name=name,
@@ -277,13 +343,18 @@ def extract_omni_metadata(
                     vocab_size=_int_or_none(modality.get("vocab_size")),
                     start_token=_int_or_none(modality.get("start_token")),
                     end_token=_int_or_none(modality.get("end_token")),
+                    structure_token_ids=(
+                        {str(k): int(v) for k, v in structure_token_ids.items()}
+                        if structure_token_ids is not None
+                        else None
+                    ),
                 )
             )
 
     return OmniMetadata(
         base_vocab_size=_int_or_none(base_vocab_size),
         modalities=tuple(modalities),
-        special_tokens=extract_model_special_tokens(omnimodal_config),
+        special_tokens=extract_model_special_tokens(omnimodal_config, added_special_ids),
         raw_config=omnimodal_config,
     )
 
@@ -304,8 +375,9 @@ def populate_omni_metadata_from_tokenizer(args, tokenizer: Any) -> Optional[Omni
     ``args.omni_metadata.special_tokens.full_ids`` (goldfish exemption; carried onto
     ``GPTDatasetConfig`` for dataloader workers).
 
-    Metadata source: the tokenizer ``init_kwargs`` keys ``base_vocab_size`` and
-    ``omnimodal_config`` (i.e. ``tokenizer_config.json``).
+    Metadata sources: the tokenizer ``init_kwargs`` keys ``base_vocab_size`` and
+    ``omnimodal_config`` (i.e. ``tokenizer_config.json``), plus the added-token table
+    (``added_tokens_decoder``) for the special-token derivation.
 
     Returns:
         The :class:`OmniMetadata`, or ``None`` when the tokenizer has no omni metadata.
@@ -313,13 +385,24 @@ def populate_omni_metadata_from_tokenizer(args, tokenizer: Any) -> Optional[Omni
     init_kwargs = extract_tokenizer_init_kwargs(tokenizer)
     base_vocab_size = init_kwargs.get("base_vocab_size")
     omnimodal_config = init_kwargs.get("omnimodal_config")
+    added_special_ids = extract_added_special_token_ids(tokenizer)
 
-    omni = extract_omni_metadata(base_vocab_size, omnimodal_config)
+    omni = extract_omni_metadata(base_vocab_size, omnimodal_config, added_special_ids)
     if omni is None:
         return None
 
     names = [modality.name for modality in omni.modalities]
-    log_single_rank(logger, logging.INFO, f" > loaded omnimodal_config with modalities: {names}")
+    special = omni.special_tokens
+    special_summary = (
+        f"{len(special.full_ids)} ids ({special.source}, range={special.id_range})"
+        if special is not None
+        else "none"
+    )
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f" > loaded omnimodal_config with modalities: {names}; special tokens: {special_summary}",
+    )
 
     args.omni_metadata = omni
     return omni
