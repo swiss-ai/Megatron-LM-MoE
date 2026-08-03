@@ -123,8 +123,7 @@ def test_apply_goldfish():
 
     torch.manual_seed(0)
     seq_length, k, h = 8192, 50, 50
-    # Sample ids in [1, vocab) to avoid the id-0 product-collapse artifact.
-    labels = torch.randint(1, _MOCK_VOCAB_SIZE, (seq_length,), dtype=torch.long)
+    labels = torch.randint(0, _MOCK_VOCAB_SIZE, (seq_length,), dtype=torch.long)
     table = _create_hash_table(device=labels.device)
 
     original = labels.clone()
@@ -155,6 +154,79 @@ def test_apply_goldfish():
     dropped = out_exempt == _GOLDFISH_TOKEN_ID
     assert not torch.any((labels >= lo) & (labels < hi) & dropped), "exempt-band token was dropped"
     assert torch.any(dropped), "expected drops outside the exempt band"
+
+    # Pinned position: exempting exactly the label id of a known dropped position
+    # cancels that drop (deterministic alignment of window hash vs. exempt mask).
+    pinned = int((out == _GOLDFISH_TOKEN_ID).nonzero(as_tuple=True)[0][0])
+    pin_lut = _create_exemption_lut([int(labels[pinned])], _MOCK_VOCAB_SIZE, labels.device)
+    out_pinned = apply_goldfish(
+        labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h, exemption_lut=pin_lut
+    )
+    assert out_pinned[pinned] != _GOLDFISH_TOKEN_ID
+
+    # Windows containing id-0 labels (pad/unk) must hash like any other window: with a
+    # zero every 10 positions every window contains one, yet the rate stays ~1/k (the
+    # old product hash collapsed all such windows onto a single drop decision).
+    zero_heavy = labels.clone()
+    zero_heavy[::10] = 0
+    out_zero = apply_goldfish(zero_heavy, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
+    zero_rate = (out_zero[h - 1 :] == _GOLDFISH_TOKEN_ID).float().mean().item()
+    assert abs(zero_rate - 1.0 / k) < 0.01, zero_rate
+
+
+def test_mock_gpt_dataset_goldfish():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    # Cache-friendly flags on purpose: goldfish alone must not disable the mask cache,
+    # and interleaved access must not leak one sample's drops into another (the cache
+    # hands out clones).
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    def build(**overrides):
+        config = GPTDatasetConfig(**base, **overrides)
+        return BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [100, 100, 100], lambda: True, config
+        ).build()
+
+    goldfish_sets = build(goldfish_loss=True, goldfish_k=4, goldfish_h=13)
+    plain_sets = build()
+    ds, plain = goldfish_sets[0], plain_sets[0]
+
+    assert ds.masks_and_position_ids_are_cacheable
+
+    # Goldfish zeroes a strict superset of the plain loss mask (~1/k of the tail).
+    gf_mask, plain_mask = ds[0]["loss_mask"].clone(), plain[0]["loss_mask"]
+    assert not torch.any((gf_mask == 1) & (plain_mask == 0))
+    n_extra = int(((gf_mask == 0) & (plain_mask == 1)).sum())
+    assert n_extra > 0, "goldfish produced no drops"
+
+    # Same index -> identical mask; interleaving other samples must not accumulate
+    # zeros through the cache (fresh dataset accessed in a different order agrees).
+    _ = ds[1]
+    assert torch.equal(ds[0]["loss_mask"], gf_mask)
+    fresh_sets = build(goldfish_loss=True, goldfish_k=4, goldfish_h=13)
+    assert torch.equal(fresh_sets[0][1]["loss_mask"], ds[1]["loss_mask"])
+
+    # The idx-None batch-padding sample stays fully masked.
+    assert not torch.any(goldfish_sets[1][None]["loss_mask"])
 
 
 def test_goldfish_config_validation():
@@ -187,4 +259,5 @@ def test_goldfish_config_validation():
 if __name__ == "__main__":
     test_mock_gpt_dataset()
     test_apply_goldfish()
+    test_mock_gpt_dataset_goldfish()
     test_goldfish_config_validation()

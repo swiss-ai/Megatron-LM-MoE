@@ -400,12 +400,13 @@ class GPTDataset(MegatronDataset):
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
+        # Goldfish drops need no cache opt-out: loss_mask is cloned out of the cache on
+        # read (and cloned into it on store), so per-sample mutation cannot leak back.
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
-                self.config.goldfish_loss,
             ]
         )
         self.masks_and_position_ids_are_cached = False
@@ -417,22 +418,24 @@ class GPTDataset(MegatronDataset):
             self._build_document_sample_shuffle_indices()
         )
 
-        # Goldfish loss: memorization-mitigation via deterministic loss-mask drops.
+        # Goldfish loss: memorization-mitigation via deterministic loss-mask drops. The
+        # hash table / coefficients / exemption LUT are shared module-level caches (see
+        # _get_hash_table): identical for every dataset instance, and blended runs build
+        # one instance per blend component.
         if self.config.goldfish_loss:
             self._goldfish_k = self.config.goldfish_k
             self._goldfish_h = self.config.goldfish_h
             self._goldfish_token_id = _GOLDFISH_TOKEN_ID
-            self._goldfish_hash_table = None  # lazily built (device-aware) in __getitem__
             # Goldfish-exempt token ids = the model's full special-token set (control/
             # structure tokens that must never be dropped) from config.omni_metadata
             # (worker-safe). None (no exemption) when the tokenizer does not describe it.
+            # Stored as a tuple: it doubles as the exemption-LUT cache key.
             omni = self.config.omni_metadata
             self._goldfish_exemption_ids = (
-                omni.special_tokens.full_ids
+                tuple(omni.special_tokens.full_ids)
                 if omni is not None and omni.special_tokens is not None
                 else None
             )
-            self._goldfish_exemption_lut = None  # lazily built (device-aware) in __getitem__
             if self._goldfish_exemption_ids:
                 n_exempt = len(self._goldfish_exemption_ids)
                 log_single_rank(
@@ -562,7 +565,10 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
+                # Cache a pristine copy: loss_mask is mutated in place below (pad
+                # masking, goldfish drops), and caching the aliased tensor would leak
+                # this first sample's zeros into every later sample.
+                self.cached_loss_mask = loss_mask.clone()
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
         else:
@@ -583,21 +589,22 @@ class GPTDataset(MegatronDataset):
         # Skipped for the idx is None batch-padding sample, whose loss_mask is fully
         # zeroed just below anyway.
         if self.config.goldfish_loss and idx is not None:
-            if self._goldfish_hash_table is None:
-                self._goldfish_hash_table = _create_hash_table(device=labels.device)
-            if self._goldfish_exemption_ids and self._goldfish_exemption_lut is None:
-                self._goldfish_exemption_lut = _create_exemption_lut(
+            exemption_lut = (
+                _get_exemption_lut(
                     self._goldfish_exemption_ids,
                     self.config.tokenizer.vocab_size,
                     device=labels.device,
                 )
+                if self._goldfish_exemption_ids
+                else None
+            )
             goldfish_labels = apply_goldfish(
                 labels,
                 goldfish_token_id=self._goldfish_token_id,
                 k=self._goldfish_k,
-                goldfish_hash_table=self._goldfish_hash_table,
+                goldfish_hash_table=_get_hash_table(labels.device),
                 goldfish_context_width=self._goldfish_h,
-                exemption_lut=self._goldfish_exemption_lut,
+                exemption_lut=exemption_lut,
             )
             loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
 
@@ -1372,6 +1379,53 @@ def _create_hash_table(device):
     return torch.rand(_HASH_TABLE_SIZE, device=device, generator=rng)
 
 
+def _create_hash_coefficients(width: int, device) -> torch.Tensor:
+    """Fixed-seed odd int64 coefficients for the goldfish window hash.
+
+    Hashing each window as a coefficient dot product (mod table size, int64 wrap-around
+    is deterministic) is order-sensitive and free of the plain product hash's
+    degeneracies: with a product, an id-0 label collapses the whole window to
+    ``hash_table[0]`` (one shared drop decision for every window containing a pad/unk),
+    and id-1 labels are invisible. Odd coefficients keep every label contributing under
+    wrap-around.
+    """
+    rng = torch.Generator(device=device)
+    rng.manual_seed(2971215073 + width)
+    coef = torch.randint(0, 2**62, (width,), dtype=torch.int64, device=device, generator=rng)
+    return coef | 1
+
+
+# Goldfish state is identical for every dataset instance (fixed seeds, config-derived
+# ids), so it is memoized at module level: blended runs construct one GPTDataset per
+# blend component per split, and each private hash-table copy would cost 4 MB per
+# instance per dataloader worker.
+_GOLDFISH_CACHE = {}
+
+
+def _get_hash_table(device) -> torch.Tensor:
+    """Module-memoized :func:`_create_hash_table` (one shared table per device)."""
+    key = ("table", str(device))
+    if key not in _GOLDFISH_CACHE:
+        _GOLDFISH_CACHE[key] = _create_hash_table(device)
+    return _GOLDFISH_CACHE[key]
+
+
+def _get_hash_coefficients(width: int, device) -> torch.Tensor:
+    """Module-memoized :func:`_create_hash_coefficients`."""
+    key = ("coef", int(width), str(device))
+    if key not in _GOLDFISH_CACHE:
+        _GOLDFISH_CACHE[key] = _create_hash_coefficients(width, device)
+    return _GOLDFISH_CACHE[key]
+
+
+def _get_exemption_lut(exemption_ids: tuple, vocab_size: int, device) -> torch.Tensor:
+    """Module-memoized :func:`_create_exemption_lut`."""
+    key = ("lut", exemption_ids, int(vocab_size), str(device))
+    if key not in _GOLDFISH_CACHE:
+        _GOLDFISH_CACHE[key] = _create_exemption_lut(exemption_ids, vocab_size, device)
+    return _GOLDFISH_CACHE[key]
+
+
 def _create_exemption_lut(exemption_ids, vocab_size: int, device) -> torch.Tensor:
     """Boolean lookup table (length ``vocab_size``) marking Goldfish-exempt token ids.
 
@@ -1395,12 +1449,16 @@ def apply_goldfish(
 ) -> torch.Tensor:
     """Deterministically drop ~1/k of tokens from the loss (Goldfish loss).
 
-    For each position, hash the preceding ``goldfish_context_width`` labels
-    (product of ids mod the hash-table size) into ``goldfish_hash_table``; where
-    the hashed value is ``< 1/k`` the predicted token is replaced by
-    ``goldfish_token_id``. Because the decision is a pure function of the local
-    context, the same token in the same context is always dropped, mitigating
-    verbatim memorization while staying fully reproducible.
+    For each position, hash the window of ``goldfish_context_width`` labels ending at
+    it (dot product with fixed random coefficients, mod the hash-table size; see
+    :func:`_create_hash_coefficients`) into ``goldfish_hash_table``; where the hashed
+    value is ``< 1/k`` the predicted token is replaced by ``goldfish_token_id``.
+    Because the decision is a pure function of the local context, the same token in
+    the same context is always dropped, mitigating verbatim memorization while
+    staying fully reproducible. In packed samples a window may span document
+    boundaries: a duplicated document's drop mask is identical wherever the window
+    lies fully inside it -- only its first ``goldfish_context_width - 1`` positions
+    can vary with the packing neighbor.
 
     ``exemption_lut`` (a boolean lookup table over token ids) cancels drops for exempt
     tokens (e.g. omni special/modality tokens); see :func:`_create_exemption_lut`.
@@ -1423,11 +1481,11 @@ def apply_goldfish(
     assert labels.ndim == 1, "Expected 1D tensor as used within GPTDataset.__getitem__"
     masked_labels = labels.clone()
 
-    # Order-insensitive product hash of each h-token window; int64 overflow is intentional
-    # (deterministic), and % prime spreads it across the table.
-    hashed_keys = goldfish_hash_table[
-        labels.unfold(0, goldfish_context_width, 1).prod(dim=-1) % _HASH_TABLE_SIZE
-    ]
+    # Order-sensitive dot-product hash of each h-token window; int64 overflow is
+    # intentional (deterministic), and % prime spreads it across the table.
+    coefficients = _get_hash_coefficients(goldfish_context_width, labels.device)
+    window_keys = (labels.unfold(0, goldfish_context_width, 1) * coefficients).sum(dim=-1)
+    hashed_keys = goldfish_hash_table[window_keys % _HASH_TABLE_SIZE]
 
     dropped_token_indices = hashed_keys < 1 / k
 
