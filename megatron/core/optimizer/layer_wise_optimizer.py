@@ -325,9 +325,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         )
 
     @torch.no_grad()
-    def step(self):  # type: ignore[no-untyped-def]
-        """step function for layer-wise optimizer."""
-        update_successful, grad_norm, num_zeros_in_grad = super().step()
+    def step_after_grad_norm(self, grad_norm):
+        """step function for layer-wise optimizer after grad norm is computed.
+
+        NOTE: ChainedOptimizer.step() routes to here, so step() is not overridden.
+        ChainedOptimizer.step() --> LayerWiseDistributedOptimizer.step_after_grad_norm() -->
+        ChainedOptimizer.step_after_grad_norm() --> allgather_params()
+        """
+        update_successful, _, num_zeros_in_grad = super().step_after_grad_norm(grad_norm)
 
         # All gather updated params. If async_allgather is True, the allgather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.

@@ -235,6 +235,9 @@ class RerunStateMachine:
 
         self.large_value_counts: dict[str, int] = {}
         self.max_values: dict[str, float] = {}
+        # Resume-local baseline: max_values is not restored on a normal checkpoint load,
+        # so the reload path of is_spiky_grad_norm compares against the previous step.
+        self.prev_step_value: dict[str, float] = {}
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
@@ -765,6 +768,41 @@ class RerunStateMachine:
             return False
 
         return value >= self.max_values[context] * threshold
+
+    def is_spiky_grad_norm(
+        self,
+        result: tuple[bool, float],
+        context: str,
+        num_samples: int = 100,
+        resample: bool = False,
+        reload: bool = False,
+        threshold: float = 5.0,
+    ):
+        found_inf_flag, value = result
+        if found_inf_flag:
+            return True
+
+        # if load from ckpt, check based on previous step value
+        if reload: 
+            if context not in self.prev_step_value:
+                self.prev_step_value[context] = value
+                return value >= threshold
+            else:
+                if value >= threshold or value >= self.prev_step_value[context] * 5:
+                    return True
+                self.prev_step_value[context] = value
+                return False
+
+        if resample or context not in self.large_value_counts:
+            self.large_value_counts[context] = 0
+        if self.large_value_counts[context] < num_samples:
+            self.large_value_counts[context] += 1
+            self.max_values[context] = max(self.max_values.get(context, 0.0), value)
+            if self.large_value_counts[context] == num_samples:
+                logger.warning(f"Max value for {context}: {self.max_values[context]}")
+            return False
+
+        return value >= self.max_values[context] * 1.5
 
     def state_dict(
         self, data_iterator: DataIteratorArgType, ckpt_format: str, force: bool = False
@@ -1395,5 +1433,31 @@ def _compare_floats(a: torch.Tensor, b: torch.Tensor) -> float:
         or (math.isnan(af) and math.isinf(bf))
         or (math.isinf(af) and math.isnan(bf))
     ):
+        return COMPARISON_MISMATCH
+    return math.fabs((af - bf) / (af + bf) * 2)
+
+
+def compare_grad_norms(
+    a: Tuple[bool, Optional[float]], b: Tuple[bool, Optional[float]]
+) -> float:
+    """Compare_func for the (found_inf_flag, grad_norm) tuple of prepare_grad_norm().
+
+    The default compare_func cannot be used on that result because it is a tuple rather
+    than a 0-dim tensor, and because grad_norm is None when inf/NaN was found in the
+    gradients (in which case only the flags can be compared).
+
+    Check the validate_result() method of the RerunStateMachine class for details.
+    """
+
+    a_found_inf, a_norm = a
+    b_found_inf, b_norm = b
+    if a_found_inf or b_found_inf:
+        return COMPARISON_MATCH if a_found_inf == b_found_inf else COMPARISON_MISMATCH
+    # grad_norm is a Python float, but accept a 0-dim tensor as well.
+    af: float = float(a_norm)
+    bf: float = float(b_norm)
+    if (af == bf) or (math.isnan(af) and math.isnan(bf)):
+        return COMPARISON_MATCH
+    if (math.isnan(af) != math.isnan(bf)) or (math.isinf(af) != math.isinf(bf)):
         return COMPARISON_MISMATCH
     return math.fabs((af - bf) / (af + bf) * 2)

@@ -23,6 +23,12 @@ class RerunStateMachineConfig:
     check_for_spiky_loss: bool = False
     """Check for spiky loss."""
 
+    check_grad_norm: bool = False
+    """Check for spiky grad norm. Only supported by the md_decoupling optimizer."""
+
+    check_grad_norm_threshold: float = 5.0
+    """Threshold for spiky grad norm detection."""
+
 
 @dataclass(kw_only=True)
 class StragglerDetectionConfig:

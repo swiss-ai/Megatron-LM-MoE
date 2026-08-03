@@ -1391,6 +1391,37 @@ class ChainedOptimizer(MegatronOptimizer):
             return num_zeros_in_grad
 
     @torch.no_grad()
+    def prepare_grad_norm(self):
+        found_inf_flag = self.prepare_grads()
+        if found_inf_flag:
+            return True, None
+
+        grad_norm = self.get_grad_norm()
+        return False, grad_norm
+
+    @torch.no_grad()
+    def step_after_grad_norm(self, grad_norm):
+        """Clip by a precomputed total norm and step. Assumes prepare_grads() already ran."""
+        for optimizer in self.chained_optimizers:      # unchanged from :1401-1415
+            if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
+                continue
+            parameters = optimizer.get_parameters()
+            if len(parameters) == 0:
+                continue
+            if optimizer.config.clip_grad > 0.0:
+                clip_grad_by_total_norm_fp32(
+                    parameters,
+                    max_norm=optimizer.config.clip_grad,
+                    total_norm=grad_norm,
+                    use_decoupled_grad=(
+                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    ),
+                )
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        update_successful = self.step_with_ready_grads()
+        return update_successful, grad_norm, num_zeros_in_grad
+
+    @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
         found_inf_flag = self.prepare_grads()
@@ -1398,6 +1429,7 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        return self.step_after_grad_norm(grad_norm)
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
