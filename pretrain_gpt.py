@@ -4,6 +4,7 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
+
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -11,6 +12,7 @@ import json
 # Suppress warnings on all ranks but rank 0.
 import os
 import warnings
+
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -26,23 +28,28 @@ from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
+from megatron.core.utils import (
+    StragglerDetector,
+    get_attr_wrapped_model,
+    get_batch_on_this_hybrid_cp_rank,
+    get_thd_batch_on_this_cp_rank,
+)
 from megatron.training import (
     get_args,
     get_timers,
+    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -166,9 +173,66 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
+# Modalities with per-modality static loss-weight flags (--vision-weight, --audio-weight).
+MODALITY_WEIGHT_NAMES = ("vision", "audio")
+
+# Cache of structure-token id tensors for label classification. Content-addressed by
+# the id tuple (not the modality name) so a tokenizer rebuild with different structure
+# ids cannot serve a stale tensor.
+_MODALITY_SPECIAL_IDS_CACHE = {}
+
+
+def _modality_token_mask(labels: torch.Tensor, modality) -> torch.Tensor:
+    """Boolean mask of labels belonging to a modality: content range + structure tokens."""
+    mask = (labels >= modality.offset) & (labels < modality.offset + modality.vocab_size)
+    key = (modality.structure_ids, labels.dtype, labels.device)
+    special = _MODALITY_SPECIAL_IDS_CACHE.get(key)
+    if special is None:
+        special = torch.tensor(modality.structure_ids, dtype=labels.dtype, device=labels.device)
+        _MODALITY_SPECIAL_IDS_CACHE[key] = special
+    mask |= torch.isin(labels, special)
+    return mask
+
+
+def modality_loss_report(losses, loss_mask, labels, modalities):
+    """Decompose the masked loss into per-modality and text components for reporting.
+
+    Each entry follows the 'lm loss' [sum, weighted_token_count] convention, so the
+    downstream reduction (sum over microbatches/DP, then sum/count) yields the per-token
+    loss of that category. Categories partition the label ids -- a modality is its
+    content range plus its structure tokens (ModalityInfo.structure_ids), text is every
+    remaining id -- so the category sums/counts add up exactly to 'lm loss'.
+
+    Args:
+        losses (torch.Tensor): Flat per-token losses (may require grad; sums are detached).
+        loss_mask (torch.Tensor): Flat loss mask/weights, same shape as ``losses``.
+        labels (torch.Tensor): Flat label ids, same shape as ``losses``.
+        modalities: Iterable of ModalityInfo (from args.tokenizer_extra_metadata.omni).
+
+    Returns:
+        dict: {'<name> loss': tensor([sum, count]), ..., 'text loss': tensor([sum, count])}
+    """
+    report = {}
+    modality_union = torch.zeros_like(labels, dtype=torch.bool)
+    for modality in modalities:
+        mask = _modality_token_mask(labels, modality)
+        modality_union |= mask
+        weights = loss_mask * mask
+        report[f"{modality.name} loss"] = torch.cat(
+            [torch.sum(losses * weights).detach().view(1), weights.sum().detach().view(1)]
+        )
+    text_weights = loss_mask * ~modality_union
+    report["text loss"] = torch.cat(
+        [torch.sum(losses * text_weights).detach().view(1), text_weights.sum().detach().view(1)]
+    )
+    return report
+
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[GPTModel] = None,
+    labels: Optional[torch.Tensor] = None,
 ):
     """Loss function.
 
@@ -176,6 +240,8 @@ def loss_func(
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
+        labels (torch.Tensor, optional): Label ids, used to report separate per-modality
+            (vision/audio) and text losses when the tokenizer carries omni metadata
 
     Returns:
         the loss scalar for this micro-batch
@@ -194,6 +260,15 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+        # Separate per-modality loss tracking (vision/audio incl. their structure
+        # tokens; text = all remaining label ids). Only for omni tokenizers.
+        metadata = getattr(args, 'tokenizer_extra_metadata', None)
+        omni = metadata.omni if metadata is not None else None
+        if labels is not None and omni is not None:
+            report.update(
+                modality_loss_report(losses, loss_mask, labels.reshape(-1), omni.modalities)
+            )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -258,14 +333,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 schedule_plan = model.build_schedule_plan(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
-                return schedule_plan, partial(loss_func, loss_mask, model=model)
+                return schedule_plan, partial(loss_func, loss_mask, model=model, labels=labels)
             else:
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model, labels=labels)
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
@@ -282,7 +357,11 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = build_tokenizer(args)
+    # The global tokenizer and its general metadata are initialized together. Carry the
+    # metadata on the dataset config so Goldfish exemptions work in dataloader workers
+    # for text-only and omni tokenizers alike.
+    tokenizer = get_tokenizer()
+    tokenizer_extra_metadata = getattr(args, "tokenizer_extra_metadata", None)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -322,7 +401,22 @@ def core_gpt_dataset_config_from_args(args):
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
+        "tokenizer_extra_metadata": tokenizer_extra_metadata,
+        # Static per-modality weights (--vision-weight/--audio-weight) are applied
+        # dataset-side; entries at the default 1.0 are omitted (no-op).
+        "modality_weights": {
+            modality: getattr(args, f"{modality}_weight")
+            for modality in MODALITY_WEIGHT_NAMES
+            if getattr(args, f"{modality}_weight") != 1.0
+        }
+        or None,
     }
+    # SFTDataset builds its own loss mask (pad/IGNORE_INDEX) and never consults
+    # modality_weights; fail loudly rather than train silently unweighted.
+    assert not (data_args["modality_weights"] and args.sft), (
+        "--vision-weight/--audio-weight are not supported with --sft: SFTDataset does "
+        "not apply modality weights to its loss mask."
+    )
 
     # add FIM args to the config
     if args.fim_data:

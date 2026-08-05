@@ -1,11 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import bisect
 import logging
 import os
 import time
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy
 import torch
@@ -16,8 +17,8 @@ from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
 from megatron.core.tokenizers import MegatronTokenizerBase
+from megatron.core.tokenizers.utils.tokenizer_extra_metadata import TokenizerExtraMetadata
 from megatron.core.utils import log_single_rank
-import bisect
 
 logger = logging.getLogger(__name__)
 
@@ -33,23 +34,22 @@ def _load_bfd_c_library():
     import subprocess
 
     _dir = os.path.dirname(os.path.abspath(__file__))
-    so_path  = os.path.join(_dir, "libbfd_pack.so")
+    so_path = os.path.join(_dir, "libbfd_pack.so")
     cpp_path = os.path.join(_dir, "bfd_pack.cpp")
 
     # Rebuild if source is newer (e.g. after the max_docs_per_bin signature change).
-    so_is_fresh = (
-        os.path.isfile(so_path)
-        and (not os.path.isfile(cpp_path) or os.path.getmtime(so_path) >= os.path.getmtime(cpp_path))
+    so_is_fresh = os.path.isfile(so_path) and (
+        not os.path.isfile(cpp_path) or os.path.getmtime(so_path) >= os.path.getmtime(cpp_path)
     )
     if so_is_fresh:
         try:
             lib = ctypes.CDLL(so_path)
             lib.bfd_pack.argtypes = [
                 ctypes.POINTER(ctypes.c_int),  # sorted_positions
-                ctypes.POINTER(ctypes.c_long), # doc_lengths
-                ctypes.c_int,                  # num_docs
-                ctypes.c_int,                  # capacity
-                ctypes.c_int,                  # max_docs_per_bin (0 = no cap)
+                ctypes.POINTER(ctypes.c_long),  # doc_lengths
+                ctypes.c_int,  # num_docs
+                ctypes.c_int,  # capacity
+                ctypes.c_int,  # max_docs_per_bin (0 = no cap)
                 ctypes.POINTER(ctypes.c_int),  # document_index
                 ctypes.POINTER(ctypes.c_int),  # doc_idx_out
                 ctypes.POINTER(ctypes.c_int),  # boundaries_out
@@ -75,6 +75,7 @@ def _load_bfd_c_library():
 
 
 _bfd_c_lib = _load_bfd_c_library()
+
 
 def _build_virtual_docs(document_index, sequence_lengths, capacity, eod_token_id):
     """Split any document longer than *capacity* into chunks with proper EOD boundaries.
@@ -122,7 +123,7 @@ def _build_virtual_docs(document_index, sequence_lengths, capacity, eod_token_id
         nc = int(num_chunks[pos])
         for ci in range(nc):
             off = ci * step
-            is_last = (ci == nc - 1)
+            is_last = ci == nc - 1
             if is_last:
                 clen = dlen - off
                 append_eod = 0
@@ -135,14 +136,22 @@ def _build_virtual_docs(document_index, sequence_lengths, capacity, eod_token_id
     return chunk_map, virtual_sizes
 
 
-def _build_sample_idx_bfd(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin):
+def _build_sample_idx_bfd(
+    sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin
+):
     """Best-Fit Decreasing bin packing for whole documents. C-accelerated when available."""
     if _bfd_c_lib is not None:
-        return _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
-    return _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin)
+        return _build_sample_idx_bfd_c(
+            sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin
+        )
+    return _build_sample_idx_bfd_python(
+        sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin
+    )
 
 
-def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0):
+def _build_sample_idx_bfd_c(
+    sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0
+):
     """C-accelerated BFD bin packing via ctypes. See _build_sample_idx_bfd."""
     import ctypes
 
@@ -160,7 +169,9 @@ def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_ex
     _bfd_c_lib.bfd_pack(
         sorted_positions.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         doc_lengths.ctypes.data_as(ctypes.POINTER(ctypes.c_long)),
-        num_docs, capacity, int(max_docs_per_bin),
+        num_docs,
+        capacity,
+        int(max_docs_per_bin),
         doc_index_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         doc_idx_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
         boundaries_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -170,13 +181,17 @@ def _build_sample_idx_bfd_c(sequence_lengths, document_index, seq_length, add_ex
     nb = num_bins_out.value
     reordered = doc_idx_out[:num_docs].astype(document_index.dtype)
     sample_index = numpy.zeros((nb + 1, 2), dtype=document_index.dtype)
-    sample_index[:, 0] = boundaries_out[:nb + 1].astype(document_index.dtype)
+    sample_index[:, 0] = boundaries_out[: nb + 1].astype(document_index.dtype)
 
-    assert boundaries_out[nb] == num_docs, f"BFD placed {boundaries_out[nb]} docs but expected {num_docs}"
+    assert (
+        boundaries_out[nb] == num_docs
+    ), f"BFD placed {boundaries_out[nb]} docs but expected {num_docs}"
     return reordered, sample_index
 
 
-def _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0):
+def _build_sample_idx_bfd_python(
+    sequence_lengths, document_index, seq_length, add_extra_token, max_docs_per_bin=0
+):
     """Pure-Python BFD fallback using bisect. See _build_sample_idx_bfd."""
     capacity = seq_length + add_extra_token
     num_docs = len(document_index)
@@ -237,6 +252,7 @@ def _build_sample_idx_bfd_python(sequence_lengths, document_index, seq_length, a
     assert offset == num_docs
     return reordered, sample_index
 
+
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
@@ -290,7 +306,19 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Packing strategy for SFT: 'greedy' (sequential) or 'bfd' (Best-Fit Decreasing)."""
 
     max_docs_per_bin: int = 0
-    """Maximum number of documents allowed per sample in bfd, 0 means no limit""" 
+    """Maximum number of documents allowed per sample in bfd, 0 means no limit"""
+
+    tokenizer_extra_metadata: Optional[TokenizerExtraMetadata] = None
+    """General tokenizer metadata, including special-token ids and an optional validated
+       omni extension. Forwarded through this config for dataloader workers."""
+
+    modality_weights: Optional[Dict[str, float]] = None
+    """Static per-modality loss weights {modality name: weight}, e.g. {"vision": 0.25},
+       from --vision-weight / --audio-weight. Applied to loss mask on per modality token ids.
+       Contains only weights != 1.0: no-op default entries are dropped upstream
+       (core_gpt_dataset_config_from_args) so unweighted runs skip the weighting branch.
+       Requires tokenizer_extra_metadata with an omni extension. None disables
+       weighting (weight 1)."""
 
     token_dtype_code: Optional[int] = field(init=False, default=None)
     """The dtype code for the token ids. 4 for int32, 8 for uint16."""
@@ -307,6 +335,23 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.modality_weights:
+            omni = (
+                self.tokenizer_extra_metadata.omni
+                if self.tokenizer_extra_metadata is not None
+                else None
+            )
+            assert omni is not None, (
+                "modality_weights requires tokenizer_extra_metadata with an omni extension "
+                "(the tokenizer must provide an omnimodal_config)."
+            )
+            for name, weight in self.modality_weights.items():
+                assert weight >= 0, f"modality loss weight for '{name}' must be >= 0 ({weight})."
+                assert omni.modality(name) is not None, (
+                    f"modality_weights names '{name}', which the tokenizer's omni metadata "
+                    f"does not describe (known: {[m.name for m in omni.modalities]})."
+                )
 
         self.token_dtype_code = (
             None
@@ -365,6 +410,19 @@ class GPTDataset(MegatronDataset):
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()
         )
+
+        # Construct modality information from omni metadata
+        if self.config.modality_weights:
+            omni = self.config.tokenizer_extra_metadata.omni
+            self._modality_weights = tuple(
+                (omni.modality(name), float(weight))
+                for name, weight in self.config.modality_weights.items()
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Per-modality loss weights enabled: {self.config.modality_weights}",
+            )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -482,7 +540,10 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
+                # Cache a pristine copy: loss_mask is mutated in place below (pad
+                # masking), and caching the aliased tensor would leak this first
+                # sample's zeros into every later sample.
+                self.cached_loss_mask = loss_mask.clone()
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
         else:
@@ -496,6 +557,20 @@ class GPTDataset(MegatronDataset):
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
         labels[labels == self._pad_token_id] = 0
+
+        # Static per-modality loss weighting: scale loss_mask at positions whose LABEL id
+        # belongs to a weighted modality (content range + its structure tokens). Pure
+        # id-based classification, so samples that start or end mid-modality (e.g. an
+        # image spanning several samples) are weighted correctly without span tracking.
+        # Skipped for the idx is None batch-padding sample, whose loss_mask is fully
+        # zeroed just below anyway.
+        if self.config.modality_weights and idx is not None:
+            weight_lut = _get_modality_weight_lut(
+                self._modality_weights, self.config.tokenizer.vocab_size, device=labels.device
+            )
+            # Out-of-place so this block never depends on the cache-cloning discipline
+            # above (the cached loss_mask is cloned on store and read; keep it that way).
+            loss_mask = loss_mask * weight_lut[labels]
 
         # Batch padding sequence so we mask the loss
         if idx is None:
@@ -628,10 +703,16 @@ class GPTDataset(MegatronDataset):
             path_to_shuffle_index = get_path_to("shuffle_index.npy")
             path_to_chunk_map = get_path_to("chunk_map.npy")
             cache_hit = all(
-                map(os.path.isfile, [
-                    path_to_description, path_to_document_index,
-                    path_to_sample_index, path_to_shuffle_index, path_to_chunk_map,
-                ])
+                map(
+                    os.path.isfile,
+                    [
+                        path_to_description,
+                        path_to_document_index,
+                        path_to_sample_index,
+                        path_to_shuffle_index,
+                        path_to_chunk_map,
+                    ],
+                )
             )
         else:
             cache_hit = False
@@ -640,8 +721,11 @@ class GPTDataset(MegatronDataset):
             not cache_hit
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
         ):
-            log_single_rank(logger, logging.INFO,
-                f"Build and save the {type(self).__name__} {self.index_split.name} BFD indices")
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Build and save the {type(self).__name__} {self.index_split.name} BFD indices",
+            )
             t_beg = time.time()
 
             sequence_length = self.config.sequence_length
@@ -666,18 +750,24 @@ class GPTDataset(MegatronDataset):
             virtual_idx = numpy.arange(num_virtual, dtype=numpy.int32)
 
             n_extra = num_virtual - len(real_doc_index)
-            log_single_rank(logger, logging.INFO,
+            log_single_rank(
+                logger,
+                logging.INFO,
                 f"  Document chunking: {len(real_doc_index)} docs → {num_virtual} virtual chunks"
-                + (f" ({n_extra} extra from oversized docs)" if n_extra > 0 else ""))
+                + (f" ({n_extra} extra from oversized docs)" if n_extra > 0 else ""),
+            )
 
             _accel = "C-accelerated" if _bfd_c_lib is not None else "Python fallback"
-            log_single_rank(logger, logging.INFO,
-                f"Using Best-Fit Decreasing packing strategy ({_accel})")
+            log_single_rank(
+                logger, logging.INFO, f"Using Best-Fit Decreasing packing strategy ({_accel})"
+            )
 
             document_index, sample_index = _build_sample_idx_bfd(
-                virtual_sizes, virtual_idx, sequence_length,
+                virtual_sizes,
+                virtual_idx,
+                sequence_length,
                 add_extra_token=self.config.add_extra_token_to_sequence,
-                max_docs_per_bin=self.config.max_docs_per_bin
+                max_docs_per_bin=self.config.max_docs_per_bin,
             )
             self._log_bfd_packing_statistics(
                 num_docs=len(real_doc_index),
@@ -693,12 +783,17 @@ class GPTDataset(MegatronDataset):
                 shuffle_index = _build_shuffle_index(num_epoch_samples, n, numpy_random_state)
             else:
                 num_repeats = int(numpy.ceil(self.num_samples / num_epoch_samples))
-                log_single_rank(logger, logging.WARNING,
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     f"> Requested {self.num_samples} samples but one epoch provides only "
-                    f"{num_epoch_samples}. Tiling shuffle index {num_repeats}x.")
-                tiles = [_build_shuffle_index(num_epoch_samples, num_epoch_samples, numpy_random_state)
-                         for _ in range(num_repeats)]
-                shuffle_index = numpy.concatenate(tiles)[:self.num_samples]
+                    f"{num_epoch_samples}. Tiling shuffle index {num_repeats}x.",
+                )
+                tiles = [
+                    _build_shuffle_index(num_epoch_samples, num_epoch_samples, numpy_random_state)
+                    for _ in range(num_repeats)
+                ]
+                shuffle_index = numpy.concatenate(tiles)[: self.num_samples]
 
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
@@ -711,7 +806,9 @@ class GPTDataset(MegatronDataset):
 
             self.chunk_map = chunk_map
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {time.time() - t_beg:4f} s")
-            log_single_rank(logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}")
+            log_single_rank(
+                logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+            )
 
             self._log_bfd_packing_statistics(
                 num_docs=len(self.indices),
@@ -719,17 +816,22 @@ class GPTDataset(MegatronDataset):
                 sample_index=sample_index,
                 from_cache=True,
             )
-            
+
             return document_index, sample_index, shuffle_index
 
         # Cache hit
-        log_single_rank(logger, logging.INFO,
-            f"Load the {type(self).__name__} {self.index_split.name} BFD indices")
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Load the {type(self).__name__} {self.index_split.name} BFD indices",
+        )
         document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode='r')
         sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode='r')
         shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode='r')
         self.chunk_map = numpy.load(path_to_chunk_map, allow_pickle=True, mmap_mode='r')
-        log_single_rank(logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}")
+        log_single_rank(
+            logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+        )
 
         self._log_bfd_packing_statistics(
             num_docs=len(self.indices),
@@ -737,7 +839,7 @@ class GPTDataset(MegatronDataset):
             sample_index=sample_index,
             from_cache=True,
         )
-        
+
         return document_index, sample_index, shuffle_index
 
     def _log_bfd_packing_statistics(self, num_docs, num_virtual, sample_index, from_cache=False):
@@ -748,18 +850,45 @@ class GPTDataset(MegatronDataset):
         avg_docs_per_sample = num_virtual / num_samples if num_samples > 0 else 0
         packing_efficiency = (
             100 * num_tokens_per_epoch / total_tokens_in_samples
-            if total_tokens_in_samples > 0 else 0
+            if total_tokens_in_samples > 0
+            else 0
         )
         suffix = " (loaded from cache)" if from_cache else ""
-        log_single_rank(logger, logging.INFO, f"> ===== BFD Packing Statistics (ONE EPOCH){suffix} =====")
-        log_single_rank(logger, logging.INFO, f" > #real docs in epoch:               {num_docs:>12,}")
-        log_single_rank(logger, logging.INFO, f" > #virtual chunks (after split):     {num_virtual:>12,}")
-        log_single_rank(logger, logging.INFO, f" > #tokens in epoch:                  {num_tokens_per_epoch:>12,}")
-        log_single_rank(logger, logging.INFO, f" > Sequence length:                   {sequence_length:>12,}")
-        log_single_rank(logger, logging.INFO, f" > #packed samples (per epoch):       {num_samples:>12,}")
-        log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}")
-        log_single_rank(logger, logging.INFO, f" > Average #chunks/sample:            {avg_docs_per_sample:>12.2f}")
-        log_single_rank(logger, logging.INFO, f" > Packing efficiency:                {packing_efficiency:>11.2f}%")
+        log_single_rank(
+            logger, logging.INFO, f"> ===== BFD Packing Statistics (ONE EPOCH){suffix} ====="
+        )
+        log_single_rank(
+            logger, logging.INFO, f" > #real docs in epoch:               {num_docs:>12,}"
+        )
+        log_single_rank(
+            logger, logging.INFO, f" > #virtual chunks (after split):     {num_virtual:>12,}"
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f" > #tokens in epoch:                  {num_tokens_per_epoch:>12,}",
+        )
+        log_single_rank(
+            logger, logging.INFO, f" > Sequence length:                   {sequence_length:>12,}"
+        )
+        log_single_rank(
+            logger, logging.INFO, f" > #packed samples (per epoch):       {num_samples:>12,}"
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}",
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f" > Average #chunks/sample:            {avg_docs_per_sample:>12.2f}",
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f" > Packing efficiency:                {packing_efficiency:>11.2f}%",
+        )
 
     def _query_bfd_packed_sample(self, idx):
         """Load one BFD-packed sample: concatenate virtual chunks, synthesize EOD on
@@ -778,8 +907,8 @@ class GPTDataset(MegatronDataset):
             virtual_id = int(self.document_index[i])
             real_doc_id = int(self.chunk_map[virtual_id, 0])
             chunk_start = int(self.chunk_map[virtual_id, 1])
-            chunk_len   = int(self.chunk_map[virtual_id, 2])
-            append_eod  = int(self.chunk_map[virtual_id, 3])
+            chunk_len = int(self.chunk_map[virtual_id, 2])
+            append_eod = int(self.chunk_map[virtual_id, 3])
 
             data = self.dataset.get(real_doc_id, offset=chunk_start, length=chunk_len)
             if append_eod:
@@ -789,14 +918,13 @@ class GPTDataset(MegatronDataset):
 
         length = sum(map(len, sample_parts))
         if length < target_length:
-            sample_parts.append(
-                [self._pad_token_id] * (target_length - length)
-            )
+            sample_parts.append([self._pad_token_id] * (target_length - length))
 
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
         )
+
     def _build_document_sample_shuffle_indices(
         self,
     ) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
@@ -1201,6 +1329,46 @@ def _get_ltor_masks_and_position_ids(
         attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
+
+
+# The per-modality weight LUT is identical for every dataset instance (config-derived
+# ids and weights), so it is memoized at module level: blended runs construct one
+# GPTDataset per blend component per split, and each private copy would cost the full
+# vocab in floats per instance per dataloader worker.
+_LUT_CACHE = {}
+
+
+def _get_modality_weight_lut(modality_weights, vocab_size: int, device) -> torch.Tensor:
+    """Module-memoized :func:`_create_modality_weight_lut`."""
+    key = (
+        "wlut",
+        tuple(
+            (modality.name, modality.offset, modality.vocab_size, modality.structure_ids, weight)
+            for modality, weight in modality_weights
+        ),
+        int(vocab_size),
+        str(device),
+    )
+    if key not in _LUT_CACHE:
+        _LUT_CACHE[key] = _create_modality_weight_lut(modality_weights, vocab_size, device)
+    return _LUT_CACHE[key]
+
+
+def _create_modality_weight_lut(modality_weights, vocab_size: int, device) -> torch.Tensor:
+    """Float lookup table (length ``vocab_size``) of per-token-id loss weights.
+
+    ``lut[labels]`` maps every label to its loss weight: 1.0 by default, and the
+    modality's weight for ids in its content range ``[offset, offset + vocab_size)``
+    or its structure-token ids, given ``(ModalityInfo, weight)`` pairs. Because the
+    vocabulary is partitioned by modality, this id-based lookup classifies correctly
+    regardless of where a sample cuts a modality span (no start/end anchors needed).
+    """
+    vocab_size = int(vocab_size)
+    lut = torch.ones(vocab_size, dtype=torch.float, device=device)
+    for modality, weight in modality_weights:
+        lut[modality.offset : modality.offset + modality.vocab_size] = weight
+        lut[torch.as_tensor(modality.structure_ids, dtype=torch.long, device=device)] = weight
+    return lut
 
 
 class MockGPTLowLevelDataset:

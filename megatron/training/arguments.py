@@ -1367,6 +1367,12 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
+    # Per-modality loss weights (static --vision-weight / --audio-weight).
+    # Keep in sync with MODALITY_WEIGHT_NAMES in pretrain_gpt.py.
+    for _modality in ("vision", "audio"):
+        _weight = getattr(args, f"{_modality}_weight")
+        assert _weight >= 0, f"--{_modality}-weight must be >= 0 ({_weight})"
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -3426,6 +3432,17 @@ def _add_data_args(parser):
                             'efficiency and don\'t cut the samples if < sequence_length.')
     group.add_argument('--max-docs-per-bin', type=int, default=0,
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    # Per-modality loss weighting (same flag interface as the dense Apertus Megatron,
+    # static weights only). Scales the loss mask at positions whose label id belongs to
+    # the modality (content-token range plus its structure tokens, from the tokenizer
+    # omni metadata). Keep in sync with MODALITY_WEIGHT_NAMES in pretrain_gpt.py.
+    for _modality in ("vision", "audio"):
+        group.add_argument(f'--{_modality}-weight', type=float, default=1.0,
+                           help=f'Loss mask weight for {_modality} tokens (content and '
+                                'structure tokens). Default 1.0 (normal loss; weights of '
+                                'exactly 1.0 are omitted from the dataset config as '
+                                'no-ops). Set to 0.0 to fully mask them. Requires an '
+                                'omni tokenizer.')
     return parser
 
 
