@@ -226,7 +226,78 @@ def test_modality_weights_config_validation():
         )
 
 
+def test_modality_loss_report():
+    """The three per-category metrics, and the partition property against 'lm loss'."""
+    from pretrain_gpt import modality_loss_report
+
+    from megatron.core.tokenizers.utils.tokenizer_extra_metadata import ModalityInfo
+
+    vision = ModalityInfo(
+        name="vision",
+        offset=100,
+        vocab_size=10,
+        start_token=5,
+        end_token=6,
+        structure_token_ids={"<|img_start|>": 5, "<|img_end|>": 6},
+    )
+
+    # 6 positions: 2 text, 3 vision content, 1 vision structure token.
+    labels = torch.tensor([1, 2, 100, 105, 109, 5])
+    losses = torch.tensor([2.0, 4.0, 6.0, 6.0, 6.0, 6.0])
+    # Base mask is all-supervised; vision carries weight 0.5 (as the dataset LUT applies).
+    loss_mask = torch.tensor([1.0, 1.0, 0.5, 0.5, 0.5, 0.5])
+
+    report = modality_loss_report(losses, loss_mask, labels, [vision])
+    assert set(report) == {
+        "vision loss",
+        "vision weighted loss",
+        "vision error",
+        "text loss",
+        "text weighted loss",
+        "text error",
+    }
+
+    # vision: 4 tokens at weight 0.5 -> weighted count 2.0, weighted sum 4*0.5*6.0 = 12.0
+    assert torch.equal(report["vision loss"], torch.tensor([12.0, 2.0]))
+    assert torch.equal(report["vision weighted loss"], torch.tensor([12.0, 4.0]))
+    assert torch.equal(report["vision error"], torch.tensor([24.0, 4.0]))
+    # The weight cancels in 'loss' (true mean CE) but not in 'weighted loss'.
+    assert report["vision loss"][0] / report["vision loss"][1] == 6.0
+    assert report["vision weighted loss"][0] / report["vision weighted loss"][1] == 3.0
+    # 'error' survives independently of mask and weight.
+    assert report["vision error"][0] / report["vision error"][1] == 6.0
+
+    assert torch.equal(report["text loss"], torch.tensor([6.0, 2.0]))
+    assert torch.equal(report["text error"], torch.tensor([6.0, 2.0]))
+
+    # '<name> loss' entries partition 'lm loss' exactly.
+    lm_sum = torch.sum(losses * loss_mask)
+    lm_count = loss_mask.sum()
+    assert report["vision loss"][0] + report["text loss"][0] == lm_sum
+    assert report["vision loss"][1] + report["text loss"][1] == lm_count
+
+    # A fully masked modality: 'loss' collapses to 0/0 but 'error' stays informative.
+    zeroed = modality_loss_report(losses, torch.zeros_like(loss_mask), labels, [vision])
+    assert torch.equal(zeroed["vision loss"], torch.tensor([0.0, 0.0]))
+    assert torch.equal(zeroed["vision error"], torch.tensor([24.0, 4.0]))
+
+    # IGNORE_INDEX labels (SFTDataset leaves -100 in the labels for prompt positions)
+    # must not be swept into the text category by the complement.
+    sft_labels = torch.tensor([1, 2, 100, 105, 109, -100])
+    sft_loss_mask = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+    sft = modality_loss_report(losses, sft_loss_mask, sft_labels, [vision])
+    # Text sees only the 2 real text tokens, not the ignored position.
+    assert torch.equal(sft["text error"], torch.tensor([6.0, 2.0]))
+    assert torch.equal(sft["text weighted loss"], torch.tensor([6.0, 2.0]))
+    # The partition against 'lm loss' still holds: ignored positions carry zero mask.
+    sft_lm_sum = torch.sum(losses * sft_loss_mask)
+    sft_lm_count = sft_loss_mask.sum()
+    assert sft["vision loss"][0] + sft["text loss"][0] == sft_lm_sum
+    assert sft["vision loss"][1] + sft["text loss"][1] == sft_lm_count
+
+
 if __name__ == "__main__":
     test_mock_gpt_dataset()
     test_modality_weight_lut()
     test_modality_weights_config_validation()
+    test_modality_loss_report()

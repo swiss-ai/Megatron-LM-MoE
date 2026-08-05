@@ -32,22 +32,28 @@ their modality's weight, by the same id-based rule.
 ## Separate per-modality loss tracking
 
 For omni tokenizers the reported loss is additionally decomposed per category
-(`modality_loss_report` in `pretrain_gpt.py`, no flag needed): **`vision loss`** and
-**`audio loss`** cover positions whose label is in the modality's content range or its
-structure tokens; **`text loss`** covers every remaining label id. Each metric follows
-the `lm loss` `[sum, weighted_token_count]` convention (reduced over microbatches and
-data-parallel ranks). The categories partition the vocabulary (structure ids are
-validated disjoint across modalities), so the category sums add up exactly to the
-`lm loss` sum; the counts match `lm loss`'s denominator exactly for 0/1 masks and to
-within int truncation when fractional weights are active.
+(`modality_loss_report` in `pretrain_gpt.py`, no flag needed). A category is a modality
+(label in its content range or among its structure tokens) or `text` (every remaining
+label id). Three metrics are emitted per category, all in the `lm loss`
+`[numerator, denominator]` convention (reduced over microbatches and data-parallel
+ranks), matching the set the dense Apertus Megatron reported:
 
-Counts are weighted, and the per-step reduction divides `sum / count` with no zero
-guard: a category with zero weighted tokens in a *single global batch* yields NaN for
-that step, the NaN accumulates into the logging window (hiding the metric from the
-console line for the whole window), and a modality weighted to `0.0` reports NaN
-permanently — a fully-masked category has no measurable loss. Expect the metrics to be
-meaningful only for categories present in (nearly) every global batch with a non-zero
-weight.
+| Metric | Pair | Reads as |
+|---|---|---|
+| `<name> loss` | `[weighted sum, weighted count]` | Mean loss over *supervised* tokens. The modality weight cancels in the ratio, so this is the true per-token loss whatever `--{m}-weight` is. |
+| `<name> weighted loss` | `[weighted sum, raw count]` | The category's actual contribution to `lm loss`, spread over all its tokens. Scales linearly with the weight. |
+| `<name> error` | `[raw sum, raw count]` | Ignores loss mask and weight entirely. **The only one that stays meaningful at weight `0.0`.** |
+
+The categories partition the vocabulary (structure ids are validated disjoint across
+modalities), so the `<name> loss` sums add up exactly to the `lm loss` sum; the counts
+match `lm loss`'s denominator exactly for 0/1 masks and to within int truncation when
+fractional weights are active.
+
+Denominators are clamped to a minimum of 1 in the per-step reduction
+(`training.py`), so a category with zero tokens in a global batch reports `0.0` rather
+than NaN. Note the consequence for `<name> loss` of a modality weighted to `0.0`: its
+weighted count is always zero, so it reports a constant `0.0`. Use `<name> error` to
+track a fully masked modality.
 
 ## Requirements & validation
 

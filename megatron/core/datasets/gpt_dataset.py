@@ -1339,7 +1339,7 @@ _LUT_CACHE = {}
 
 
 def _get_modality_weight_lut(modality_weights, vocab_size: int, device) -> torch.Tensor:
-    """Module-memoized :func:`_create_modality_weight_lut`."""
+    """Module-memoized :func:`_create_modality_weight_lut`. Get LUT for all modalities combined"""
     key = (
         "wlut",
         tuple(
