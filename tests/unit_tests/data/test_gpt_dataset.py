@@ -14,6 +14,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.utils.tokenizer_extra_metadata import (
+    ModelSpecialTokens,
+    TokenizerExtraMetadata,
+)
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -113,5 +117,116 @@ def test_mock_gpt_dataset():
     assert not torch.any(sample['loss_mask'])
 
 
+def test_modality_weight_lut():
+    from megatron.core.datasets.gpt_dataset import (
+        _create_modality_weight_lut,
+        _get_modality_weight_lut,
+    )
+    from megatron.core.tokenizers.utils.tokenizer_extra_metadata import ModalityInfo
+
+    vision = ModalityInfo(
+        name="vision",
+        offset=1000,
+        vocab_size=100,
+        start_token=5,
+        end_token=7,
+        structure_token_ids={"<|img_start|>": 5, "<|img_end|>": 7},
+    )
+    audio = ModalityInfo(
+        name="audio",
+        offset=1100,
+        vocab_size=50,
+        start_token=9,
+        end_token=9,
+        structure_token_ids={"<|audio|>": 9},
+    )
+    lut = _create_modality_weight_lut(
+        [(vision, 0.25), (audio, 0.0)], vocab_size=2000, device=torch.device("cpu")
+    )
+
+    # Text ids stay 1.0; content ranges AND per-modality structure ids get the weight.
+    labels = torch.tensor([0, 5, 7, 9, 999, 1000, 1099, 1100, 1149, 1150])
+    expected = torch.tensor([1.0, 0.25, 0.25, 0.0, 1.0, 0.25, 0.25, 0.0, 0.0, 1.0])
+    assert torch.equal(lut[labels], expected)
+
+    # Application semantics: multiplicative on loss_mask, existing zeros stay zero.
+    loss_mask = torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    assert torch.equal(
+        loss_mask * lut[labels], torch.tensor([1.0, 0.25, 0.0, 0.0, 1.0, 0.25, 0.25, 0.0, 0.0, 1.0])
+    )
+
+    # The module memo hands out one shared table per (weights, vocab, device).
+    pairs = ((vision, 0.25), (audio, 0.0))
+    memoized = _get_modality_weight_lut(pairs, 2000, torch.device("cpu"))
+    assert _get_modality_weight_lut(pairs, 2000, torch.device("cpu")) is memoized
+
+
+def test_modality_weights_config_validation():
+    from megatron.core.tokenizers.utils.tokenizer_extra_metadata import parse_omni_metadata
+
+    omni = parse_omni_metadata(
+        100,
+        {
+            "omni_special_token_offset": 100,
+            "modalities": [
+                {
+                    "name": "vision",
+                    "offset": 100,
+                    "vocab_size": 1024,
+                    "start_token": 27,
+                    "end_token": 28,
+                    "structure_token_ids": {
+                        "<|image|>": 18,
+                        "<|img_start|>": 27,
+                        "<|img_end|>": 28,
+                    },
+                }
+            ],
+        },
+    )
+    metadata = TokenizerExtraMetadata(
+        special_tokens=ModelSpecialTokens(full_ids=[18, 27, 28]), omni=omni
+    )
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    # Valid: the weighted modality is described by the omni metadata.
+    GPTDatasetConfig(modality_weights={"vision": 0.25}, tokenizer_extra_metadata=metadata, **base)
+
+    # Weights without omni metadata are rejected (text-only metadata or none at all).
+    with pytest.raises(AssertionError, match="requires tokenizer_extra_metadata"):
+        GPTDatasetConfig(modality_weights={"vision": 0.25}, tokenizer_extra_metadata=None, **base)
+    text_only = TokenizerExtraMetadata(special_tokens=ModelSpecialTokens(full_ids=[1]))
+    with pytest.raises(AssertionError, match="requires tokenizer_extra_metadata"):
+        GPTDatasetConfig(
+            modality_weights={"vision": 0.25}, tokenizer_extra_metadata=text_only, **base
+        )
+
+    # An unknown modality name is rejected.
+    with pytest.raises(AssertionError, match="does not describe"):
+        GPTDatasetConfig(
+            modality_weights={"video": 0.25}, tokenizer_extra_metadata=metadata, **base
+        )
+
+    # Negative weights are rejected.
+    with pytest.raises(AssertionError, match=">= 0"):
+        GPTDatasetConfig(
+            modality_weights={"vision": -1.0}, tokenizer_extra_metadata=metadata, **base
+        )
+
+
 if __name__ == "__main__":
     test_mock_gpt_dataset()
+    test_modality_weight_lut()
+    test_modality_weights_config_validation()
