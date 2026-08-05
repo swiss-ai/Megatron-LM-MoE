@@ -96,6 +96,12 @@ class StreamManager:
         """Make backward consumer streams wait until activation reload H2D completes."""
         self.consumer_streams_wait_event(h2d_done_event)
 
+    def consumer_streams_record(self, tensor):
+        for launch_stream in self.get_launch_streams():
+            tensor.record_stream(launch_stream)
+        for i in range(self.num_compute_streams):
+            tensor.record_stream(self.compute_streams[i])
+
 
 @dataclass
 class ActivationOffloadHandle:

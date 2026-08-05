@@ -1239,6 +1239,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 "wired on the combine output when moe_offload_activations is enabled."
             )
             stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done)
+            stream_manager.consumer_streams_record(act_offload_handle.gpu_slot)
             fp8_permuted_local_hidden_states = act_offload_handle.gpu_slot
             fp8_x_chunks = list(
                 torch.split(fp8_permuted_local_hidden_states, total_token_num_per_chunk, dim=0)
@@ -1251,6 +1252,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             )
             act_offload_handle.cpu_base = None
             act_offload_handle.cpu_flat = None
+            act_offload_handle.gpu_slot = None
 
         if ctx.activation_recompute:
             # recompute the activation for backward
@@ -1278,12 +1280,14 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                     "MoEActivationOffloadManager.reload must handle the fc1 slot when fc1_active is set."
                 )
                 stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done_fc1)
+                stream_manager.consumer_streams_record(act_offload_handle.gpu_slot_fc1)
                 fp8_fc1_output = act_offload_handle.gpu_slot_fc1
                 PinnedActBufferPool.get_instance().free(
                     act_offload_handle.cpu_base_fc1, act_offload_handle.h2d_done_fc1
                 )
                 act_offload_handle.cpu_base_fc1 = None
                 act_offload_handle.cpu_flat_fc1 = None
+                act_offload_handle.gpu_slot_fc1 = None
             fc1_output = per_token_dequant_from_fp8(fp8_fc1_output, fp8_fc1_output_scales)
 
         grad_y = grad_outputs[0].contiguous()
