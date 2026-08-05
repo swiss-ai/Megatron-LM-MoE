@@ -1996,7 +1996,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     val,
                     group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
-                loss_reduced[key] = val[0] / val[1]
+                # Clamp the denominator: a category can be legitimately empty in a
+                # global batch (e.g. a per-modality metric for a modality absent from
+                # the batch, or one weighted to 0.0). Without this the metric is NaN,
+                # which then poisons the whole logging window.
+                loss_reduced[key] = val[0] / val[1].clamp(min=1)
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()

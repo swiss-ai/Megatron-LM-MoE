@@ -194,14 +194,53 @@ def _modality_token_mask(labels: torch.Tensor, modality) -> torch.Tensor:
     return mask
 
 
+def _category_loss_entries(losses, loss_mask, membership):
+    """Build the three reported [numerator, denominator] pairs for one label category.
+
+    ``membership`` is a boolean mask selecting the category's label positions. The three
+    entries differ in which denominator they normalize by, and whether the numerator is
+    masked and weighted at all:
+
+    - ``loss``: [weighted sum, weighted count]. The supervised per-token loss of the
+      category. Modality weights cancel in the ratio, so this is the true mean loss over
+      supervised tokens whatever --{modality}-weight is set to. Undefined (reported as
+      0 after the denominator clamp) once a modality is weighted to 0.0.
+    - ``weighted loss``: [weighted sum, raw count]. The same numerator spread over every
+      token of the category, so it shows the category's actual contribution to 'lm loss'
+      and scales linearly with the modality weight.
+    - ``error``: [raw sum, raw count]. Ignores the loss mask and the modality weight
+      entirely, so the model's error on a modality stays observable even when that
+      modality is fully masked out of training (weight 0.0).
+    """
+    # Reporting only, so build no autograd graph: ``losses`` requires grad on the
+    # differentiable path in loss_func, and without this every reduction below would
+    # allocate graph nodes and temporaries that the caller immediately discards.
+    # no_grad also makes the results non-differentiable, so no .detach() is needed.
+    with torch.no_grad():
+        membership = membership.to(losses.dtype)
+        weights = loss_mask * membership
+        masked_sum = torch.sum(losses * weights)
+        weighted_count = weights.sum()
+        raw_sum = torch.sum(losses * membership)
+        raw_count = membership.sum()
+        return {
+            "loss": torch.cat([masked_sum.view(1), weighted_count.view(1)]),
+            "weighted loss": torch.cat([masked_sum.view(1), raw_count.view(1)]),
+            "error": torch.cat([raw_sum.view(1), raw_count.view(1)]),
+        }
+
+
 def modality_loss_report(losses, loss_mask, labels, modalities):
     """Decompose the masked loss into per-modality and text components for reporting.
 
-    Each entry follows the 'lm loss' [sum, weighted_token_count] convention, so the
-    downstream reduction (sum over microbatches/DP, then sum/count) yields the per-token
-    loss of that category. Categories partition the label ids -- a modality is its
-    content range plus its structure tokens (ModalityInfo.structure_ids), text is every
-    remaining id -- so the category sums/counts add up exactly to 'lm loss'.
+    Every entry follows the 'lm loss' [numerator, denominator] convention, so the
+    downstream reduction (sum over microbatches/DP, then numerator/denominator) yields
+    a per-token quantity. Categories partition the label ids: a modality is its content
+    range plus its structure tokens (ModalityInfo.structure_ids), text is every
+    remaining id, so the '<name> loss' sums and counts add up exactly to 'lm loss'.
+
+    Three metrics are emitted per category; see :func:`_category_loss_entries` for how
+    they differ. '<name> error' is the one that survives a modality weighted to 0.0.
 
     Args:
         losses (torch.Tensor): Flat per-token losses (may require grad; sums are detached).
@@ -210,21 +249,26 @@ def modality_loss_report(losses, loss_mask, labels, modalities):
         modalities: Iterable of ModalityInfo (from args.tokenizer_extra_metadata.omni).
 
     Returns:
-        dict: {'<name> loss': tensor([sum, count]), ..., 'text loss': tensor([sum, count])}
+        dict: {'<name> loss', '<name> weighted loss', '<name> error'} for every modality
+            plus 'text', each mapping to tensor([numerator, denominator]).
     """
     report = {}
+    # Drop positions whose label is not a real vocabulary id. SFTDataset masks prompt and
+    # padding positions in the loss mask but leaves IGNORE_INDEX (-100) in the labels
+    # (megatron/training/datasets/sft_dataset.py), and the text category below is a
+    # complement, so those positions would otherwise be counted as text. They cannot
+    # affect '<name> loss' (their loss mask is zero), but they would inflate the
+    # mask-independent '<name> error' with positions the model was never trained on.
+    valid = labels >= 0
     modality_union = torch.zeros_like(labels, dtype=torch.bool)
     for modality in modalities:
         mask = _modality_token_mask(labels, modality)
         modality_union |= mask
-        weights = loss_mask * mask
-        report[f"{modality.name} loss"] = torch.cat(
-            [torch.sum(losses * weights).detach().view(1), weights.sum().detach().view(1)]
-        )
-    text_weights = loss_mask * ~modality_union
-    report["text loss"] = torch.cat(
-        [torch.sum(losses * text_weights).detach().view(1), text_weights.sum().detach().view(1)]
-    )
+        for metric, value in _category_loss_entries(losses, loss_mask, mask & valid).items():
+            report[f"{modality.name} {metric}"] = value
+    text_mask = (~modality_union) & valid
+    for metric, value in _category_loss_entries(losses, loss_mask, text_mask).items():
+        report[f"text {metric}"] = value
     return report
 
 
