@@ -115,6 +115,289 @@ def test_mock_gpt_dataset():
     assert torch.all(sample['labels'] == -100)
 
 
+def test_apply_goldfish():
+    from megatron.core.datasets.gpt_dataset import (
+        _GOLDFISH_TOKEN_ID,
+        _create_exemption_lut,
+        _create_hash_table,
+        apply_goldfish,
+    )
+
+    torch.manual_seed(0)
+    seq_length, k, h = 8192, 50, 50
+    labels = torch.randint(0, _MOCK_VOCAB_SIZE, (seq_length,), dtype=torch.long)
+    table = _create_hash_table(device=labels.device)
+
+    original = labels.clone()
+    out = apply_goldfish(labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
+
+    # apply_goldfish works on a clone: the input labels are not mutated.
+    assert torch.equal(labels, original)
+
+    # Deterministic: identical inputs -> identical drops.
+    out2 = apply_goldfish(labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
+    assert torch.equal(out, out2)
+
+    # The first h-1 positions are never eligible for dropping (unfold alignment).
+    assert not torch.any(out[: h - 1] == _GOLDFISH_TOKEN_ID)
+
+    # Drop rate over the eligible tail is approximately 1/k.
+    drop_rate = (out[h - 1 :] == _GOLDFISH_TOKEN_ID).float().mean().item()
+    assert abs(drop_rate - 1.0 / k) < 0.01, drop_rate
+
+    # Exemption: no dropped position may carry a label in the exempt band, while drops
+    # still occur outside it. `out` above is the positive control (drops with no exemption).
+    assert torch.any(out == _GOLDFISH_TOKEN_ID)
+    lo, hi = 2000, 6000
+    exemption_lut = _create_exemption_lut(list(range(lo, hi)), _MOCK_VOCAB_SIZE, labels.device)
+    out_exempt = apply_goldfish(
+        labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h, exemption_lut=exemption_lut
+    )
+    dropped = out_exempt == _GOLDFISH_TOKEN_ID
+    assert not torch.any((labels >= lo) & (labels < hi) & dropped), "exempt-band token was dropped"
+    assert torch.any(dropped), "expected drops outside the exempt band"
+
+    # Pinned position: exempting exactly the label id of a known dropped position
+    # cancels that drop (deterministic alignment of window hash vs. exempt mask).
+    pinned = int((out == _GOLDFISH_TOKEN_ID).nonzero(as_tuple=True)[0][0])
+    pin_lut = _create_exemption_lut([int(labels[pinned])], _MOCK_VOCAB_SIZE, labels.device)
+    out_pinned = apply_goldfish(
+        labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h, exemption_lut=pin_lut
+    )
+    assert out_pinned[pinned] != _GOLDFISH_TOKEN_ID
+
+    # Both in-base and separate-range structure IDs are represented by the same
+    # scattered LUT.
+    scattered_lut = _create_exemption_lut([0, 18, 2000, 6000], _MOCK_VOCAB_SIZE, labels.device)
+    assert torch.all(scattered_lut[torch.tensor([0, 18, 2000, 6000])])
+
+    # Windows containing id-0 labels (pad/unk) must hash like any other window: with a
+    # zero every 10 positions every window contains one, yet the rate stays ~1/k (the
+    # old product hash collapsed all such windows onto a single drop decision).
+    zero_heavy = labels.clone()
+    zero_heavy[::10] = 0
+    out_zero = apply_goldfish(zero_heavy, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
+    zero_rate = (out_zero[h - 1 :] == _GOLDFISH_TOKEN_ID).float().mean().item()
+    assert abs(zero_rate - 1.0 / k) < 0.01, zero_rate
+
+
+def test_mock_gpt_dataset_goldfish():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    text_tokenizer_extra_metadata = TokenizerExtraMetadata(
+        special_tokens=ModelSpecialTokens(full_ids=[1, 2, 3])
+    )
+    # Cache-friendly flags on purpose: goldfish alone must not disable the mask cache,
+    # and interleaved access must not leak one sample's drops into another (the cache
+    # hands out clones).
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        tokenizer_extra_metadata=text_tokenizer_extra_metadata,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    def build(**overrides):
+        config = GPTDatasetConfig(**base, **overrides)
+        return BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [100, 100, 100], lambda: True, config
+        ).build()
+
+    goldfish_sets = build(goldfish_loss=True, goldfish_k=4, goldfish_h=13)
+    plain_sets = build()
+    ds, plain = goldfish_sets[0], plain_sets[0]
+
+    assert ds.masks_and_position_ids_are_cacheable
+    assert ds._goldfish_exemption_ids == (1, 2, 3)
+
+    # Goldfish zeroes a strict superset of the plain loss mask (~1/k of the tail).
+    gf_mask, plain_mask = ds[0]["loss_mask"].clone(), plain[0]["loss_mask"]
+    assert not torch.any((gf_mask == 1) & (plain_mask == 0))
+    n_extra = int(((gf_mask == 0) & (plain_mask == 1)).sum())
+    assert n_extra > 0, "goldfish produced no drops"
+
+    # Same index -> identical mask; interleaving other samples must not accumulate
+    # zeros through the cache (fresh dataset accessed in a different order agrees).
+    _ = ds[1]
+    assert torch.equal(ds[0]["loss_mask"], gf_mask)
+    fresh_sets = build(goldfish_loss=True, goldfish_k=4, goldfish_h=13)
+    assert torch.equal(fresh_sets[0][1]["loss_mask"], ds[1]["loss_mask"])
+
+    # The idx-None batch-padding sample stays fully masked.
+    assert not torch.any(goldfish_sets[1][None]["loss_mask"])
+
+
+def test_mock_gpt_dataset_goldfish_with_modality_weights():
+    """Composition through __getitem__: combined mask == goldfish mask * weight LUT.
+
+    In particular goldfish drops survive weighting (0 * w == 0) and weighting applies
+    to positions goldfish left untouched.
+    """
+    from megatron.core.datasets.gpt_dataset import _create_modality_weight_lut
+    from megatron.core.tokenizers.utils.tokenizer_extra_metadata import parse_omni_metadata
+
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    # Omni layout inside the mock vocab: text ids [0, 100), vision content [1000, 1500).
+    # The mock data cycles through low ids, so samples contain structure ids (18/27/28,
+    # goldfish-exempt) and vision content ids (goldfish-eligible, weighted).
+    omni = parse_omni_metadata(
+        100,
+        {
+            "omni_special_token_offset": 100,
+            "modalities": [
+                {
+                    "name": "vision",
+                    "offset": 1000,
+                    "vocab_size": 500,
+                    "start_token": 27,
+                    "end_token": 28,
+                    "structure_token_ids": {
+                        "<|image|>": 18,
+                        "<|img_start|>": 27,
+                        "<|img_end|>": 28,
+                    },
+                }
+            ],
+        },
+    )
+    metadata = TokenizerExtraMetadata(
+        special_tokens=ModelSpecialTokens(full_ids=[18, 27, 28]), omni=omni
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        tokenizer_extra_metadata=metadata,
+        mid_level_dataset_surplus=0.005,
+        goldfish_loss=True,
+        goldfish_k=4,
+        goldfish_h=13,
+    )
+
+    def build(**overrides):
+        config = GPTDatasetConfig(**base, **overrides)
+        return BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [100, 100, 100], lambda: True, config
+        ).build()
+
+    weighted = build(modality_weights={"vision": 0.25})[0]
+    goldfish_only = build()[0]
+    lut = _create_modality_weight_lut(
+        [(omni.modality("vision"), 0.25)], _MOCK_VOCAB_SIZE, torch.device("cpu")
+    )
+
+    saw_drop = saw_weight = False
+    for index in range(16):
+        sample_w, sample_g = weighted[index], goldfish_only[index]
+        assert torch.equal(sample_w["labels"], sample_g["labels"])
+        # Exact composition: weighting scales the goldfish-processed mask elementwise,
+        # so goldfish zeros stay zero under any weight.
+        assert torch.equal(sample_w["loss_mask"], sample_g["loss_mask"] * lut[sample_w["labels"]])
+        saw_drop = saw_drop or bool(torch.any(sample_g["loss_mask"] == 0))
+        saw_weight = saw_weight or bool(torch.any(lut[sample_w["labels"]] != 1.0))
+    # The checked samples exercise both branches: real drops and real down-weighted ids.
+    assert saw_drop and saw_weight
+
+
+def test_goldfish_config_validation():
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    # A valid goldfish config constructs without error.
+    GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=50, **base)
+
+    # k must be >= 2 (k=1 drops ~100% of tokens).
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=1, goldfish_h=50, **base)
+
+    # h must be < sequence_length (else the unfold has no valid window).
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=1024, **base)
+
+
+def test_modality_weight_lut():
+    from megatron.core.datasets.gpt_dataset import (
+        _create_modality_weight_lut,
+        _get_modality_weight_lut,
+    )
+    from megatron.core.tokenizers.utils.tokenizer_extra_metadata import ModalityInfo
+
+    vision = ModalityInfo(
+        name="vision",
+        offset=1000,
+        vocab_size=100,
+        start_token=5,
+        end_token=7,
+        structure_token_ids={"<|img_start|>": 5, "<|img_end|>": 7},
+    )
+    audio = ModalityInfo(
+        name="audio",
+        offset=1100,
+        vocab_size=50,
+        start_token=9,
+        end_token=9,
+        structure_token_ids={"<|audio|>": 9},
+    )
+    lut = _create_modality_weight_lut(
+        [(vision, 0.25), (audio, 0.0)], vocab_size=2000, device=torch.device("cpu")
+    )
+
+    # Text ids stay 1.0; content ranges AND per-modality structure ids get the weight.
+    labels = torch.tensor([0, 5, 7, 9, 999, 1000, 1099, 1100, 1149, 1150])
+    expected = torch.tensor([1.0, 0.25, 0.25, 0.0, 1.0, 0.25, 0.25, 0.0, 0.0, 1.0])
+    assert torch.equal(lut[labels], expected)
+
+    # Application semantics: multiplicative on loss_mask, existing zeros stay zero.
+    loss_mask = torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    assert torch.equal(
+        loss_mask * lut[labels], torch.tensor([1.0, 0.25, 0.0, 0.0, 1.0, 0.25, 0.25, 0.0, 0.0, 1.0])
+    )
+
+    # The module memo hands out one shared table per (weights, vocab, device).
+    pairs = ((vision, 0.25), (audio, 0.0))
+    memoized = _get_modality_weight_lut(pairs, 2000, torch.device("cpu"))
+    assert _get_modality_weight_lut(pairs, 2000, torch.device("cpu")) is memoized
+
+
 def test_modality_weights_config_validation():
     from megatron.core.tokenizers.utils.tokenizer_extra_metadata import parse_omni_metadata
 
@@ -381,6 +664,11 @@ def test_modality_weights_require_safe_normalization():
 
 if __name__ == "__main__":
     test_mock_gpt_dataset()
+    test_apply_goldfish()
+    test_mock_gpt_dataset_goldfish()
+    test_mock_gpt_dataset_goldfish_with_modality_weights()
+    test_goldfish_config_validation()
+    test_modality_weight_lut()
     test_modality_weights_config_validation()
     test_modality_loss_report()
     test_loss_func_normalize_by_num_supervised_tokens()

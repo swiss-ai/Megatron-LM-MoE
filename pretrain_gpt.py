@@ -420,6 +420,9 @@ def core_gpt_dataset_config_from_args(args):
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
+        "goldfish_loss": args.goldfish_loss,
+        "goldfish_k": args.goldfish_k,
+        "goldfish_h": args.goldfish_h,
         "tokenizer_extra_metadata": tokenizer_extra_metadata,
         # Omit no-op modality weights.
         "modality_weights": {
