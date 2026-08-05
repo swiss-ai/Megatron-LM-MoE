@@ -295,9 +295,90 @@ def test_modality_loss_report():
     assert sft["vision loss"][0] + sft["text loss"][0] == sft_lm_sum
     assert sft["vision loss"][1] + sft["text loss"][1] == sft_lm_count
 
+    # supervised_denominator=True: 'weighted loss' normalizes by the category's
+    # supervised-token count, matching the 'lm loss' convention under
+    # --normalize-by-num-supervised-tokens. Mask out one vision position (e.g. eod
+    # masking) so the supervised count differs from the raw count.
+    sup_loss_mask = torch.tensor([1.0, 1.0, 0.5, 0.5, 0.5, 0.0])
+    sup = modality_loss_report(losses, sup_loss_mask, labels, [vision], supervised_denominator=True)
+    # vision: 3 supervised of 4 total; weighted sum 3*0.5*6.0 = 9.0.
+    assert torch.equal(sup["vision weighted loss"], torch.tensor([9.0, 3.0]))
+    # 'loss' and 'error' keep their denominators.
+    assert torch.equal(sup["vision loss"], torch.tensor([9.0, 1.5]))
+    assert torch.equal(sup["vision error"], torch.tensor([24.0, 4.0]))
+    # The 'weighted loss' pairs now partition the supervised-count 'lm loss' exactly.
+    assert sup["vision weighted loss"][0] + sup["text weighted loss"][0] == torch.sum(
+        losses * sup_loss_mask
+    )
+    assert (
+        sup["vision weighted loss"][1] + sup["text weighted loss"][1] == (sup_loss_mask > 0).sum()
+    )
+
+
+def test_loss_func_normalize_by_num_supervised_tokens():
+    """num_tokens semantics of loss_func with and without the normalization flag."""
+    from types import SimpleNamespace
+
+    from megatron.training import global_vars
+    from megatron.training.global_vars import set_args
+
+    def run_loss_func(normalize, loss_mask, output_tensor):
+        from pretrain_gpt import loss_func
+
+        from megatron.core.rerun_state_machine import destroy_rerun_state_machine
+
+        saved_args = global_vars._GLOBAL_ARGS
+        set_args(
+            SimpleNamespace(
+                normalize_by_num_supervised_tokens=normalize,
+                check_for_nan_in_loss_and_grad=False,
+                check_for_spiky_loss=False,
+                tokenizer_extra_metadata=None,
+                modelopt_enabled=False,
+            )
+        )
+        try:
+            return loss_func(loss_mask, output_tensor)
+        finally:
+            set_args(saved_args)
+            # loss_func implicitly initializes the rerun state machine; drop it so a
+            # later test doing explicit initialization doesn't hit 'already initialized'.
+            destroy_rerun_state_machine()
+
+    losses = torch.tensor([2.0, 4.0, 6.0, 8.0])
+    # Fractional mask: weighted sum 2.5 vs 3 supervised positions.
+    loss_mask = torch.tensor([1.0, 0.5, 0.0, 1.0])
+
+    loss, num_tokens, report = run_loss_func(False, loss_mask, losses)
+    # Default: weighted mask sum, truncated to int (2.5 -> 2).
+    assert loss == 12.0
+    assert num_tokens.dtype == torch.int and num_tokens == 2
+    assert torch.equal(report["lm loss"], torch.tensor([12.0, 2.0]))
+
+    loss, num_tokens, report = run_loss_func(True, loss_mask, losses)
+    # Flag: count of supervised (mask > 0) positions; the numerator is unchanged.
+    assert loss == 12.0
+    assert num_tokens.dtype == torch.int and num_tokens == 3
+    assert torch.equal(report["lm loss"], torch.tensor([12.0, 3.0]))
+
+    # Binary masks (every existing text-only run): the flag is a strict no-op.
+    binary_mask = torch.tensor([1.0, 1.0, 0.0, 1.0])
+    loss_off, num_off, report_off = run_loss_func(False, binary_mask, losses)
+    loss_on, num_on, report_on = run_loss_func(True, binary_mask, losses)
+    assert loss_off == loss_on == 14.0
+    assert num_off == num_on == 3
+    assert torch.equal(report_off["lm loss"], report_on["lm loss"])
+
+    # Weight 0.0 (fully masked modality) drops from the count either way, like padding.
+    zero_weight_mask = torch.tensor([1.0, 0.0, 0.0, 1.0])
+    _, num_off, _ = run_loss_func(False, zero_weight_mask, losses)
+    _, num_on, _ = run_loss_func(True, zero_weight_mask, losses)
+    assert num_off == num_on == 2
+
 
 if __name__ == "__main__":
     test_mock_gpt_dataset()
     test_modality_weight_lut()
     test_modality_weights_config_validation()
     test_modality_loss_report()
+    test_loss_func_normalize_by_num_supervised_tokens()

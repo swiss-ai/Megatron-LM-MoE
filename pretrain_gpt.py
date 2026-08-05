@@ -194,7 +194,7 @@ def _modality_token_mask(labels: torch.Tensor, modality) -> torch.Tensor:
     return mask
 
 
-def _category_loss_entries(losses, loss_mask, membership):
+def _category_loss_entries(losses, loss_mask, membership, supervised_denominator=False):
     """Build the three reported [numerator, denominator] pairs for one label category.
 
     ``membership`` is a boolean mask selecting the category's label positions. The three
@@ -205,9 +205,12 @@ def _category_loss_entries(losses, loss_mask, membership):
       category. Modality weights cancel in the ratio, so this is the true mean loss over
       supervised tokens whatever --{modality}-weight is set to. Undefined (reported as
       0 after the denominator clamp) once a modality is weighted to 0.0.
-    - ``weighted loss``: [weighted sum, raw count]. The same numerator spread over every
-      token of the category, so it shows the category's actual contribution to 'lm loss'
-      and scales linearly with the modality weight.
+    - ``weighted loss``: [weighted sum, raw count], or [weighted sum, supervised count]
+      when ``supervised_denominator`` is set (mirroring the 'lm loss' convention under
+      --normalize-by-num-supervised-tokens). Either way the numerator is spread over the
+      category's tokens, so it shows the category's actual contribution to 'lm loss' and
+      scales linearly with the modality weight; the supervised count drops positions the
+      loss mask zeroes out (padding, eod masking, weight 0.0).
     - ``error``: [raw sum, raw count]. Ignores the loss mask and the modality weight
       entirely, so the model's error on a modality stays observable even when that
       modality is fully masked out of training (weight 0.0).
@@ -223,21 +226,30 @@ def _category_loss_entries(losses, loss_mask, membership):
         weighted_count = weights.sum()
         raw_sum = torch.sum(losses * membership)
         raw_count = membership.sum()
+        if supervised_denominator:
+            # weights > 0 == (loss_mask > 0) & membership: weights are non-negative.
+            weighted_loss_count = (weights > 0).sum().to(losses.dtype)
+        else:
+            weighted_loss_count = raw_count
         return {
             "loss": torch.cat([masked_sum.view(1), weighted_count.view(1)]),
-            "weighted loss": torch.cat([masked_sum.view(1), raw_count.view(1)]),
+            "weighted loss": torch.cat([masked_sum.view(1), weighted_loss_count.view(1)]),
             "error": torch.cat([raw_sum.view(1), raw_count.view(1)]),
         }
 
 
-def modality_loss_report(losses, loss_mask, labels, modalities):
+def modality_loss_report(losses, loss_mask, labels, modalities, supervised_denominator=False):
     """Decompose the masked loss into per-modality and text components for reporting.
 
     Every entry follows the 'lm loss' [numerator, denominator] convention, so the
     downstream reduction (sum over microbatches/DP, then numerator/denominator) yields
     a per-token quantity. Categories partition the label ids: a modality is its content
     range plus its structure tokens (ModalityInfo.structure_ids), text is every
-    remaining id, so the '<name> loss' sums and counts add up exactly to 'lm loss'.
+    remaining id. The '<name> loss' numerators add up exactly to the 'lm loss'
+    numerator; the '<name> loss' denominators add up to the 'lm loss' denominator under
+    the default loss-mask-sum normalization, while under
+    --normalize-by-num-supervised-tokens it is the '<name> weighted loss' pairs (with
+    ``supervised_denominator`` set to match) that sum exactly to 'lm loss'.
 
     Three metrics are emitted per category; see :func:`_category_loss_entries` for how
     they differ. '<name> error' is the one that survives a modality weighted to 0.0.
@@ -247,6 +259,10 @@ def modality_loss_report(losses, loss_mask, labels, modalities):
         loss_mask (torch.Tensor): Flat loss mask/weights, same shape as ``losses``.
         labels (torch.Tensor): Flat label ids, same shape as ``losses``.
         modalities: Iterable of ModalityInfo (from args.tokenizer_extra_metadata.omni).
+        supervised_denominator (bool): Normalize '<name> weighted loss' by the
+            category's supervised-token count instead of its raw token count. Set to
+            args.normalize_by_num_supervised_tokens so the decomposition matches the
+            'lm loss' convention.
 
     Returns:
         dict: {'<name> loss', '<name> weighted loss', '<name> error'} for every modality
@@ -264,10 +280,14 @@ def modality_loss_report(losses, loss_mask, labels, modalities):
     for modality in modalities:
         mask = _modality_token_mask(labels, modality)
         modality_union |= mask
-        for metric, value in _category_loss_entries(losses, loss_mask, mask & valid).items():
+        for metric, value in _category_loss_entries(
+            losses, loss_mask, mask & valid, supervised_denominator
+        ).items():
             report[f"{modality.name} {metric}"] = value
     text_mask = (~modality_union) & valid
-    for metric, value in _category_loss_entries(losses, loss_mask, text_mask).items():
+    for metric, value in _category_loss_entries(
+        losses, loss_mask, text_mask, supervised_denominator
+    ).items():
         report[f"text {metric}"] = value
     return report
 
@@ -289,7 +309,8 @@ def loss_func(
 
     Returns:
         the loss scalar for this micro-batch
-        the number of non-padded tokens in this microbatch
+        the loss-mask sum truncated to int, or the count of supervised (loss_mask > 0)
+            tokens under --normalize-by-num-supervised-tokens
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
@@ -302,7 +323,12 @@ def loss_func(
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
 
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        if args.normalize_by_num_supervised_tokens:
+            # True count of supervised tokens: fractional modality weights scale the
+            # numerator only, instead of also shrinking the denominator.
+            num_tokens = (loss_mask > 0).sum().to(torch.int)
+        else:
+            num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
         # Separate per-modality loss tracking (vision/audio incl. their structure
@@ -311,7 +337,13 @@ def loss_func(
         omni = metadata.omni if metadata is not None else None
         if labels is not None and omni is not None:
             report.update(
-                modality_loss_report(losses, loss_mask, labels.reshape(-1), omni.modalities)
+                modality_loss_report(
+                    losses,
+                    loss_mask,
+                    labels.reshape(-1),
+                    omni.modalities,
+                    supervised_denominator=args.normalize_by_num_supervised_tokens,
+                )
             )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.

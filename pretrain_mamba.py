@@ -158,7 +158,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
 
     Returns:
         the loss scalar for this micro-batch
-        the number of non-padded tokens in this microbatch
+        the loss-mask sum truncated to int, or the count of supervised (loss_mask > 0)
+            tokens under --normalize-by-num-supervised-tokens
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
@@ -170,7 +171,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
 
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        if args.normalize_by_num_supervised_tokens:
+            # True count of supervised tokens: fractional loss-mask weights scale the
+            # numerator only, instead of also shrinking the denominator.
+            num_tokens = (loss_mask > 0).sum().to(torch.int)
+        else:
+            num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
     # Check individual rank losses are not NaN prior to DP all-reduce.

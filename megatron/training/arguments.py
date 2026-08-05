@@ -1373,6 +1373,15 @@ def validate_args(args, defaults={}):
         _weight = getattr(args, f"{_modality}_weight")
         assert _weight >= 0, f"--{_modality}-weight must be >= 0 ({_weight})"
 
+    if args.normalize_by_num_supervised_tokens and not args.calculate_per_token_loss:
+        print_rank_0(
+            'WARNING: --normalize-by-num-supervised-tokens without '
+            '--calculate-per-token-loss only changes the per-microbatch loss '
+            'normalization and the reported denominators; the reported lm loss '
+            'still differs from the objective that determines the gradients. Add '
+            '--calculate-per-token-loss to make them equal.'
+        )
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -2824,6 +2833,15 @@ def _add_training_args(parser):
                        dest='check_for_large_grads')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
+    group.add_argument('--normalize-by-num-supervised-tokens', action='store_true',
+                       help='Normalize the loss by the count of supervised tokens '
+                       '(loss_mask > 0) instead of the loss-mask sum. The loss value '
+                       'only differs from the default when fractional loss-mask '
+                       'weights are in use (e.g. --vision-weight 0.5); the '
+                       'per-modality "weighted loss" report denominators switch to '
+                       'supervised counts as well. Pair with '
+                       '--calculate-per-token-loss so the reported lm loss equals '
+                       'the objective that determines the gradients.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
