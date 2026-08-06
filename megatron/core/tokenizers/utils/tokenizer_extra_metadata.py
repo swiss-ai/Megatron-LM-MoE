@@ -1,64 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Define and extract runtime tokenizer metadata with two components.
-
-This module defines a common tokenizer metadata structure and helpers that populate it
-from a HuggingFace tokenizer. Only HuggingFace-backed tokenizers are supported: the
-extraction walks Megatron's wrapper chain to the underlying
-``transformers.PreTrainedTokenizerBase`` and reads its declared surface directly.
-Non-HuggingFace tokenizers (sentencepiece, tiktoken, byte-level, null) yield no
-metadata, which is an error when Goldfish loss is enabled because its special-token
-exemptions would be silently empty.
-
-It stores two classes of information:
-
-1. Special-token IDs
-- Goldfish loss uses these IDs to avoid dropping control tokens.
-- The set is the union of ``all_special_ids`` (named roles plus registered additional
-  special tokens) and every ``added_tokens_decoder`` entry flagged special, which
-  covers reserved and chat-template tokens not registered as additional specials.
-- For omni tokenizers, the set is filtered to IDs below ``base_vocab_size`` plus every
-  named modality structure-token ID. The base-vocabulary filter keeps modality content
-  tokens Goldfish-eligible because omni artifacts may also mark those tokens special.
-
-2. Omnimodal layout information
-- Optional: ``omni=None`` if ``omnimodal_config`` is absent.
-- Parsed from the top-level ``base_vocab_size`` and ``omnimodal_config`` keys of the
-  tokenizer's ``init_kwargs`` (the extra entries of ``tokenizer_config.json``).
-- Validation: Modality content ranges are normalized into offset order and must not overlap.
-  Structure-token IDs may be in the base vocabulary or a separate OMNI special range,
-  but never inside a modality content range. Modalities must declare
-  ``structure_token_ids``; legacy Apertus 1.5 configs that omit them are rejected by
-  design (correct multimodal masking cannot be derived from ranges alone).
-
-Example of expected structure:
-
-  {
-      "base_vocab_size": 200064,
-      "omnimodal_config": {
-          "omni_special_token_offset": 200064,
-          "modalities": [
-              {
-                  "name": "vision",
-                  "offset": 200064,
-                  "vocab_size": 131072,
-                  "start_token": 27,
-                  "end_token": 28,
-                  "structure_token_ids": {
-                      "<|image|>": 18,
-                      "<|img_start|>": 27,
-                      "<|img_end|>": 28,
-                  },
-              }
-          ],
-      },
-  }
-
-Tokenizer metadata is validated against this expected structure. See the
-`Apertus omni-tokenizer repository
-<https://github.com/swiss-ai/apertus-omni-tokenizer>`_ for its definition and details
-about creating extended tokenizers.
-"""
+"""Extract validated tokenizer metadata; see ``docs/omnimodal_metadata.md``."""
 
 import logging
 from dataclasses import dataclass
@@ -71,33 +13,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ModelSpecialTokens:
-    """Goldfish exemption IDs derived from a tokenizer.
-
-    For plain-text tokenizers, this contains every discovered special-token
-    ID: ``all_special_ids`` plus added tokens flagged special. For omni tokenizers,
-    it contains discovered IDs below ``base_vocab_size`` plus every named modality
-    structure-token ID. Omni content-token IDs are excluded even when marked special so
-    they remain eligible for Goldfish drops.
-
-    Attributes:
-        full_ids: Sorted, unique Goldfish exemption IDs; empty when none are discovered.
-    """
+    """Special-token IDs exempt from Goldfish masking."""
 
     full_ids: List[int]
 
 
 @dataclass(frozen=True)
 class ModalityInfo:
-    """Container for metadata of one modality.
-
-    Attributes:
-        name: Modality name, such as ``"vision"`` or ``"audio"``.
-        offset: Content-token block start id.
-        vocab_size: Number of content tokens.
-        start_token: Modality start-token ID.
-        end_token: Modality end-token ID.
-        structure_token_ids: Complete structure-token name-to-ID map.
-    """
+    """Validated token layout for one modality."""
 
     name: str
     offset: int
@@ -114,12 +37,7 @@ class ModalityInfo:
 
 @dataclass(frozen=True)
 class OmniMetadata:
-    """Container holding all parsed omnimodal information of a tokenizer.
-
-    Attributes:
-        base_vocab_size: Exclusive upper bound of the text vocabulary.
-        modalities: tuple of modality info containers, one for each modality
-    """
+    """Validated omnimodal tokenizer layout."""
 
     base_vocab_size: int
     modalities: Tuple[ModalityInfo, ...]
@@ -131,14 +49,7 @@ class OmniMetadata:
 
 @dataclass(frozen=True)
 class TokenizerExtraMetadata:
-    """Container for all tokenizer metadata.
-
-    Contains model special tokens in all cases and omni-metadata if it exists.
-
-    Attributes:
-        special_tokens: Goldfish exemption IDs for any tokenizer type.
-        omni: Validated omni layout, or ``None`` for text-only tokenizers.
-    """
+    """Special-token metadata with an optional omni layout."""
 
     special_tokens: ModelSpecialTokens
     omni: Optional[OmniMetadata] = None
@@ -167,11 +78,7 @@ def _require_int(value: Any, path: str) -> int:
 def _parse_modalities(
     base_vocab_size: int, omnimodal_config: Dict[str, Any]
 ) -> Tuple[ModalityInfo, ...]:
-    """Validate and parse the supported ``omnimodal_config`` contract.
-
-    Checks field presence and types, overlapping modality content ranges, and
-    misplaced structure tokens.
-    """
+    """Validate and parse ``omnimodal_config.modalities``."""
     omnimodal_config = _validate_object_fields(
         omnimodal_config, "omnimodal_config", {"omni_special_token_offset", "modalities"}
     )
@@ -254,7 +161,7 @@ def _parse_modalities(
             )
         )
 
-    # Validate Non Overlapping modality ranges
+    # Content ranges must not overlap.
     parsed.sort(key=lambda modality: modality.offset)
     content_ranges = [
         (modality.offset, modality.offset + modality.vocab_size, modality.name)
@@ -268,7 +175,7 @@ def _parse_modalities(
                 f"omnimodal_config content ranges overlap for {previous_name!r} and {name!r}"
             )
 
-    # Validate misplaced structure tokens
+    # Structure tokens cannot be content tokens.
     structure_ids = {
         token_id for modality in parsed for token_id in modality.structure_token_ids.values()
     }
@@ -283,9 +190,7 @@ def _parse_modalities(
             "content range [offset, offset + vocab_size)"
         )
 
-    # Structure ids must be disjoint across modalities: consumers rely on it (the weight
-    # LUT would resolve a shared id by iteration order, and the per-modality loss report
-    # would double-count it, breaking its partition of 'lm loss').
+    # Structure-token ownership must be unique.
     seen_ids = set()
     shared = set()
     for modality in parsed:
@@ -310,13 +215,7 @@ def _parse_modalities(
 
 
 def _find_hf_tokenizer(tokenizer: Any) -> Optional[Any]:
-    """Return the underlying HuggingFace tokenizer, or ``None`` if the chain has none.
-
-    Follows Megatron's ``_tokenizer``/``tokenizer`` wrapper links (for example
-    ``MegatronTokenizerText._tokenizer`` -> ``HuggingFaceTokenizer.tokenizer``) until an
-    object carrying an ``init_kwargs`` dictionary is found, the
-    ``PreTrainedTokenizerBase`` signature on transformers 4.x and 5.x.
-    """
+    """Find the HuggingFace tokenizer in a Megatron wrapper chain."""
     queue = [tokenizer]
     seen = set()
     while queue:
@@ -331,13 +230,7 @@ def _find_hf_tokenizer(tokenizer: Any) -> Optional[Any]:
 
 
 def _extract_special_token_ids(hf_tokenizer: Any) -> List[int]:
-    """Return sorted special-token IDs declared by a HuggingFace tokenizer.
-
-    Unions ``all_special_ids`` (named roles plus registered additional special tokens)
-    with ``added_tokens_decoder`` entries flagged special, which covers reserved and
-    chat-template tokens that are not registered as additional specials.
-    """
-    # The getattr defaults stay: _find_hf_tokenizer duck-types on init_kwargs alone.
+    """Collect all special-token IDs from a HuggingFace tokenizer."""
     ids = set(getattr(hf_tokenizer, "all_special_ids", None) or [])
     decoder = getattr(hf_tokenizer, "added_tokens_decoder", None) or {}
     ids.update(token_id for token_id, token in decoder.items() if getattr(token, "special", False))
@@ -347,12 +240,7 @@ def _extract_special_token_ids(hf_tokenizer: Any) -> List[int]:
 def parse_model_special_tokens(
     special_ids: List[int], omni: Optional[OmniMetadata] = None
 ) -> ModelSpecialTokens:
-    """Build Goldfish exemption IDs for text-only or omni tokenizers.
-
-    Text-only tokenizers retain all discovered special IDs. Omni tokenizers retain
-    discovered IDs below the base vocabulary and all named structure-token IDs, keeping
-    modality content tokens Goldfish-eligible.
-    """
+    """Build Goldfish exemptions from parsed tokenizer metadata."""
     general_ids = set(special_ids)
     if omni is None:
         full_ids = sorted(general_ids)
@@ -370,10 +258,7 @@ def parse_model_special_tokens(
 def parse_omni_metadata(
     base_vocab_size: Optional[int], omnimodal_config: Optional[Dict[str, Any]]
 ) -> Optional[OmniMetadata]:
-    """Validate omni configuration, returning ``None`` when it is absent.
-
-    Given omnimodal config values from tokenizer, parse into data-classes and validate.
-    """
+    """Validate omni configuration, returning ``None`` when absent."""
     if omnimodal_config is None:
         return None
 
@@ -396,10 +281,7 @@ def extract_tokenizer_extra_metadata(
     omnimodal_config: Optional[Dict[str, Any]],
     special_ids: List[int],
 ) -> TokenizerExtraMetadata:
-    """Orchestrator: build special-token metadata and an optional omni container.
-
-    Parse Omnimodal configuration if given and build model special tokens.
-    """
+    """Build special-token and optional omni metadata."""
     omni = parse_omni_metadata(base_vocab_size, omnimodal_config)
     return TokenizerExtraMetadata(
         special_tokens=parse_model_special_tokens(special_ids, omni=omni), omni=omni
@@ -409,14 +291,7 @@ def extract_tokenizer_extra_metadata(
 def populate_tokenizer_extra_metadata_from_tokenizer(
     args, tokenizer: Any
 ) -> Optional[TokenizerExtraMetadata]:
-    """Populate ``args.tokenizer_extra_metadata`` from a tokenizer wrapper chain.
-
-    Clears stale extra metadata before extraction, validates omni configuration when
-    present, and logs whether the tokenizer is text-only or omni. Non-HuggingFace
-    tokenizers carry no extra metadata and leave ``None``; this is an error when
-    Goldfish loss is enabled because its special-token exemptions would be silently
-    empty.
-    """
+    """Populate ``args.tokenizer_extra_metadata`` from a tokenizer."""
     args.tokenizer_extra_metadata = None
 
     hf_tokenizer = _find_hf_tokenizer(tokenizer)
@@ -434,7 +309,6 @@ def populate_tokenizer_extra_metadata_from_tokenizer(
         )
         return None
 
-    # extract
     init_kwargs = hf_tokenizer.init_kwargs
     base_vocab_size = init_kwargs.get("base_vocab_size")
     omnimodal_config = init_kwargs.get("omnimodal_config")
@@ -445,7 +319,6 @@ def populate_tokenizer_extra_metadata_from_tokenizer(
             "refusing to build Goldfish exemptions from structure tokens alone"
         )
 
-    # parse
     metadata = extract_tokenizer_extra_metadata(base_vocab_size, omnimodal_config, special_ids)
 
     log_single_rank(

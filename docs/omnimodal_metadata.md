@@ -54,5 +54,5 @@ Omni content tokens are excluded even though artifacts flag them special.
 - **Goldfish exemption** (planned) ← full special-token set (`ModelSpecialTokens.full_ids`).
 - **Per-modality loss weighting** (`--vision-weight`/`--audio-weight`) ← content range
   + `ModalityInfo.structure_ids`; see `docs/modality_loss_weighting.md`.
-- **Per-modality loss tracking** (`vision loss`/`audio loss`/`text loss` metrics) ←
-  same classification, `modality_loss_report` in `pretrain_gpt.py`.
+- **Per-modality loss tracking** (`--log-per-modality-loss`) ← same classification,
+  `modality_loss_report` in `pretrain_gpt.py`.

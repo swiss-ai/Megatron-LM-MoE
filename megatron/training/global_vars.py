@@ -134,8 +134,7 @@ def set_global_variables(args, build_tokenizer=True):
     )
     if build_tokenizer:
         tokenizer = _build_tokenizer(args)
-        # Read general and optional omni tokenizer metadata onto args before the wandb
-        # writer below snapshots vars(args) as the run config.
+        # Extract metadata before logging snapshots args.
         populate_tokenizer_extra_metadata_from_tokenizer(args, tokenizer)
     _set_tensorboard_writer(args)
     _set_wandb_writer(args)
@@ -206,8 +205,7 @@ def rebuild_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
     tokenizer = _build_tokenizer(args)
-    # Replace tokenizer metadata on rebuild, including transitions between omni and
-    # text-only tokenizers.
+    # Refresh metadata with the tokenizer.
     populate_tokenizer_extra_metadata_from_tokenizer(args, tokenizer)
     return tokenizer
 

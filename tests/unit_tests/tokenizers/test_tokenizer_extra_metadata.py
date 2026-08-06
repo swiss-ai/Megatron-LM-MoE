@@ -56,8 +56,7 @@ APERTUS_2_CONFIG = {
     ],
 }
 
-# Content IDs are deliberately included: the omni path must filter them even though
-# the tokenizer marks them special=True.
+# Content IDs must be filtered from special-token exemptions.
 APERTUS_2_ADDED_SPECIAL_IDS = list(range(0, 124)) + [200064, 265599, 331135, 331136, 335231]
 
 SEPARATE_RANGE_CONFIG = {
@@ -123,7 +122,7 @@ def test_omni_schema_supports_separate_structure_range():
     )
 
     assert metadata.special_tokens.full_ids == [0, 1, 2, 3, 100, 101, 102, 104, 105, 106]
-    # Unnamed reserve slots and modality content remain eligible for Goldfish.
+    # Reserve and content IDs remain eligible.
     assert not ({103, 107, 108, 109} | set(range(110, 116))) & set(metadata.special_tokens.full_ids)
 
 
@@ -349,7 +348,7 @@ def test_metadata_dataclasses_are_frozen_and_pickle_safe():
     with pytest.raises(FrozenInstanceError):
         metadata.omni.modalities = ()
 
-    # Freezing prevents field rebinding without replacing ordinary nested containers.
+    # Nested containers remain mutable.
     metadata.special_tokens.full_ids.append(7)
     metadata.omni.modalities[0].structure_token_ids["<new>"] = 7
 
