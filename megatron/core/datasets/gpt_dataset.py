@@ -17,10 +17,13 @@ from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
 from megatron.core.tokenizers import MegatronTokenizerBase
+from megatron.core.tokenizers.utils.modality_lut import get_modality_weight_lut
 from megatron.core.tokenizers.utils.tokenizer_extra_metadata import TokenizerExtraMetadata
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
+
+_IGNORE_INDEX = -100
 
 
 def _load_bfd_c_library():
@@ -309,16 +312,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Maximum number of documents allowed per sample in bfd, 0 means no limit"""
 
     tokenizer_extra_metadata: Optional[TokenizerExtraMetadata] = None
-    """General tokenizer metadata, including special-token ids and an optional validated
-       omni extension. Forwarded through this config for dataloader workers."""
+    """Parsed tokenizer metadata forwarded to dataset workers."""
 
     modality_weights: Optional[Dict[str, float]] = None
-    """Static per-modality loss weights {modality name: weight}, e.g. {"vision": 0.25},
-       from --vision-weight / --audio-weight. Applied to loss mask on per modality token ids.
-       Contains only weights != 1.0: no-op default entries are dropped upstream
-       (core_gpt_dataset_config_from_args) so unweighted runs skip the weighting branch.
-       Requires tokenizer_extra_metadata with an omni extension. None disables
-       weighting (weight 1)."""
+    """Optional static loss-mask weights keyed by modality name."""
 
     token_dtype_code: Optional[int] = field(init=False, default=None)
     """The dtype code for the token ids. 4 for int32, 8 for uint16."""
@@ -411,13 +408,17 @@ class GPTDataset(MegatronDataset):
             self._build_document_sample_shuffle_indices()
         )
 
-        # Construct modality information from omni metadata
+        # Snapshot the modality-weighting inputs; the vocab_size property can walk an
+        # O(vocab) HF chain, too expensive for the per-sample path in __getitem__.
         if self.config.modality_weights:
-            omni = self.config.tokenizer_extra_metadata.omni
-            self._modality_weights = tuple(
-                (omni.modality(name), float(weight))
-                for name, weight in self.config.modality_weights.items()
-            )
+            self._omni_modalities = self.config.tokenizer_extra_metadata.omni.modalities
+            self._modality_weights = {
+                name: float(weight) for name, weight in self.config.modality_weights.items()
+            }
+            self._lut_vocab_size = int(self.config.tokenizer.vocab_size)
+            # The LUT itself is built on first __getitem__, i.e. in the dataloader
+            # worker, so the tensor is never pickled per instance.
+            self._weight_lut = None
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -540,9 +541,7 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                # Cache a pristine copy: loss_mask is mutated in place below (pad
-                # masking), and caching the aliased tensor would leak this first
-                # sample's zeros into every later sample.
+                # Keep later per-sample masking out of the cache.
                 self.cached_loss_mask = loss_mask.clone()
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
@@ -551,30 +550,31 @@ class GPTDataset(MegatronDataset):
             loss_mask = self.cached_loss_mask.clone()
             position_ids = self.cached_position_ids
 
-        # For padded sequences, mask the loss
-        loss_mask[labels == self._pad_token_id] = 0.0
+        padding = labels == self._pad_token_id
+        loss_mask[padding] = 0.0
 
-        # For padded sequences, ensure the embedding layer can map the token ID
+        # Keep model and LUT indices in range.
         tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        labels[padding] = 0
 
-        # Static per-modality loss weighting: scale loss_mask at positions whose LABEL id
-        # belongs to a weighted modality (content range + its structure tokens). Pure
-        # id-based classification, so samples that start or end mid-modality (e.g. an
-        # image spanning several samples) are weighted correctly without span tracking.
-        # Skipped for the idx is None batch-padding sample, whose loss_mask is fully
-        # zeroed just below anyway.
+        # Weight each prediction target by modality.
         if self.config.modality_weights and idx is not None:
-            weight_lut = _get_modality_weight_lut(
-                self._modality_weights, self.config.tokenizer.vocab_size, device=labels.device
-            )
-            # Out-of-place so this block never depends on the cache-cloning discipline
-            # above (the cached loss_mask is cloned on store and read; keep it that way).
-            loss_mask = loss_mask * weight_lut[labels]
+            if self._weight_lut is None:
+                self._weight_lut = get_modality_weight_lut(
+                    self._omni_modalities,
+                    self._modality_weights,
+                    self._lut_vocab_size,
+                    device=labels.device,
+                )
+            loss_mask = loss_mask * self._weight_lut[labels]
 
         # Batch padding sequence so we mask the loss
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
+            padding = torch.ones_like(padding)
+
+        # set padding to ignore index so it can be reliably excluded from loss reporting
+        labels[padding] = _IGNORE_INDEX
 
         if self.config.create_attention_mask:
             return {
@@ -1329,46 +1329,6 @@ def _get_ltor_masks_and_position_ids(
         attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
-
-
-# The per-modality weight LUT is identical for every dataset instance (config-derived
-# ids and weights), so it is memoized at module level: blended runs construct one
-# GPTDataset per blend component per split, and each private copy would cost the full
-# vocab in floats per instance per dataloader worker.
-_LUT_CACHE = {}
-
-
-def _get_modality_weight_lut(modality_weights, vocab_size: int, device) -> torch.Tensor:
-    """Module-memoized :func:`_create_modality_weight_lut`. Get LUT for all modalities combined"""
-    key = (
-        "wlut",
-        tuple(
-            (modality.name, modality.offset, modality.vocab_size, modality.structure_ids, weight)
-            for modality, weight in modality_weights
-        ),
-        int(vocab_size),
-        str(device),
-    )
-    if key not in _LUT_CACHE:
-        _LUT_CACHE[key] = _create_modality_weight_lut(modality_weights, vocab_size, device)
-    return _LUT_CACHE[key]
-
-
-def _create_modality_weight_lut(modality_weights, vocab_size: int, device) -> torch.Tensor:
-    """Float lookup table (length ``vocab_size``) of per-token-id loss weights.
-
-    ``lut[labels]`` maps every label to its loss weight: 1.0 by default, and the
-    modality's weight for ids in its content range ``[offset, offset + vocab_size)``
-    or its structure-token ids, given ``(ModalityInfo, weight)`` pairs. Because the
-    vocabulary is partitioned by modality, this id-based lookup classifies correctly
-    regardless of where a sample cuts a modality span (no start/end anchors needed).
-    """
-    vocab_size = int(vocab_size)
-    lut = torch.ones(vocab_size, dtype=torch.float, device=device)
-    for modality, weight in modality_weights:
-        lut[modality.offset : modality.offset + modality.vocab_size] = weight
-        lut[torch.as_tensor(modality.structure_ids, dtype=torch.long, device=device)] = weight
-    return lut
 
 
 class MockGPTLowLevelDataset:

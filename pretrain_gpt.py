@@ -31,6 +31,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tokenizers.utils.modality_lut import get_modality_index_lut
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
 from megatron.core.utils import (
     StragglerDetector,
@@ -173,120 +174,65 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
-# Modalities with per-modality static loss-weight flags (--vision-weight, --audio-weight).
+# Modalities exposed by loss-weight flags.
 MODALITY_WEIGHT_NAMES = ("vision", "audio")
 
-# Cache of structure-token id tensors for label classification. Content-addressed by
-# the id tuple (not the modality name) so a tokenizer rebuild with different structure
-# ids cannot serve a stale tensor.
-_MODALITY_SPECIAL_IDS_CACHE = {}
+
+def _loss_denominator(loss_mask, normalize_by_num_supervised_tokens):
+    if normalize_by_num_supervised_tokens:
+        return (loss_mask > 0).sum().to(torch.int)
+    return loss_mask.sum().clone().detach().to(torch.int)
 
 
-def _modality_token_mask(labels: torch.Tensor, modality) -> torch.Tensor:
-    """Boolean mask of labels belonging to a modality: content range + structure tokens."""
-    mask = (labels >= modality.offset) & (labels < modality.offset + modality.vocab_size)
-    key = (modality.structure_ids, labels.dtype, labels.device)
-    special = _MODALITY_SPECIAL_IDS_CACHE.get(key)
-    if special is None:
-        special = torch.tensor(modality.structure_ids, dtype=labels.dtype, device=labels.device)
-        _MODALITY_SPECIAL_IDS_CACHE[key] = special
-    mask |= torch.isin(labels, special)
-    return mask
-
-
-def _category_loss_entries(losses, loss_mask, membership, supervised_denominator=False):
-    """Build the three reported [numerator, denominator] pairs for one label category.
-
-    ``membership`` is a boolean mask selecting the category's label positions. The three
-    entries differ in which denominator they normalize by, and whether the numerator is
-    masked and weighted at all:
-
-    - ``loss``: [weighted sum, weighted count]. The supervised per-token loss of the
-      category. Modality weights cancel in the ratio, so this is the true mean loss over
-      supervised tokens whatever --{modality}-weight is set to. Undefined (reported as
-      0 after the denominator clamp) once a modality is weighted to 0.0.
-    - ``weighted loss``: [weighted sum, raw count], or [weighted sum, supervised count]
-      when ``supervised_denominator`` is set (mirroring the 'lm loss' convention under
-      --normalize-by-num-supervised-tokens). Either way the numerator is spread over the
-      category's tokens, so it shows the category's actual contribution to 'lm loss' and
-      scales linearly with the modality weight; the supervised count drops positions the
-      loss mask zeroes out (padding, eod masking, weight 0.0).
-    - ``error``: [raw sum, raw count]. Ignores the loss mask and the modality weight
-      entirely, so the model's error on a modality stays observable even when that
-      modality is fully masked out of training (weight 0.0).
-    """
-    # Reporting only, so build no autograd graph: ``losses`` requires grad on the
-    # differentiable path in loss_func, and without this every reduction below would
-    # allocate graph nodes and temporaries that the caller immediately discards.
-    # no_grad also makes the results non-differentiable, so no .detach() is needed.
+def _build_per_modality_metrics(
+    losses, loss_mask, modality_mask, normalize_by_num_supervised_tokens=False
+):
+    """Build reporting pairs for one token group."""
     with torch.no_grad():
-        membership = membership.to(losses.dtype)
-        weights = loss_mask * membership
-        masked_sum = torch.sum(losses * weights)
-        weighted_count = weights.sum()
-        raw_sum = torch.sum(losses * membership)
-        raw_count = membership.sum()
-        if supervised_denominator:
-            # weights > 0 == (loss_mask > 0) & membership: weights are non-negative.
-            weighted_loss_count = (weights > 0).sum().to(losses.dtype)
-        else:
-            weighted_loss_count = raw_count
+        modality_mask = modality_mask.to(losses.dtype)
+        modality_loss_mask = loss_mask * modality_mask
+        masked_sum = torch.sum(losses * modality_loss_mask)
+        num_tokens = _loss_denominator(
+            modality_loss_mask, normalize_by_num_supervised_tokens
+        )
+        raw_sum = torch.sum(losses * modality_mask)
+        num_modality_tokens = modality_mask.sum()
         return {
-            "loss": torch.cat([masked_sum.view(1), weighted_count.view(1)]),
-            "weighted loss": torch.cat([masked_sum.view(1), weighted_loss_count.view(1)]),
-            "error": torch.cat([raw_sum.view(1), raw_count.view(1)]),
+            "loss": torch.cat([masked_sum.view(1), num_tokens.view(1)]),
+            "error": torch.cat([raw_sum.view(1), num_modality_tokens.view(1)]),
         }
 
 
-def modality_loss_report(losses, loss_mask, labels, modalities, supervised_denominator=False):
-    """Decompose the masked loss into per-modality and text components for reporting.
+def modality_loss_report(
+    losses,
+    loss_mask,
+    labels,
+    modalities,
+    vocab_size,
+    normalize_by_num_supervised_tokens=False,
+):
+    """Report loss statistics partitioned by modality and text.
 
-    Every entry follows the 'lm loss' [numerator, denominator] convention, so the
-    downstream reduction (sum over microbatches/DP, then numerator/denominator) yields
-    a per-token quantity. Categories partition the label ids: a modality is its content
-    range plus its structure tokens (ModalityInfo.structure_ids), text is every
-    remaining id. The '<name> loss' numerators add up exactly to the 'lm loss'
-    numerator; the '<name> loss' denominators add up to the 'lm loss' denominator under
-    the default loss-mask-sum normalization, while under
-    --normalize-by-num-supervised-tokens it is the '<name> weighted loss' pairs (with
-    ``supervised_denominator`` set to match) that sum exactly to 'lm loss'.
-
-    Three metrics are emitted per category; see :func:`_category_loss_entries` for how
-    they differ. '<name> error' is the one that survives a modality weighted to 0.0.
-
-    Args:
-        losses (torch.Tensor): Flat per-token losses (may require grad; sums are detached).
-        loss_mask (torch.Tensor): Flat loss mask/weights, same shape as ``losses``.
-        labels (torch.Tensor): Flat label ids, same shape as ``losses``.
-        modalities: Iterable of ModalityInfo (from args.tokenizer_extra_metadata.omni).
-        supervised_denominator (bool): Normalize '<name> weighted loss' by the
-            category's supervised-token count instead of its raw token count. Set to
-            args.normalize_by_num_supervised_tokens so the decomposition matches the
-            'lm loss' convention.
-
-    Returns:
-        dict: {'<name> loss', '<name> weighted loss', '<name> error'} for every modality
-            plus 'text', each mapping to tensor([numerator, denominator]).
+    Token->modality membership comes from the shared modality-index LUT
+    (megatron/core/tokenizers/utils/modality_lut.py) — the same classification
+    gpt_dataset.py uses for loss weighting.
     """
     report = {}
-    # Drop positions whose label is not a real vocabulary id. SFTDataset masks prompt and
-    # padding positions in the loss mask but leaves IGNORE_INDEX (-100) in the labels
-    # (megatron/training/datasets/sft_dataset.py), and the text category below is a
-    # complement, so those positions would otherwise be counted as text. They cannot
-    # affect '<name> loss' (their loss mask is zero), but they would inflate the
-    # mask-independent '<name> error' with positions the model was never trained on.
+    # Exclude ignored targets (padding and ignored indices)
     valid = labels >= 0
-    modality_union = torch.zeros_like(labels, dtype=torch.bool)
-    for modality in modalities:
-        mask = _modality_token_mask(labels, modality)
-        modality_union |= mask
-        for metric, value in _category_loss_entries(
-            losses, loss_mask, mask & valid, supervised_denominator
+    lut = get_modality_index_lut(modalities, vocab_size, labels.device)
+    modality_indices = lut[labels.clamp(min=0)]
+    for modality_index, modality in enumerate(modalities, start=1):
+        for metric, value in _build_per_modality_metrics(
+            losses,
+            loss_mask,
+            (modality_indices == modality_index) & valid,
+            normalize_by_num_supervised_tokens,
         ).items():
             report[f"{modality.name} {metric}"] = value
-    text_mask = (~modality_union) & valid
-    for metric, value in _category_loss_entries(
-        losses, loss_mask, text_mask, supervised_denominator
+    text_mask = (modality_indices == 0) & valid
+    for metric, value in _build_per_modality_metrics(
+        losses, loss_mask, text_mask, normalize_by_num_supervised_tokens
     ).items():
         report[f"text {metric}"] = value
     return report
@@ -323,26 +269,21 @@ def loss_func(
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
 
-        if args.normalize_by_num_supervised_tokens:
-            # True count of supervised tokens: fractional modality weights scale the
-            # numerator only, instead of also shrinking the denominator.
-            num_tokens = (loss_mask > 0).sum().to(torch.int)
-        else:
-            num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        num_tokens = _loss_denominator(loss_mask, args.normalize_by_num_supervised_tokens)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
-        # Separate per-modality loss tracking (vision/audio incl. their structure
-        # tokens; text = all remaining label ids). Only for omni tokenizers.
+        # Optional per-group metrics.
         metadata = getattr(args, 'tokenizer_extra_metadata', None)
         omni = metadata.omni if metadata is not None else None
-        if labels is not None and omni is not None:
+        if args.log_per_modality_loss and labels is not None and omni is not None:
             report.update(
                 modality_loss_report(
                     losses,
                     loss_mask,
                     labels.reshape(-1),
                     omni.modalities,
-                    supervised_denominator=args.normalize_by_num_supervised_tokens,
+                    args.padded_vocab_size,
+                    normalize_by_num_supervised_tokens=args.normalize_by_num_supervised_tokens,
                 )
             )
 
@@ -433,11 +374,13 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    # The global tokenizer and its general metadata are initialized together. Carry the
-    # metadata on the dataset config so Goldfish exemptions work in dataloader workers
-    # for text-only and omni tokenizers alike.
+    # Pass tokenizer metadata to dataset workers.
     tokenizer = get_tokenizer()
     tokenizer_extra_metadata = getattr(args, "tokenizer_extra_metadata", None)
+    if args.log_per_modality_loss:
+        assert (
+            tokenizer_extra_metadata is not None and tokenizer_extra_metadata.omni is not None
+        ), "--log-per-modality-loss requires an omni tokenizer."
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -478,8 +421,7 @@ def core_gpt_dataset_config_from_args(args):
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
         "tokenizer_extra_metadata": tokenizer_extra_metadata,
-        # Static per-modality weights (--vision-weight/--audio-weight) are applied
-        # dataset-side; entries at the default 1.0 are omitted (no-op).
+        # Omit no-op modality weights.
         "modality_weights": {
             modality: getattr(args, f"{modality}_weight")
             for modality in MODALITY_WEIGHT_NAMES
@@ -487,8 +429,7 @@ def core_gpt_dataset_config_from_args(args):
         }
         or None,
     }
-    # SFTDataset builds its own loss mask (pad/IGNORE_INDEX) and never consults
-    # modality_weights; fail loudly rather than train silently unweighted.
+    # SFTDataset owns its loss mask.
     assert not (data_args["modality_weights"] and args.sft), (
         "--vision-weight/--audio-weight are not supported with --sft: SFTDataset does "
         "not apply modality weights to its loss mask."

@@ -5,6 +5,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -291,6 +292,37 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+
+def _validate_modality_loss_args(args):
+    """Validate static modality weights and their required loss normalization."""
+    has_masked_weight = False
+    has_non_binary_weight = False
+    for modality in ("vision", "audio"):
+        weight = getattr(args, f"{modality}_weight")
+        assert math.isfinite(weight) and weight >= 0, (
+            f"--{modality}-weight must be finite and >= 0 ({weight})"
+        )
+        has_masked_weight |= weight != 1.0
+        has_non_binary_weight |= weight not in (0.0, 1.0)
+
+    if has_masked_weight:
+        # Without per-token loss, each microbatch (and each CP rank) is normalized by
+        # its own local supervised count, so contiguous down- or zero-weighted modality
+        # spans redistribute gradient weight onto the surviving tokens instead of
+        # scaling it.
+        assert args.calculate_per_token_loss, (
+            "Non-default --vision-weight/--audio-weight values require "
+            "--calculate-per-token-loss."
+        )
+    if has_non_binary_weight:
+        # For 0/1 masks the two denominators coincide; fractional weights need the
+        # supervised-token count so the weight scales the numerator only.
+        assert args.normalize_by_num_supervised_tokens, (
+            "Non-binary --vision-weight/--audio-weight values require "
+            "--normalize-by-num-supervised-tokens."
+        )
+
 
 def validate_args(args, defaults={}):
 
@@ -1367,11 +1399,8 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
-    # Per-modality loss weights (static --vision-weight / --audio-weight).
-    # Keep in sync with MODALITY_WEIGHT_NAMES in pretrain_gpt.py.
-    for _modality in ("vision", "audio"):
-        _weight = getattr(args, f"{_modality}_weight")
-        assert _weight >= 0, f"--{_modality}-weight must be >= 0 ({_weight})"
+    # Validate modality loss options.
+    _validate_modality_loss_args(args)
 
     if args.normalize_by_num_supervised_tokens and not args.calculate_per_token_loss:
         print_rank_0(
@@ -2837,11 +2866,14 @@ def _add_training_args(parser):
                        help='Normalize the loss by the count of supervised tokens '
                        '(loss_mask > 0) instead of the loss-mask sum. The loss value '
                        'only differs from the default when fractional loss-mask '
-                       'weights are in use (e.g. --vision-weight 0.5); the '
-                       'per-modality "weighted loss" report denominators switch to '
-                       'supervised counts as well. Pair with '
+                       'weights are in use (e.g. --vision-weight 0.5); for GPT, the '
+                       'per-modality loss report uses supervised counts as well. Pair with '
                        '--calculate-per-token-loss so the reported lm loss equals '
                        'the objective that determines the gradients.')
+    group.add_argument('--log-per-modality-loss', action='store_true',
+                       help='Report separate loss metrics for each modality and text. '
+                       'Requires an omni tokenizer and adds per-microbatch reduction '
+                       'overhead. Supported by pretrain_gpt.py only and not with ModelOpt.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
@@ -3450,17 +3482,14 @@ def _add_data_args(parser):
                             'efficiency and don\'t cut the samples if < sequence_length.')
     group.add_argument('--max-docs-per-bin', type=int, default=0,
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
-    # Per-modality loss weighting (same flag interface as the dense Apertus Megatron,
-    # static weights only). Scales the loss mask at positions whose label id belongs to
-    # the modality (content-token range plus its structure tokens, from the tokenizer
-    # omni metadata). Keep in sync with MODALITY_WEIGHT_NAMES in pretrain_gpt.py.
+    # Keep names in sync with MODALITY_WEIGHT_NAMES in pretrain_gpt.py.
     for _modality in ("vision", "audio"):
         group.add_argument(f'--{_modality}-weight', type=float, default=1.0,
                            help=f'Loss mask weight for {_modality} tokens (content and '
                                 'structure tokens). Default 1.0 (normal loss; weights of '
                                 'exactly 1.0 are omitted from the dataset config as '
                                 'no-ops). Set to 0.0 to fully mask them. Requires an '
-                                'omni tokenizer.')
+                                'omni tokenizer. Supported by pretrain_gpt.py only.')
     return parser
 
 
