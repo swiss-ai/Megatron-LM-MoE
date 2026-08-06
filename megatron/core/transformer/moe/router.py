@@ -832,7 +832,7 @@ class TopKRouter(Router):
                 ):
                     save_to_aux_losses_tracker(
                         name,
-                        value,
+                        value / self.tp_cp_group.size(),
                         self.layer_number,
                         num_layers,
                         reduce_group=self.tp_cp_group,
@@ -859,7 +859,7 @@ class TopKRouter(Router):
                     ):
                         save_to_aux_losses_tracker(
                             name,
-                            value,
+                            value / self.tp_cp_group.size(),
                             self.layer_number,
                             num_layers,
                             reduce_group=self.tp_cp_group,
