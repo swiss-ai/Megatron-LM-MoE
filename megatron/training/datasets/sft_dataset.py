@@ -167,8 +167,10 @@ class SFTDataset(MegatronDataset):
 
         # Loss mask.
         loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0  # Mask paddings
+        padding = labels == pad
+        loss_mask[padding] = 0.0  # Mask paddings
         loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
+        labels[padding] = IGNORE_INDEX
 
         # TODO(duncan): Optionally create an attention mask
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
