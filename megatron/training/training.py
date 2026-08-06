@@ -1370,6 +1370,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
+        if getattr(args, "modelopt_enabled", False):
+            assert not getattr(args, "normalize_by_num_supervised_tokens", False), (
+                "--normalize-by-num-supervised-tokens is not supported with ModelOpt."
+            )
+            assert not getattr(args, "log_per_modality_loss", False), (
+                "--log-per-modality-loss is not supported with ModelOpt."
+            )
+
     # Build model.
     def build_model():
         if (
@@ -1996,10 +2004,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     val,
                     group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
-                # Clamp the denominator: a category can be legitimately empty in a
-                # global batch (e.g. a per-modality metric for a modality absent from
-                # the batch, or one weighted to 0.0). Without this the metric is NaN,
-                # which then poisons the whole logging window.
+                # Avoid NaN for empty reporting groups.
                 loss_reduced[key] = val[0] / val[1].clamp(min=1)
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
@@ -3581,7 +3586,10 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        # Clamp like the train-step reduction: a category can be legitimately empty
+        # over a whole eval pass (e.g. a modality weighted to 0.0 or absent from the
+        # split); report 0.0 rather than NaN.
+        total_loss_dict[key] = numerator / denominator.clamp(min=1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
