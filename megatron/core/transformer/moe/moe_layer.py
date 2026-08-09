@@ -50,9 +50,9 @@ if HAVE_FLASHINFER:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -273,6 +273,24 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
             )
 
+            # Optional normalizations on the latent dimension. fc1 norm is applied to the
+            # down-projected latent (after fc1_latent_proj, before dispatch); fc2 norm is
+            # applied to the combined latent (after combine, before fc2_latent_proj).
+            self.fc1_latent_norm = None
+            if self.config.latentmoe_fc1_norm:
+                self.fc1_latent_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
+            self.fc2_latent_norm = None
+            if self.config.latentmoe_fc2_norm:
+                self.fc2_latent_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
+
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
@@ -424,6 +442,8 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
+            if self.fc1_latent_norm is not None:
+                hidden_states = self.fc1_latent_norm(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
@@ -527,6 +547,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.fc2_latent_norm is not None:
+                output = self.fc2_latent_norm(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:

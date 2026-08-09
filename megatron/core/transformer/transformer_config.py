@@ -1053,6 +1053,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    latentmoe_fc1_norm: bool = False
+    """Apply a normalization on the latent dimension right after the MoE fc1 latent
+    down-projection (hidden -> latent), before token dispatch. Only used when moe_latent_size
+    is set."""
+
+    latentmoe_fc2_norm: bool = False
+    """Apply a normalization on the latent dimension right before the MoE fc2 latent
+    up-projection (latent -> hidden), after token combine. Only used when moe_latent_size
+    is set."""
+
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 

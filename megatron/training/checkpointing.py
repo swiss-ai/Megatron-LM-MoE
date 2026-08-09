@@ -1603,6 +1603,10 @@ def load_args_from_checkpoint(
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    # Latent-dim norms add extra norm weights to the checkpoint; force so --use-checkpoint-args
+    # rebuilds the matching sublayers (default False, hence force=True).
+    _set_arg('latentmoe_fc1_norm', force=True)
+    _set_arg('latentmoe_fc2_norm', force=True)
 
     # Apertus custom architecture flags. These are forward-affecting TransformerConfig fields that
     # default to False/None, so they need force=True (else _set_arg early-returns because the value

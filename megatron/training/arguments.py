@@ -1738,6 +1738,11 @@ def validate_args(args, defaults={}):
         assert args.moe_latent_size > 0, "MoE latent projection dimension has to be greater than zero."
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
         assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
+    if args.latentmoe_fc1_norm or args.latentmoe_fc2_norm:
+        assert args.moe_latent_size is not None, (
+            "--latentmoe-fc1-norm/--latentmoe-fc2-norm require --moe-latent-size to be set; they "
+            "normalize the MoE latent dimension."
+        )
 
     if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
         warn_rank_0(
