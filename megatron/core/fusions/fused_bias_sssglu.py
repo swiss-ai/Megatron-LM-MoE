@@ -9,13 +9,17 @@ from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SSSGLU FUSION/ NO AUTOGRAD ################
-# SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign:
-#   gate(x)  = softsign(x - 1) + 0.5 = (x - 1) / (1 + |x - 1|) + 0.5   (== sssglu_act in activations.py)
+# SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign. The shift ``s = sqrt(2)-1``
+# is chosen so the gate derivative has y-intercept 0.5 (``gate'(0) = 1/(1+|s|)**2 = 0.5``), and the
+# additive offset ``1 - 1/sqrt(2) = -softsign(-s)`` keeps ``gate(0) = 0``:
+#   s        = sqrt(2) - 1 ~= 0.41421356
+#   gate(x)  = softsign(x - s) + (1 - 1/sqrt(2)) = (x - s) / (1 + |x - s|) + 0.29289322
+#                                                                     (== sssglu_act in activations.py)
 #   SSSGLU(y_1, y_2) = gate(y_1) * y_2
 # Like RLGLU (and unlike SwiGLU/SSGLU) the gate is NOT of the form ``x * squash(x)`` -- it is the
 # gate itself, applied directly, so there is no separate SiLU-style helper. The gate derivative is
-#   gate'(x) = 1 / (1 + |x - 1|)**2
-# which is cheap and needs nothing beyond ``|x - 1|`` (already computed for the gate). Built exactly
+#   gate'(x) = 1 / (1 + |x - s|)**2
+# which is cheap and needs nothing beyond ``|x - s|`` (already computed for the gate). Built exactly
 # like the SwiGLU/SSGLU/RLGLU fusions (fused_bias_swiglu.py / fused_bias_ssglu.py /
 # fused_bias_rlglu.py): @jit_fuser forward/backward pairs wrapped in torch.autograd.Function, since
 # the gate has no cross-feature reduction. The gate math is inlined here (rather than importing
@@ -32,11 +36,11 @@ def sssglu(y):
 
     Returns:
         torch.Tensor: Result of SSSGLU activation: gate(y1) * y2, where y1, y2 are the split
-            halves and gate(x) = softsign(x - 1) + 0.5.
+            halves and gate(x) = softsign(x - (sqrt(2)-1)) + (1 - 1/sqrt(2)).
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
-    u = y_1 - 1
-    return (0.5 + u / (1 + torch.abs(u))) * y_2
+    u = y_1 - 0.41421356237309515
+    return (0.2928932188134524 + u / (1 + torch.abs(u))) * y_2
 
 
 @jit_fuser
@@ -65,8 +69,8 @@ def weighted_sssglu(y, weights):
 def sssglu_back(g, y):
     """Computes the gradient for the SSSGLU activation function.
 
-    With gate(x) = softsign(x - 1) + 0.5, the gate derivative is
-        gate'(x) = 1 / (1 + |x - 1|)**2.
+    With gate(x) = softsign(x - (sqrt(2)-1)) + (1 - 1/sqrt(2)), the gate derivative is
+        gate'(x) = 1 / (1 + |x - (sqrt(2)-1)|)**2.
     So d/dy1 [gate(y1) * y2] = gate'(y1) * y2 and d/dy2 [gate(y1) * y2] = gate(y1).
 
     Args:
@@ -77,9 +81,9 @@ def sssglu_back(g, y):
         torch.Tensor: Gradient with respect to the input tensor.
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
-    u = y_1 - 1
+    u = y_1 - 0.41421356237309515
     denom = 1 + torch.abs(u)
-    gate = 0.5 + u / denom
+    gate = 0.2928932188134524 + u / denom
     gate_prime = 1.0 / (denom * denom)
     return torch.cat((g * gate_prime * y_2, g * gate), -1)
 

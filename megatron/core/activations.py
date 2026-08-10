@@ -953,7 +953,9 @@ def situ_act(x: torch.Tensor) -> torch.Tensor:
 
 
 def sssglu_act(x: torch.Tensor) -> torch.Tensor:
-    """SSSGLU gate: ``f(x) = softsign(x - 1) + 0.5 = (x - 1) / (1 + |x - 1|) + 0.5``.
+    """SSSGLU gate: ``f(x) = softsign(x - s) + (1 - 1/sqrt(2))``, ``s = sqrt(2) - 1``.
+
+    ``= (x - s) / (1 + |x - s|) + 0.29289322`` with ``s ~= 0.41421356``.
 
     Used as the gate of a gated linear unit (``sssglu_act(x_glu) * x_linear``). Unlike SwiGLU/SSGLU
     (whose gate is of the form ``x * squash(x)``) this is the gate applied directly, so it is
@@ -963,11 +965,13 @@ def sssglu_act(x: torch.Tensor) -> torch.Tensor:
     ``megatron.core.transformer.moe.sssglu_jit`` (Triton, fp8/offloading paths); the generic GLU
     path uses this function directly as the eager fallback.
 
-    A shifted, scaled softsign: a smooth (0, 1)-valued step centered at ``x = 1`` with
-    ``f(1) = 0.5``, ``f -> 1`` as ``x -> +inf`` and ``f -> 0`` as ``x -> -inf``. Its derivative is
-    ``1 / (1 + |x - 1|)**2``. The fused kernels inline this math (kept in sync with this function).
+    A shifted, scaled softsign: a smooth (0, 1)-valued step centered at ``x = s`` with
+    ``f(s) = 1 - 1/sqrt(2)``, ``f -> 1`` as ``x -> +inf`` and ``f -> 0`` as ``x -> -inf``. The shift
+    ``s = sqrt(2) - 1`` is chosen so the derivative ``1 / (1 + |x - s|)**2`` has y-intercept
+    ``f'(0) = 0.5``, and the additive offset ``1 - 1/sqrt(2)`` keeps ``f(0) = 0``. The fused kernels
+    inline this math (kept in sync with this function).
     """
-    return F.softsign(x - 1) + 0.5
+    return F.softsign(x - 0.41421356237309515) + 0.2928932188134524
 
 
 @jit_fuser

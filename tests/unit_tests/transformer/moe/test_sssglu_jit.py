@@ -2,7 +2,7 @@
 
 These are the fp32-internal Triton kernels used on the FP8 (offloading-)experts path (the sibling
 of ``rlglu_jit.py`` / ``swiglu_jit.py``). SSSGLU is a GLU whose gate is a shifted, scaled softsign
-applied directly: ``gate(a) = softsign(a - 1) + 0.5``. Forward and backward (including the per-row
+applied directly: ``gate(a) = softsign(a - (sqrt(2)-1)) + (1 - 1/sqrt(2))``. Forward and backward (including the per-row
 ``probs`` scaling and its gradient) are checked against a pure-torch autograd reference. CUDA-gated
 like the other kernel tests; run on the cluster GPU.
 """
@@ -19,7 +19,7 @@ if torch.cuda.is_available():
 def _ref_forward(x, probs=None):
     """Reference ``gate(a) * b [* probs]`` with the [a|b] halves split along the last dim."""
     a, b = torch.chunk(x, 2, -1)
-    y = (F.softsign(a - 1) + 0.5) * b
+    y = (F.softsign(a - 0.41421356237309515) + 0.2928932188134524) * b
     if probs is not None:
         y = y * probs
     return y

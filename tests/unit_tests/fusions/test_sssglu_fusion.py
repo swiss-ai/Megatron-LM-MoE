@@ -1,7 +1,7 @@
 """Tests for the fused SSSGLU kernels (``fused_bias_sssglu.py``).
 
 SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign,
-``gate(x) = softsign(x - 1) + 0.5``, applied directly (like RLGLU, unlike SwiGLU/SSGLU's
+``gate(x) = softsign(x - (sqrt(2)-1)) + (1 - 1/sqrt(2))``, applied directly (like RLGLU, unlike SwiGLU/SSGLU's
 ``x * squash(x)`` form). The fusion is built like RLGLU's / SwiGLU's own (``@jit_fuser`` forward
 plus hand-derived analytic backward wrapped in torch.autograd.Function), so the tests mirror
 ``test_ssglu_fusion.py`` and add an fp64 autograd-reference check of the analytic backward.
@@ -21,19 +21,19 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 def _ref(x, bias=None):
-    """Pure-torch autograd reference: gate(y1) * y2 with gate(y) = softsign(y - 1) + 0.5."""
+    """Pure-torch autograd reference: gate(y1) * y2 with gate(y) = softsign(y - (sqrt(2)-1)) + (1 - 1/sqrt(2))."""
     if bias is not None:
         x = x + bias
     y_1, y_2 = torch.chunk(x, 2, -1)
-    return (F.softsign(y_1 - 1) + 0.5) * y_2
+    return (F.softsign(y_1 - 0.41421356237309515) + 0.2928932188134524) * y_2
 
 
 def test_sssglu_act_matches_gate_definition():
     x = torch.randn(1024, dtype=torch.float64, device="cuda")
-    gate = F.softsign(x - 1) + 0.5
+    gate = F.softsign(x - 0.41421356237309515) + 0.2928932188134524
     assert torch.allclose(sssglu_act(x), gate)
-    # gate is softsign (in (-1, 1)) shifted by 0.5 -> lands in (-0.5, 1.5)
-    assert gate.min() > -0.5 and gate.max() < 1.5
+    # gate is softsign (in (-1, 1)) shifted by (1 - 1/sqrt(2)) ~= 0.29289 -> lands in (-0.70711, 1.29289)
+    assert gate.min() > -0.7072 and gate.max() < 1.2929
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float64, torch.float32, torch.bfloat16])

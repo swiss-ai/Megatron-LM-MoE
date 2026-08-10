@@ -1,12 +1,17 @@
 """Triton kernels for SSSGLU activation with optional per-row probability scaling.
 
-SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign:
-    gate(a)  = softsign(a - 1) + 0.5 = (a - 1) / (1 + |a - 1|) + 0.5   (== sssglu_act in activations.py)
+SSSGLU is a gated linear unit whose gate is a shifted, scaled softsign. The shift is chosen so the
+gate derivative has a y-intercept of 0.5 (``gate'(0) = 1 / (1 + |shift|)**2 = 0.5`` gives
+``shift = sqrt(2) - 1``); the additive offset ``-softsign(-shift) = 1 - 1/sqrt(2)`` keeps
+``gate(0) = 0``:
+    shift    = sqrt(2) - 1 ~= 0.41421356
+    gate(a)  = softsign(a - shift) + (1 - 1/sqrt(2))
+             = (a - shift) / (1 + |a - shift|) + 0.29289322        (== sssglu_act in activations.py)
     SSSGLU   = gate(a) * b
 Structured exactly like ``rlglu_jit.py`` / ``ssglu_jit.py`` / ``swiglu_jit.py`` (its GLU siblings)
 -- the only difference is the gate; all gate math runs in fp32. Like RLGLU (and unlike SwiGLU/SSGLU,
 ``a * squash(a) * b``) the forward has no extra factor of ``a`` -- the gate is applied directly. Its
-derivative is ``gate'(a) = 1 / (1 + |a - 1|)**2``. See also the (torch) fusion in
+derivative is ``gate'(a) = 1 / (1 + |a - shift|)**2``. See also the (torch) fusion in
 ``megatron.core.fusions.fused_bias_sssglu``.
 """
 
@@ -40,9 +45,9 @@ def _sssglu_fwd_kernel(
     a = tl.load(x_ptr + a_off, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(x_ptr + b_off, mask=mask, other=0.0).to(tl.float32)
 
-    # gate(a) = softsign(a - 1) + 0.5 = 0.5 + (a - 1) / (1 + |a - 1|); y = gate(a) * b
-    u = a - 1.0
-    gate_a = 0.5 + u / (1.0 + tl.abs(u))
+    # gate(a) = softsign(a - shift) + (1 - 1/sqrt(2)); shift = sqrt(2) - 1; y = gate(a) * b
+    u = a - 0.41421356237309515
+    gate_a = 0.2928932188134524 + u / (1.0 + tl.abs(u))
     y = gate_a * b
 
     if HAS_PROBS:
@@ -80,11 +85,11 @@ def _sssglu_bwd_kernel(
     b = tl.load(x_ptr + b_off, mask=mask, other=0.0).to(tl.float32)
     gy = tl.load(gy_ptr + gy_off, mask=mask, other=0.0).to(tl.float32)
 
-    # gate(a)  = 0.5 + (a - 1) / (1 + |a - 1|)
-    # gate'(a) = 1 / (1 + |a - 1|)**2
-    u = a - 1.0
+    # gate(a)  = (1 - 1/sqrt(2)) + (a - shift) / (1 + |a - shift|); shift = sqrt(2) - 1
+    # gate'(a) = 1 / (1 + |a - shift|)**2
+    u = a - 0.41421356237309515
     denom = 1.0 + tl.abs(u)
-    gate_a = 0.5 + u / denom
+    gate_a = 0.2928932188134524 + u / denom
     d_gate = 1.0 / (denom * denom)
 
     if HAS_PROBS:
@@ -117,7 +122,7 @@ def sssglu_forward(
 ) -> torch.Tensor:
     """Triton SSSGLU forward.
 
-    y = gate(a) * b, gate(a) = softsign(a-1) + 0.5, optionally scaled by per-row `probs`.
+    y = gate(a) * b, gate(a) = softsign(a - (sqrt(2)-1)) + (1 - 1/sqrt(2)), optionally scaled by per-row `probs`.
     """
     assert input_tensor.shape[-1] % 2 == 0, "last dim must be 2*D"
     orig_shape = input_tensor.shape
