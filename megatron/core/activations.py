@@ -919,21 +919,23 @@ def rlglu_act(x: torch.Tensor) -> torch.Tensor:
 
 
 def lglu_act(x: torch.Tensor) -> torch.Tensor:
-    """LGLU gate: ``f(x) = sign(x - 1) * ln(|x - 1| + 1) + ln 2``.
+    """LGLU gate: ``f(x) = sign(x - 3) * ln(|x - 3| + 1) + ln 4``.
 
     Used as the gate of a gated linear unit (``lglu_act(x_glu) * x_linear``) via the generic
     (non-fused) GLU path -- dispatched by ``activation_func == lglu_act`` with
     ``gated_linear_unit=True`` and ``bias_activation_fusion=False``. No fused kernel (the user
     only requested kernel fusion for SSSGLU), so it always runs eager.
 
-    A symmetric-log ("signed logarithm") gate centered at ``x = 1``: it grows like
-    ``+/- ln|x - 1|`` in the tails (a gentle, unbounded response of either sign) and the additive
-    ``ln 2`` fixes ``f(1) = ln 2`` so the gate is never exactly zero at its center. Its derivative
-    is ``1 / (1 + |x - 1|)`` (a smooth bump peaking at ``x = 1``), so ``sign(x - 1)`` never causes a
-    kink in the value -- ``sign(u) * ln(|u| + 1) -> 0`` as ``u -> 0`` from both sides.
+    A symmetric-log ("signed logarithm") gate centered at ``x = 3``: it grows like
+    ``+/- ln|x - 3|`` in the tails (a gentle, unbounded response of either sign). Its derivative is
+    ``1 / (1 + |x - 3|)`` (a smooth bump peaking at ``x = 3``, so peak gradient is ``1.0``); the
+    shift of ``3`` sets the gradient y-intercept ``f'(0) = 1 / (1 + 3) = 0.25`` (matching SSSGLU),
+    and ``sign(x - 3)`` never causes a kink in the value -- ``sign(u) * ln(|u| + 1) -> 0`` as
+    ``u -> 0`` from both sides. The additive ``ln 4`` fixes ``f(0) = sign(-3) * ln(4) + ln 4 = 0``
+    so the gate still passes through the origin.
     """
-    u = x - 1
-    return torch.sign(u) * torch.log(1 + u.abs()) + math.log(2.0)
+    u = x - 3
+    return torch.sign(u) * torch.log(1 + u.abs()) + math.log(4.0)
 
 
 def situ_act(x: torch.Tensor) -> torch.Tensor:
