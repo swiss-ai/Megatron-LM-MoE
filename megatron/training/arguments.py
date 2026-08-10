@@ -2869,7 +2869,8 @@ def _add_training_args(parser):
                        'weights are in use (e.g. --vision-weight 0.5); for GPT, the '
                        'per-modality loss report uses supervised counts as well. Pair with '
                        '--calculate-per-token-loss so the reported lm loss equals '
-                       'the objective that determines the gradients.')
+                       'the objective that determines the gradients. Supported by '
+                       'pretrain_gpt.py only.')
     group.add_argument('--log-per-modality-loss', action='store_true',
                        help='Report separate loss metrics for each modality and text. '
                        'Requires an omni tokenizer and adds per-microbatch reduction '
