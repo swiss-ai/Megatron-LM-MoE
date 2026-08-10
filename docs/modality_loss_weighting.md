@@ -24,18 +24,33 @@ zero.
 
 ## Technical flow
 
-| Stage | Implementation |
-|---|---|
-| Parse tokenizer layout | [`tokenizer_extra_metadata.py`](../megatron/core/tokenizers/utils/tokenizer_extra_metadata.py) reads `omnimodal_config`, validates disjoint content/structure IDs, and produces ordered `ModalityInfo` objects. The full schema is documented in [`omnimodal_metadata.md`](omnimodal_metadata.md). |
-| Build dataset config | [`pretrain_gpt.py`](../pretrain_gpt.py), `core_gpt_dataset_config_from_args`, forwards tokenizer metadata and only non-default weights into `GPTDatasetConfig`. |
-| Classify token IDs | [`modality_lut.py`](../megatron/core/tokenizers/utils/modality_lut.py), `_create_modality_index_lut`, builds an int8 vocabulary LUT: `0` is text and `k` is the one-based index of a modality. Both content and structure IDs are assigned. |
-| Convert indices to weights | `_create_modality_weight_lut` maps index `0` and unweighted modalities to `1.0`, then maps configured modalities to their weight. `_LUT_CACHE` shares immutable LUTs per process by layout, weights, vocabulary size, and device. |
-| Apply the mask | `GPTDataset.__getitem__` first creates the normal loss mask and clears padding. It lazily obtains the weight LUT and multiplies it with `weight_lut[labels]`. Padding labels become `-100` after lookup; batch-padding samples are fully ignored. |
-| Consume the mask | [`pretrain_gpt.py`](../pretrain_gpt.py), `loss_func`, computes `sum(token_loss * loss_mask)`. Non-binary weights require supervised-token and per-token normalization so the configured weight is not cancelled by the denominator. |
-| Optional reporting | With `--log-per-modality-loss`, `modality_loss_report` uses the same modality-index LUT on the training device, with `args.padded_vocab_size`, so reporting and dataset masking use identical token ownership. |
+| Stage                      | Implementation                                                                                                                                                                                                                                                                                     |
+|----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Parse tokenizer layout     | [`tokenizer_extra_metadata.py`](../megatron/core/tokenizers/utils/tokenizer_extra_metadata.py) reads `omnimodal_config`, validates disjoint content/structure IDs, and produces ordered `ModalityInfo` objects. The full schema is documented in [`omnimodal_metadata.md`](omnimodal_metadata.md). |
+| Build dataset config       | [`pretrain_gpt.py`](../pretrain_gpt.py), `core_gpt_dataset_config_from_args`, forwards tokenizer metadata and only non-default weights into `GPTDatasetConfig`.                                                                                                                                    |
+| Classify token IDs         | [`modality_lut.py`](../megatron/core/tokenizers/utils/modality_lut.py), `_create_modality_index_lut`, builds an int8 vocabulary LUT: `0` is text and `k` is the one-based index of a modality. Both content and structure IDs are assigned.                                                        |
+| Convert indices to weights | `_create_modality_weight_lut` uses an index LUT once to build a direct token-to-weight LUT. Index and weight LUTs have separate cache entries because they serve different consumers.                                                                                                               |
+| Apply the mask             | `GPTDataset.__getitem__` first creates the normal loss mask and clears padding. It lazily obtains the weight LUT and multiplies it with `weight_lut[labels]`. Padding labels become `-100` after lookup; batch-padding samples are fully ignored.                                                  |
+| Consume the mask           | [`pretrain_gpt.py`](../pretrain_gpt.py), `loss_func`, computes `sum(token_loss * loss_mask)`. Non-binary weights require supervised-token and per-token normalization so the configured weight is not cancelled by the denominator.                                                                |
+| Optional reporting         | With `--log-per-modality-loss`, `modality_loss_report` uses a modality-index LUT on the training device, with `args.padded_vocab_size`, so reporting and dataset masking use identical token ownership.                                                                                          |
 
-Dataset LUTs are created lazily in each dataloader worker. Training ranks create only
-the modality-index LUT needed for optional reporting. Static weights belong in the cached
+### LUT roles and lifecycle
+
+| LUT type | Stored value for each token ID | Consumer | Created when | Typical vocabulary size and device |
+|----------|---------------------------------|----------|--------------|------------------------------------|
+| Modality-index LUT | `int8`: `0` for text, otherwise the one-based modality index | Per-modality reporting in `pretrain_gpt.py` | On the first report when `--log-per-modality-loss` is enabled | `args.padded_vocab_size` on the training device |
+| Modality-weight LUT | `float`: the configured loss weight, defaulting to `1.0` | Loss-mask construction in `GPTDataset.__getitem__` | On the first real sample in each dataloader worker, and only when a non-default weight is configured | `tokenizer.vocab_size` on the labels' device, normally CPU |
+
+The LUTs are kept separate because the index LUT preserves modality identity for
+reporting, including when multiple modalities have the same weight. The weight LUT
+instead gives dataset masking one direct lookup without an index-to-weight conversion
+for every sample. It is derived once from a temporary index LUT, then cached; that
+temporary table is not added to the index-LUT cache.
+
+Both caches are process-local and keyed by modality layout, vocabulary size, and
+device; weight-LUT keys additionally contain the configured weights. Consequently,
+training processes and dataloader workers create only the table they consume, with
+the shape and placement required in that context. Static weights belong in the cached
 weight LUT; dynamic schedules would instead apply a small modality-to-weight vector at
 training time.
 
@@ -47,10 +62,10 @@ With `--log-per-modality-loss`, omni tokenizers additionally report each modalit
 full-tensor reductions per microbatch. Two metrics are emitted per token group in
 the `lm loss` `[numerator, denominator]` convention:
 
-| Metric         | Pair                                    | Reads as                                      |
-|----------------|-----------------------------------------|-----------------------------------------------|
+| Metric         | Pair                                                | Reads as                                                      |
+|----------------|-----------------------------------------------------|---------------------------------------------------------------|
 | `<name> loss`  | Same weighted sum and denominator rule as `lm loss` | The group's contribution under the active normalization mode. |
-| `<name> error` | `[raw sum, raw token count]`            | Unmasked, unweighted mean cross-entropy over valid targets. |
+| `<name> error` | `[raw sum, raw token count]`                        | Unmasked, unweighted mean cross-entropy over valid targets.   |
 
 Without `--normalize-by-num-supervised-tokens`, `<name> loss` divides by the
 loss-mask sum (cast to an integer), matching `lm loss`; supported weights in this
