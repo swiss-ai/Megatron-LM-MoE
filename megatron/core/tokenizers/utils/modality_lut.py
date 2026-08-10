@@ -1,17 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Modality-classification lookup tables derived from tokenizer omni metadata.
+"""Cached modality lookup tables derived from tokenizer omni metadata.
 
-This module centralizes the single membership definition (a modality is its content
-range plus its structure tokens, see ``ModalityInfo``) shared by the dataset-side loss
-weighting in ``megatron.core.datasets.gpt_dataset`` and the per-modality loss report
-in ``pretrain_gpt.py``. It is kept out of ``tokenizer_extra_metadata`` so that the
-metadata module stays torch-free.
+Two LUT types share one content-plus-structure membership definition:
+
+* The int8 index LUT maps token IDs to text or a modality. It is created lazily for
+  per-modality reporting and preserves identity when modalities have equal weights.
+* The float weight LUT maps token IDs directly to loss weights. It is created lazily
+  by the dataset only for non-default weights, keeping sample masking to one lookup.
+
+They remain separate because weights cannot recover modality identity. Each is cached
+per process by layout, vocabulary size, and device; weight LUT keys also include the
+weights. This module stays separate so ``tokenizer_extra_metadata`` remains torch-free.
 """
 
 import torch
 
-# Share immutable Lookup Tables (LUTs) between dataset instances in a process.
+# Share immutable LUTs within a process.
 _LUT_CACHE = {}
 
 
@@ -24,7 +29,7 @@ def _modality_layout_key(modalities):
 
 
 def get_modality_index_lut(modalities, vocab_size: int, device) -> torch.Tensor:
-    """Module-memoized :func:`_create_modality_index_lut`."""
+    """Return the cached token-to-modality index LUT used by reporting."""
     key = ("modality-index-lut", _modality_layout_key(modalities), int(vocab_size), str(device))
     if key not in _LUT_CACHE:
         _LUT_CACHE[key] = _create_modality_index_lut(modalities, vocab_size, device)
@@ -45,7 +50,7 @@ def _create_modality_index_lut(modalities, vocab_size: int, device) -> torch.Ten
 
 
 def get_modality_weight_lut(modalities, weights, vocab_size: int, device) -> torch.Tensor:
-    """Module-memoized :func:`_create_modality_weight_lut`."""
+    """Return the cached token-to-weight LUT used by dataset masking."""
     key = (
         "wlut",
         _modality_layout_key(modalities),
