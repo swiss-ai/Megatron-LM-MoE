@@ -20,6 +20,7 @@ from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
     RerunMode,
+    RerunStrategy,
     initialize_rerun_state_machine,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
@@ -110,6 +111,7 @@ def initialize_megatron(
         state_save_func=state_save_func,
         state_restore_func=state_restore_func,
         mode=RerunMode(args.rerun_mode),
+        strategy=RerunStrategy(args.rerun_strategy),
         error_injector=RerunErrorInjector(
             error_injection_rate=args.error_injection_rate,
             error_injection_type=RerunDiagnostic(args.error_injection_type),

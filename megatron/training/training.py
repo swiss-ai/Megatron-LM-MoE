@@ -45,6 +45,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional, Dict
+from functools import partial
 
 import torch.distributed
 
@@ -198,7 +199,12 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import (
+    track_moe_metrics, 
+    clear_aux_losses_tracker,
+    save_router_state,
+    restore_router_state,
+)
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
     OffloadingFP8Config,
@@ -1068,7 +1074,20 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
-    _register_router_rerun_state(model)
+
+    # register state save/restore functions in rerun state machine
+    rerun_state_machine = get_rerun_state_machine()
+    rerun_state_machine.register_state_save_restore_funcs(
+        "router",
+        partial(save_router_state, model=model),
+        restore_router_state,
+    )
+    # upon state restore, clear moe metrics to avoid double counting
+    rerun_state_machine.register_state_save_restore_funcs(
+        "moe_metrics",
+        lambda: None,
+        lambda state: clear_aux_losses_tracker(),
+    )
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1819,49 +1838,6 @@ def setup_model_and_optimizer(
         exit()
 
     return model, optimizer, opt_param_scheduler
-
-
-# persistent MoE router buffers
-_RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta')
-
-def _save_router_state(model):
-    state = {}
-    for chunk_idx, model_chunk in enumerate(model):
-        for name, module in get_attr_wrapped_model(model_chunk, 'named_modules')():
-            for buf_name in _RERUN_ROUTER_BUFFERS:
-                buf = getattr(module, buf_name, None)
-                if buf is not None:
-                    state[(chunk_idx, name, buf_name)] = buf.detach().clone()
-    return state
-
-def _restore_router_state(model, state):
-    for chunk_idx, model_chunk in enumerate(model):
-        for name, module in get_attr_wrapped_model(model_chunk, 'named_modules')():
-            for buf_name in _RERUN_ROUTER_BUFFERS:
-                buf = getattr(module, buf_name, None)
-                saved = state.get((chunk_idx, name, buf_name))
-                if buf is not None and saved is not None:
-                    buf.copy_(saved)
-
-def _register_router_rerun_state(model):
-    """Add the MoE router buffers to the rerun state machine's save/restore hooks"""
-    rerun_state_machine = get_rerun_state_machine()
-    prev_save = rerun_state_machine.state_save_func
-    prev_restore = rerun_state_machine.state_restore_func
-
-    def state_save_func():
-        return {
-            'prev': prev_save() if prev_save is not None else None,
-            'router': _save_router_state(model),
-        }
-
-    def state_restore_func(state_dict):
-        if prev_restore is not None and state_dict['prev'] is not None:
-            prev_restore(state_dict['prev'])
-        _restore_router_state(model, state_dict['router'])
-
-    rerun_state_machine.state_save_func = state_save_func
-    rerun_state_machine.state_restore_func = state_restore_func
 
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
@@ -3310,6 +3286,9 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
+        args.skipped_train_samples += (
+            iteration_sequences * get_rerun_state_machine().discarded_batches
+        )
         num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
