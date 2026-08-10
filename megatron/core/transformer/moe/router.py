@@ -27,6 +27,8 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+# persistent MoE buffers for rerun state machine
+_RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta')
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -274,6 +276,19 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+
+    def get_router_rerun_state(self):
+        """Snapshot the router state that a replayed iteration must start from."""
+        return {
+            n: buf.detach().clone()
+            for n in _RERUN_ROUTER_BUFFERS
+            if (buf := getattr(self, n, None)) is not None
+        }
+
+    def set_router_rerun_state(self, state):
+        """Restore the snapshot taken by get_rerun_state()."""
+        for n, saved in state.items():
+            getattr(self, n).copy_(saved)
 
     def _maintain_float32_expert_bias(self):
         """

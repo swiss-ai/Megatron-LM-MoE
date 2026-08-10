@@ -22,7 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_model_config, internal_api, is_te_min_version
+from megatron.core.utils import get_model_config, internal_api, is_te_min_version, get_attr_wrapped_model
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -1523,6 +1523,18 @@ def get_moe_layer_wise_logging_tracker() -> dict:
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
+def save_router_state(model):
+    return [
+        (m, m.get_router_rerun_state())
+        for chunk in model
+        for m in get_attr_wrapped_model(chunk, 'modules')()
+        if hasattr(m, 'get_router_rerun_state')
+    ]
+
+def restore_router_state(state):
+    for module, saved in state:
+        if hasattr(module, 'set_router_rerun_state'):
+            module.set_router_rerun_state(saved)
 
 @internal_api
 class RandomSTE(torch.autograd.Function):
