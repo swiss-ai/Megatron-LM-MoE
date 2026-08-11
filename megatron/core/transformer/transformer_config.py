@@ -417,6 +417,13 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    shifted_log_attention_gating: bool = False
+    """If True, the attention output gate uses the LGLU shifted-log gate
+    ``g(x) = sign(x - 3) * ln(|x - 3| + 1) + ln 4`` (a signed-log gate centered at ``x = 3`` that
+    passes through the origin, ``g(0) = 0``) in place of ``sigmoid(x)``. Only changes the gate
+    *function*; the gate projection itself is created by ``attention_output_gate``, which this
+    requires. Matches ``lglu_act`` in ``megatron.core.activations``."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -2240,6 +2247,13 @@ class TransformerConfig(ModelParallelConfig):
         if self.fused_single_qkv_rope:
             if self.attention_output_gate:
                 raise ValueError("fused_single_qkv_rope does not support gated attention for now.")
+
+        if self.shifted_log_attention_gating and not self.attention_output_gate:
+            raise ValueError(
+                "shifted_log_attention_gating requires attention_output_gate: it only swaps the "
+                "gate function (sigmoid -> LGLU shifted-log); the gate projection is created by "
+                "attention_output_gate. Pass --attention-output-gate as well."
+            )
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")

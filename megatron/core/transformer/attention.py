@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -1268,7 +1269,10 @@ class Attention(MegatronModule, ABC):
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            if self.config.shifted_log_attention_gating:
+                core_attn_out = self._apply_shifted_log_output_gate(core_attn_out, gate)
+            else:
+                core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -1291,6 +1295,22 @@ class Attention(MegatronModule, ABC):
         gate = gate.contiguous()
         gate = gate.view(*x.shape)
         x = x * torch.sigmoid(gate.float())
+        x = x.to(x_dtype)
+        return x
+
+    @jit_fuser
+    def _apply_shifted_log_output_gate(self, x, gate):
+        # LGLU shifted-log gate: g(x) = sign(x - 3) * ln(|x - 3| + 1) + ln 4, a signed-log gate
+        # centered at x = 3 that passes through the origin (g(0) = 0). Replaces sigmoid in the
+        # output gate when config.shifted_log_attention_gating is set. Inlined (rather than calling
+        # lglu_act) to stay self-contained under jit_fuser / avoid a self.config read in the
+        # scripted body; must stay in sync with lglu_act in megatron.core.activations.
+        x_dtype = x.dtype
+        gate = gate.contiguous()
+        gate = gate.view(*x.shape)
+        u = gate.float() - 3.0
+        gate = torch.sign(u) * torch.log(1 + u.abs()) + math.log(4.0)
+        x = x * gate
         x = x.to(x_dtype)
         return x
 
