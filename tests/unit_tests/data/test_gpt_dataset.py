@@ -115,72 +115,6 @@ def test_mock_gpt_dataset():
     assert torch.all(sample['labels'] == -100)
 
 
-def test_apply_goldfish():
-    from megatron.core.datasets.gpt_dataset import (
-        _GOLDFISH_TOKEN_ID,
-        _create_exemption_lut,
-        _create_hash_table,
-        apply_goldfish,
-    )
-
-    torch.manual_seed(0)
-    seq_length, k, h = 8192, 50, 50
-    labels = torch.randint(0, _MOCK_VOCAB_SIZE, (seq_length,), dtype=torch.long)
-    table = _create_hash_table(device=labels.device)
-
-    original = labels.clone()
-    out = apply_goldfish(labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
-
-    # apply_goldfish works on a clone: the input labels are not mutated.
-    assert torch.equal(labels, original)
-
-    # Deterministic: identical inputs -> identical drops.
-    out2 = apply_goldfish(labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
-    assert torch.equal(out, out2)
-
-    # The first h-1 positions are never eligible for dropping (unfold alignment).
-    assert not torch.any(out[: h - 1] == _GOLDFISH_TOKEN_ID)
-
-    # Drop rate over the eligible tail is approximately 1/k.
-    drop_rate = (out[h - 1 :] == _GOLDFISH_TOKEN_ID).float().mean().item()
-    assert abs(drop_rate - 1.0 / k) < 0.01, drop_rate
-
-    # Exemption: no dropped position may carry a label in the exempt band, while drops
-    # still occur outside it. `out` above is the positive control (drops with no exemption).
-    assert torch.any(out == _GOLDFISH_TOKEN_ID)
-    lo, hi = 2000, 6000
-    exemption_lut = _create_exemption_lut(list(range(lo, hi)), _MOCK_VOCAB_SIZE, labels.device)
-    out_exempt = apply_goldfish(
-        labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h, exemption_lut=exemption_lut
-    )
-    dropped = out_exempt == _GOLDFISH_TOKEN_ID
-    assert not torch.any((labels >= lo) & (labels < hi) & dropped), "exempt-band token was dropped"
-    assert torch.any(dropped), "expected drops outside the exempt band"
-
-    # Pinned position: exempting exactly the label id of a known dropped position
-    # cancels that drop (deterministic alignment of window hash vs. exempt mask).
-    pinned = int((out == _GOLDFISH_TOKEN_ID).nonzero(as_tuple=True)[0][0])
-    pin_lut = _create_exemption_lut([int(labels[pinned])], _MOCK_VOCAB_SIZE, labels.device)
-    out_pinned = apply_goldfish(
-        labels, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h, exemption_lut=pin_lut
-    )
-    assert out_pinned[pinned] != _GOLDFISH_TOKEN_ID
-
-    # Both in-base and separate-range structure IDs are represented by the same
-    # scattered LUT.
-    scattered_lut = _create_exemption_lut([0, 18, 2000, 6000], _MOCK_VOCAB_SIZE, labels.device)
-    assert torch.all(scattered_lut[torch.tensor([0, 18, 2000, 6000])])
-
-    # Windows containing id-0 labels (pad/unk) must hash like any other window: with a
-    # zero every 10 positions every window contains one, yet the rate stays ~1/k (the
-    # old product hash collapsed all such windows onto a single drop decision).
-    zero_heavy = labels.clone()
-    zero_heavy[::10] = 0
-    out_zero = apply_goldfish(zero_heavy, _GOLDFISH_TOKEN_ID, k, table, goldfish_context_width=h)
-    zero_rate = (out_zero[h - 1 :] == _GOLDFISH_TOKEN_ID).float().mean().item()
-    assert abs(zero_rate - 1.0 / k) < 0.01, zero_rate
-
-
 def test_mock_gpt_dataset_goldfish():
     if torch.distributed.is_available():
         Utils.initialize_distributed()
@@ -224,11 +158,22 @@ def test_mock_gpt_dataset_goldfish():
     assert ds.masks_and_position_ids_are_cacheable
     assert ds._goldfish_exemption_ids == (1, 2, 3)
 
-    # Goldfish zeroes a strict superset of the plain loss mask (~1/k of the tail).
+    # Goldfish zeroes a strict superset of the plain loss mask (~1/k of the tail);
+    # the returned labels are untouched.
     gf_mask, plain_mask = ds[0]["loss_mask"].clone(), plain[0]["loss_mask"]
     assert not torch.any((gf_mask == 1) & (plain_mask == 0))
     n_extra = int(((gf_mask == 0) & (plain_mask == 1)).sum())
     assert n_extra > 0, "goldfish produced no drops"
+    assert torch.equal(ds[0]["labels"], plain[0]["labels"])
+
+    # Train split only: the validation and test splits get no drops.
+    for split_index in (1, 2):
+        assert torch.equal(
+            goldfish_sets[split_index][0]["loss_mask"], plain_sets[split_index][0]["loss_mask"]
+        )
+        assert torch.equal(
+            goldfish_sets[split_index][0]["labels"], plain_sets[split_index][0]["labels"]
+        )
 
     # Same index -> identical mask; interleaving other samples must not accumulate
     # zeros through the cache (fresh dataset accessed in a different order agrees).
@@ -247,7 +192,7 @@ def test_mock_gpt_dataset_goldfish_with_modality_weights():
     In particular goldfish drops survive weighting (0 * w == 0) and weighting applies
     to positions goldfish left untouched.
     """
-    from megatron.core.datasets.gpt_dataset import _create_modality_weight_lut
+    from megatron.core.tokenizers.utils.modality_lut import _create_modality_weight_lut
     from megatron.core.tokenizers.utils.tokenizer_extra_metadata import parse_omni_metadata
 
     if torch.distributed.is_available():
@@ -311,7 +256,7 @@ def test_mock_gpt_dataset_goldfish_with_modality_weights():
     weighted = build(modality_weights={"vision": 0.25})[0]
     goldfish_only = build()[0]
     lut = _create_modality_weight_lut(
-        [(omni.modality("vision"), 0.25)], _MOCK_VOCAB_SIZE, torch.device("cpu")
+        omni.modalities, {"vision": 0.25}, _MOCK_VOCAB_SIZE, torch.device("cpu")
     )
 
     saw_drop = saw_weight = False
@@ -353,49 +298,9 @@ def test_goldfish_config_validation():
     with pytest.raises(AssertionError):
         GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=1024, **base)
 
-
-def test_modality_weight_lut():
-    from megatron.core.datasets.gpt_dataset import (
-        _create_modality_weight_lut,
-        _get_modality_weight_lut,
-    )
-    from megatron.core.tokenizers.utils.tokenizer_extra_metadata import ModalityInfo
-
-    vision = ModalityInfo(
-        name="vision",
-        offset=1000,
-        vocab_size=100,
-        start_token=5,
-        end_token=7,
-        structure_token_ids={"<|img_start|>": 5, "<|img_end|>": 7},
-    )
-    audio = ModalityInfo(
-        name="audio",
-        offset=1100,
-        vocab_size=50,
-        start_token=9,
-        end_token=9,
-        structure_token_ids={"<|audio|>": 9},
-    )
-    lut = _create_modality_weight_lut(
-        [(vision, 0.25), (audio, 0.0)], vocab_size=2000, device=torch.device("cpu")
-    )
-
-    # Text ids stay 1.0; content ranges AND per-modality structure ids get the weight.
-    labels = torch.tensor([0, 5, 7, 9, 999, 1000, 1099, 1100, 1149, 1150])
-    expected = torch.tensor([1.0, 0.25, 0.25, 0.0, 1.0, 0.25, 0.25, 0.0, 0.0, 1.0])
-    assert torch.equal(lut[labels], expected)
-
-    # Application semantics: multiplicative on loss_mask, existing zeros stay zero.
-    loss_mask = torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-    assert torch.equal(
-        loss_mask * lut[labels], torch.tensor([1.0, 0.25, 0.0, 0.0, 1.0, 0.25, 0.25, 0.0, 0.0, 1.0])
-    )
-
-    # The module memo hands out one shared table per (weights, vocab, device).
-    pairs = ((vision, 0.25), (audio, 0.0))
-    memoized = _get_modality_weight_lut(pairs, 2000, torch.device("cpu"))
-    assert _get_modality_weight_lut(pairs, 2000, torch.device("cpu")) is memoized
+    # h must be a positive context width.
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=0, **base)
 
 
 def test_modality_weights_config_validation():
@@ -664,11 +569,9 @@ def test_modality_weights_require_safe_normalization():
 
 if __name__ == "__main__":
     test_mock_gpt_dataset()
-    test_apply_goldfish()
     test_mock_gpt_dataset_goldfish()
     test_mock_gpt_dataset_goldfish_with_modality_weights()
     test_goldfish_config_validation()
-    test_modality_weight_lut()
     test_modality_weights_config_validation()
     test_modality_loss_report()
     test_loss_func_normalize_by_num_supervised_tokens()

@@ -437,6 +437,10 @@ def core_gpt_dataset_config_from_args(args):
         "--vision-weight/--audio-weight are not supported with --sft: SFTDataset does "
         "not apply modality weights to its loss mask."
     )
+    assert not (args.goldfish_loss and args.sft), (
+        "--goldfish-loss is not supported with --sft: SFTDataset builds its own loss "
+        "mask and would silently skip goldfish dropping."
+    )
 
     # add FIM args to the config
     if args.fim_data:

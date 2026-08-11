@@ -3494,12 +3494,13 @@ def _add_data_args(parser):
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
     group.add_argument('--goldfish-loss', action='store_true',
                        help='Enable Goldfish loss during pretraining: deterministically drop '
-                            '~1/k of tokens from the loss to mitigate verbatim memorization.')
+                            '~1/k of tokens from the loss to mitigate verbatim memorization. '
+                            'Train split only. Supported by pretrain_gpt.py only.')
     group.add_argument('--goldfish-k', type=int, default=50,
                        help='Goldfish drop factor k; drop probability is 1/k.')
     group.add_argument('--goldfish-h', type=int, default=50,
-                       help='Goldfish context width: number of preceding tokens hashed to '
-                            'determine masking.')
+                       help='Goldfish context width: the h labels ending at (and including) '
+                            'a position are hashed to decide its drop.')
     # Keep names in sync with MODALITY_WEIGHT_NAMES in pretrain_gpt.py.
     for _modality in ("vision", "audio"):
         group.add_argument(f'--{_modality}-weight', type=float, default=1.0,
