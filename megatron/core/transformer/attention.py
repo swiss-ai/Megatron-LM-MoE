@@ -1271,6 +1271,8 @@ class Attention(MegatronModule, ABC):
             nvtx_range_push(suffix="output_gate")
             if self.config.shifted_log_attention_gating:
                 core_attn_out = self._apply_shifted_log_output_gate(core_attn_out, gate)
+            elif self.config.shifted_softsign_attention_gating:
+                core_attn_out = self._apply_shifted_softsign_output_gate(core_attn_out, gate)
             else:
                 core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
@@ -1310,6 +1312,21 @@ class Attention(MegatronModule, ABC):
         gate = gate.view(*x.shape)
         u = gate.float() - 3.0
         gate = torch.sign(u) * torch.log(1 + u.abs()) + math.log(4.0)
+        x = x * gate
+        x = x.to(x_dtype)
+        return x
+
+    @jit_fuser
+    def _apply_shifted_softsign_output_gate(self, x, gate):
+        # Shifted-softsign gate: g(x) = softsign(x - 3) + 1 = (x - 3) / (1 + |x - 3|) + 1. A bounded
+        # (0, 2), strictly monotonic gate centered at g(3) = 1 -- a positive (never sign-flipping)
+        # counterpart to the shifted-log gate; does not pass through the origin (g(0) = 0.25). Gate
+        # math inlined to stay self-contained under jit_fuser. Parallels the SSSGLU softsign family.
+        x_dtype = x.dtype
+        gate = gate.contiguous()
+        gate = gate.view(*x.shape)
+        u = gate.float() - 3.0
+        gate = u / (1 + u.abs()) + 1.0
         x = x * gate
         x = x.to(x_dtype)
         return x

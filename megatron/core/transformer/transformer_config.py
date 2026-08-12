@@ -424,6 +424,16 @@ class TransformerConfig(ModelParallelConfig):
     *function*; the gate projection itself is created by ``attention_output_gate``, which this
     requires. Matches ``lglu_act`` in ``megatron.core.activations``."""
 
+    shifted_softsign_attention_gating: bool = False
+    """If True, the attention output gate uses the shifted-softsign gate
+    ``g(x) = softsign(x - 3) + 1 = (x - 3) / (1 + |x - 3|) + 1`` (a bounded, strictly monotonic
+    gate in ``(0, 2)`` centered at ``g(3) = 1``; positive everywhere so it never flips the sign of
+    the attention output, and does NOT pass through the origin, ``g(0) = 0.25``) in place of
+    ``sigmoid(x)``. Only changes the gate *function*; the gate projection itself is created by
+    ``attention_output_gate``, which this requires. Mutually exclusive with
+    ``shifted_log_attention_gating``. Parallels the SSSGLU softsign family in
+    ``megatron.core.activations``."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -2253,6 +2263,19 @@ class TransformerConfig(ModelParallelConfig):
                 "shifted_log_attention_gating requires attention_output_gate: it only swaps the "
                 "gate function (sigmoid -> LGLU shifted-log); the gate projection is created by "
                 "attention_output_gate. Pass --attention-output-gate as well."
+            )
+
+        if self.shifted_softsign_attention_gating and not self.attention_output_gate:
+            raise ValueError(
+                "shifted_softsign_attention_gating requires attention_output_gate: it only swaps "
+                "the gate function (sigmoid -> shifted-softsign); the gate projection is created "
+                "by attention_output_gate. Pass --attention-output-gate as well."
+            )
+
+        if self.shifted_log_attention_gating and self.shifted_softsign_attention_gating:
+            raise ValueError(
+                "shifted_log_attention_gating and shifted_softsign_attention_gating are mutually "
+                "exclusive (both replace the attention output-gate function); enable only one."
             )
 
         if self.multi_latent_attention and self.rotary_interleaved:
