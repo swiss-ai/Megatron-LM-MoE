@@ -98,8 +98,9 @@ def make_sharded_optimizer_tensor(
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
 
     assert tuple(optim_param.shape) == model_param.local_shape, (
-        f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape '
-        f'({model_param.local_shape})'
+        f'Optimizer shape ({tuple(optim_param.shape)}) does not match model shape '
+        f'({model_param.local_shape}) for param key={getattr(model_param, "key", "?")!r} '
+        f'(prefix={prefix!r})'
     )
     sh_ten = replace(
         model_param, key=f'{prefix}.{model_param.key}', data=optim_param, dtype=optim_param.dtype

@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
@@ -211,11 +211,13 @@ class HyperConnectionModule(MegatronModule):
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
-        mark_keep_in_fp32(self.mapping_proj.weight)
-        mark_keep_in_fp32(self.alpha_pre)
-        mark_keep_in_fp32(self.alpha_post)
-        mark_keep_in_fp32(self.alpha_res)
-        mark_keep_in_fp32(self.bias)
+        # NOTE: mHC params are kept in the model's compute dtype (bf16) like every other
+        # parameter, NOT marked keep_in_fp32. Marking them fp32 would place them in the
+        # optimizer's fp32_from_fp32 param group, which the mixed-precision optimizer's
+        # sharded_state_dict does not map (it builds the map from float16_groups only) —
+        # breaking dist-checkpoint save. Numerical stability is preserved because the mapping
+        # computation explicitly upcasts weights/activations to fp32 in-compute, and the
+        # optimizer master weights are fp32 regardless.
         self.norm_eps = 1e-6
 
         # Native-only backend (this fork drops the cuTile/cuDNN fused kernels).

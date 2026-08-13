@@ -24,11 +24,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.module import (
-    GraphableMegatronModule,
-    MegatronModule,
-    mark_keep_in_fp32,
-)
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -391,13 +387,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # mHC learned output contraction: n-stream [s, b, n*C] -> 1-stream [s, b, C],
             # applied just before the final layer norm on the stage that owns it.
             if self.config.enable_hyper_connections:
+                # Kept in the model compute dtype (bf16), not marked keep_in_fp32: fp32 model
+                # params land in the optimizer's fp32_from_fp32 group, which the mixed-precision
+                # sharded_state_dict does not map, breaking dist-checkpoint save. learned_output_contract
+                # upcasts these to fp32 in-compute, and optimizer master weights are fp32 anyway.
                 hc_mult = self.config.num_residual_streams
                 hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = mark_keep_in_fp32(
-                    torch.nn.Parameter(torch.randn(hc_mult, hc_dim))
-                )
-                self.hc_head_base = mark_keep_in_fp32(torch.nn.Parameter(torch.zeros(hc_mult)))
-                self.hc_head_scale = mark_keep_in_fp32(torch.nn.Parameter(torch.ones(1)))
+                self.hc_head_fn = torch.nn.Parameter(torch.randn(hc_mult, hc_dim))
+                self.hc_head_base = torch.nn.Parameter(torch.zeros(hc_mult))
+                self.hc_head_scale = torch.nn.Parameter(torch.ones(1))
                 torch.nn.init.xavier_uniform_(self.hc_head_fn)
                 if self.config.sequence_parallel:
                     setattr(self.hc_head_fn, 'sequence_parallel', True)
