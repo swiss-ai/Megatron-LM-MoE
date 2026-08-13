@@ -22,7 +22,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
-    learned_output_contract,
+    HyperConnectionOutputContract,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -387,20 +387,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # mHC learned output contraction: n-stream [s, b, n*C] -> 1-stream [s, b, C],
             # applied just before the final layer norm on the stage that owns it.
             if self.config.enable_hyper_connections:
-                # Kept in the model compute dtype (bf16), not marked keep_in_fp32: fp32 model
-                # params land in the optimizer's fp32_from_fp32 group, which the mixed-precision
-                # sharded_state_dict does not map, breaking dist-checkpoint save. learned_output_contract
-                # upcasts these to fp32 in-compute, and optimizer master weights are fp32 anyway.
-                hc_mult = self.config.num_residual_streams
-                hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = torch.nn.Parameter(torch.randn(hc_mult, hc_dim))
-                self.hc_head_base = torch.nn.Parameter(torch.zeros(hc_mult))
-                self.hc_head_scale = torch.nn.Parameter(torch.ones(1))
-                torch.nn.init.xavier_uniform_(self.hc_head_fn)
-                if self.config.sequence_parallel:
-                    setattr(self.hc_head_fn, 'sequence_parallel', True)
-                    setattr(self.hc_head_base, 'sequence_parallel', True)
-                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+                # A submodule (not bare nn.Parameter attributes) so its params are emitted by
+                # sharded_state_dict (named_children) and matched by the optimizer's sharded
+                # checkpoint. Params stay in the model compute dtype (bf16); learned_output_contract
+                # upcasts to fp32 in-compute and the optimizer master weights are fp32 anyway.
+                self.hc_output_contract = HyperConnectionOutputContract(self.config)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -880,14 +871,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # mHC: contract n-stream -> 1-stream on the stage that owns the final layer norm,
         # just before applying it. [s, b, n*C] -> [s, b, C].
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            hidden_states = self.hc_output_contract(hidden_states)
 
         # Final layer norm.
         if self.final_layernorm is not None:

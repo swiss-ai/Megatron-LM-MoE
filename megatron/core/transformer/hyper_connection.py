@@ -795,6 +795,43 @@ class HyperConnectionModule(MegatronModule):
 # ==================== Checkpoint utilities for mHC ====================
 
 
+class HyperConnectionOutputContract(MegatronModule):
+    """Learned n-stream -> 1-stream output contraction (mHC), applied once at the block's
+    final-layernorm stage.
+
+    Kept as a module (rather than bare ``nn.Parameter`` attributes on TransformerBlock) so its
+    parameters appear in ``named_children`` / ``named_modules`` and are therefore emitted by
+    ``TransformerBlock.sharded_state_dict`` — otherwise they are optimizer-tracked but missing
+    from the sharded checkpoint, which fails dist-checkpoint save with ``KeyError`` on the
+    orphaned param id.
+    """
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__(config)
+        self.n = config.num_residual_streams
+        hc_dim = config.hidden_size * self.n
+        self.head_fn = nn.Parameter(torch.randn(self.n, hc_dim))
+        self.head_base = nn.Parameter(torch.zeros(self.n))
+        self.head_scale = nn.Parameter(torch.ones(1))
+        nn.init.xavier_uniform_(self.head_fn)
+        # Non-TP-aware params: all-reduce grads across TP when sequence parallel is enabled.
+        if config.sequence_parallel:
+            setattr(self.head_fn, 'sequence_parallel', True)
+            setattr(self.head_base, 'sequence_parallel', True)
+            setattr(self.head_scale, 'sequence_parallel', True)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Contract [s, b, n*C] -> [s, b, C]."""
+        return learned_output_contract(
+            hidden_states,
+            self.head_fn,
+            self.head_base,
+            self.head_scale,
+            self.n,
+            self.config.layernorm_epsilon,
+        )
+
+
 class HyperConnectionCheckpoint:
     """
     Checkpoint utility for mHC intermediate activations.
