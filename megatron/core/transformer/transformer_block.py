@@ -20,7 +20,15 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    MegatronModule,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -288,6 +296,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.post_process = post_process
         self.vp_stage = vp_stage
 
+        # mHC (Manifold-Constrained Hyper-Connections): number of residual streams (n).
+        self.num_residual_streams = config.num_residual_streams
+
         # required for pipeline parallel schedules
         self.input_tensor = None
 
@@ -377,6 +388,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            # mHC learned output contraction: n-stream [s, b, n*C] -> 1-stream [s, b, C],
+            # applied just before the final layer norm on the stage that owns it.
+            if self.config.enable_hyper_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = mark_keep_in_fp32(
+                    torch.nn.Parameter(torch.randn(hc_mult, hc_dim))
+                )
+                self.hc_head_base = mark_keep_in_fp32(torch.nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(torch.nn.Parameter(torch.ones(1)))
+                torch.nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -751,6 +777,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # mHC: expand 1-stream -> n-stream at the start of the block. Only the first PP stage
+        # expands; later stages receive the n-stream residual [s, b, n*C] from the previous stage.
+        if self.config.enable_hyper_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -845,6 +878,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+
+        # mHC: contract n-stream -> 1-stream on the stage that owns the final layer norm,
+        # just before applying it. [s, b, n*C] -> [s, b, C].
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
         # Final layer norm.
         if self.final_layernorm is not None:

@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import dataclasses
 import warnings
 from typing import Optional, Union
 
@@ -33,7 +34,9 @@ from megatron.core.transformer.transformer_block import (
     get_num_layers_to_build,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -371,10 +374,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
 @copy_signature(get_gpt_layer_with_transformer_engine_submodules)
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
-    return ModuleSpec(
-        module=TransformerLayer,
-        submodules=get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs),
-    )
+    enable_hc = kwargs.pop('enable_hyper_connection', False)
+    submodules = get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs)
+    return _maybe_wrap_hyper_connection(submodules, enable_hc)
 
 
 def get_gpt_layer_local_submodules(
@@ -509,9 +511,45 @@ def get_gpt_layer_local_submodules(
 @copy_signature(get_gpt_layer_local_submodules)
 def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
-    return ModuleSpec(
-        module=TransformerLayer, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
+    enable_hc = kwargs.pop('enable_hyper_connection', False)
+    submodules = get_gpt_layer_local_submodules(*args, **kwargs)
+    return _maybe_wrap_hyper_connection(submodules, enable_hc)
+
+
+def _maybe_wrap_hyper_connection(
+    submodules: TransformerLayerSubmodules, enable_hc: bool
+) -> ModuleSpec:
+    """Return a ModuleSpec, injecting mHC modules and selecting the mHC layer class if enabled.
+
+    When ``enable_hc`` is True the self-attention and MLP hyper-connection slots are populated
+    with :class:`HyperConnectionModule` and the layer class is
+    :class:`HyperConnectionTransformerLayer`; otherwise a plain :class:`TransformerLayer` spec is
+    returned unchanged. Cross-attention hyper connections are intentionally left as IdentityOp.
+    """
+    if enable_hc:
+        submodules.self_attention_hyper_connection = HyperConnectionModule
+        submodules.mlp_hyper_connection = HyperConnectionModule
+        return ModuleSpec(module=HyperConnectionTransformerLayer, submodules=submodules)
+    return ModuleSpec(module=TransformerLayer, submodules=submodules)
+
+
+def _strip_hyper_connection(layer_spec: ModuleSpec) -> ModuleSpec:
+    """Return a copy of ``layer_spec`` with mHC removed (plain TransformerLayer).
+
+    MTP layers consume the contracted 1-stream hidden states, so they must run as plain
+    :class:`TransformerLayer`. When the reused decoder layer spec is an mHC layer, this reverts
+    the layer class to :class:`TransformerLayer` and resets the hyper-connection submodule slots to
+    ``IdentityOp`` (copying, so the shared decoder spec is not mutated). Non-mHC specs pass through.
+    """
+    if layer_spec.module is not HyperConnectionTransformerLayer:
+        return layer_spec
+    new_submodules = dataclasses.replace(
+        layer_spec.submodules,
+        self_attention_hyper_connection=IdentityOp,
+        cross_attention_hyper_connection=IdentityOp,
+        mlp_hyper_connection=IdentityOp,
     )
+    return dataclasses.replace(layer_spec, module=TransformerLayer, submodules=new_submodules)
 
 
 def _get_mlp_module_spec(
@@ -623,6 +661,7 @@ def get_gpt_decoder_layer_specs(
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -638,6 +677,7 @@ def get_gpt_decoder_layer_specs(
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -670,6 +710,7 @@ def get_gpt_decoder_layer_specs(
             kitchen_attention_backend=config.kitchen_attention_backend,
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -684,6 +725,7 @@ def get_gpt_decoder_layer_specs(
             kitchen_attention_backend=config.kitchen_attention_backend,
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -810,10 +852,17 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
-    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+    elif isinstance(spec, ModuleSpec) and spec.module in (
+        TransformerLayer,
+        HyperConnectionTransformerLayer,
+    ):
         transformer_layer_spec = spec
     else:
         raise ValueError(f"Invalid spec: {spec}")
+
+    # mHC: MTP layers operate on the contracted 1-stream hidden states, so strip hyper
+    # connections from the reused decoder layer spec (an HC layer would expect n*C input).
+    transformer_layer_spec = _strip_hyper_connection(transformer_layer_spec)
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec=transformer_layer_spec, backend=backend

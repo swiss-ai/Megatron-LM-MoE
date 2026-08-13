@@ -1264,12 +1264,59 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    ####################
+    # Hyper-Connection (mHC) Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC (Manifold-Constrained Hyper-Connections) residual connections.
+
+    Replaces the standard residual with an n-stream residual `[s, b, n*C]` and
+    per-sublayer learned mappings (H_pre / H_post / H_res). Requires RMSNorm-style
+    normalization on the layers. This is the native (non-fused) port; the upstream
+    cuTile/cuDNN fused kernels and selective-recompute path are not included."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in the mHC paper). Only used when
+    ``enable_hyper_connections`` is True."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for the doubly-stochastic H_res projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of the mHC gating factor (alpha in the paper)."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+
+        # mHC (Manifold-Constrained Hyper-Connections) validation.
+        if self.enable_hyper_connections:
+            if not isinstance(self.num_residual_streams, int) or self.num_residual_streams < 1:
+                raise ValueError(
+                    "num_residual_streams must be a positive integer when "
+                    "enable_hyper_connections=True, got "
+                    f"{self.num_residual_streams}."
+                )
+            if (
+                not isinstance(self.mhc_sinkhorn_iterations, int)
+                or self.mhc_sinkhorn_iterations < 1
+            ):
+                raise ValueError(
+                    "mhc_sinkhorn_iterations must be a positive integer when "
+                    "enable_hyper_connections=True, got "
+                    f"{self.mhc_sinkhorn_iterations}."
+                )
+            # The inference_optimized layer spec path does not thread hyper connections, so the
+            # block would expand to n-stream while the layers expect a single stream. This native
+            # mHC port targets the TE and local specs.
+            if getattr(self, "transformer_impl", None) == "inference_optimized":
+                raise NotImplementedError(
+                    "enable_hyper_connections (mHC) is not supported with "
+                    "transformer_impl='inference_optimized' in this port."
+                )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

@@ -246,6 +246,13 @@ class TransformerLayerSubmodules:
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
     post_mlp_layernorm: LayerNormBuilder = IdentityOp
 
+    # mHC (Manifold-Constrained Hyper-Connections) modules. When populated (and used with
+    # HyperConnectionTransformerLayer), these wrap self-attention / MLP with the n-stream
+    # aggregate/expand/residual-mix mappings. Cross-attention HC is not supported.
+    self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
+    cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
+    mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
+
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
@@ -1675,3 +1682,210 @@ class MoETransformerLayer(TransformerLayer):
                 return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
         else:
             return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
+
+
+class HyperConnectionTransformerLayer(TransformerLayer):
+    """A transformer layer with Manifold-Constrained Hyper-Connections (mHC).
+
+    Extends :class:`TransformerLayer` by wrapping self-attention and the MLP with
+    hyper-connection modules. The layer operates on n-stream hidden states of shape
+    ``[s, b, n*C]``: before each sub-layer the streams are aggregated to a single stream
+    (``H_pre``); after the sub-layer the output is expanded back to n streams and mixed
+    with the (doubly-stochastic ``H_res``-permuted) residual streams via
+    ``fused_h_res_h_post_bda`` (which also performs the bias-dropout-add).
+
+    This is the native port for this fork: the upstream selective-recompute
+    (``mhc_recompute_manager``) and CUDA-graph partial-capture paths are intentionally not
+    wired, so the recompute manager is always ``None``. Cross-attention hyper-connections,
+    KEEL, and sandwich-norm are not supported (they also rewrite the residual add and would
+    conflict with the mHC merge).
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            hidden_dropout=hidden_dropout,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            is_mtp_layer=is_mtp_layer,
+            add_layer_offset=add_layer_offset,
+            pp_layer_offset=pp_layer_offset,
+        )
+
+        if submodules.cross_attention_hyper_connection is not IdentityOp:
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support cross-attention hyper "
+                "connections. Use IdentityOp for cross_attention_hyper_connection."
+            )
+        assert submodules.self_attention_hyper_connection is not IdentityOp, (
+            "HyperConnectionTransformerLayer requires self_attention_hyper_connection. "
+            "Use TransformerLayer instead if hyper connections are not needed."
+        )
+        assert submodules.mlp_hyper_connection is not IdentityOp, (
+            "HyperConnectionTransformerLayer requires mlp_hyper_connection. "
+            "Use TransformerLayer instead if hyper connections are not needed."
+        )
+        if getattr(self, "keel", False):
+            raise ValueError(
+                "mHC (enable_hyper_connections) is incompatible with KEEL: both rewrite the "
+                "residual add."
+            )
+        assert isinstance(self.post_self_attn_layernorm, IdentityOp) and isinstance(
+            self.post_mlp_layernorm, IdentityOp
+        ), (
+            "mHC (enable_hyper_connections) is incompatible with sandwich norm "
+            "(post_self_attn_layernorm / post_mlp_layernorm); the mHC merge owns the residual add."
+        )
+
+        self.self_attention_hyper_connection = build_module(
+            submodules.self_attention_hyper_connection,
+            config=self.config,
+            layer_number=self.layer_number,
+        )
+        self.mlp_hyper_connection = build_module(
+            submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
+        )
+
+    def _forward_attention(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Self-attention with mHC aggregate (pre) and expand/residual-mix (post).
+
+        ``hidden_states`` enters and leaves as n-stream ``[s, b, n*C]``.
+        """
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        # mHC pre: aggregate n streams -> 1 stream; stash residual streams and mappings.
+        nvtx_range_push(suffix="self_attention_hyper_connection")
+        aggregated, self_attn_h_res, self_attn_hc_h_post, residual = (
+            self.self_attention_hyper_connection(hidden_states)
+        )
+        nvtx_range_pop(suffix="self_attention_hyper_connection")
+
+        # Input layernorm on the aggregated single stream.
+        input_layernorm_output = apply_module(self.input_layernorm)(aggregated)
+        if isinstance(input_layernorm_output, tuple):
+            input_layernorm_output = input_layernorm_output[0]
+
+        # Self attention.
+        nvtx_range_push(suffix="self_attention")
+        attention_output_with_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        nvtx_range_pop(suffix="self_attention")
+
+        # mHC post: expand the attention output back to n streams, mix the residual streams
+        # (H_res) and perform the bias-dropout-add in one call.
+        nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
+                self_attn_h_res,
+                residual,
+                self_attn_hc_h_post,
+                attention_output_with_bias,
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+            )
+        nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
+
+        # Cross-attention is not supported with mHC (asserted at construction); pass context
+        # through unchanged for API compatibility.
+        return hidden_states, context
+
+    def _forward_mlp(
+        self,
+        hidden_states: Tensor,
+        inference_context: BaseInferenceContext | None = None,
+        padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        """MLP (dense or MoE) with mHC aggregate (pre) and expand/residual-mix (post).
+
+        ``hidden_states`` enters and leaves as n-stream ``[s, b, n*C]``.
+        """
+        # mHC pre for the MLP sub-layer.
+        nvtx_range_push(suffix="mlp_hyper_connection")
+        aggregated, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(hidden_states)
+        nvtx_range_pop(suffix="mlp_hyper_connection")
+
+        # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical stability of
+        # the mixing weights. A dense TE layernorm-linear expects params_dtype input, so restore
+        # it for non-MoE layers (MoE layers absorb the dtype in their own routing path).
+        if not self.is_moe_layer and aggregated.dtype != self.config.params_dtype:
+            aggregated = aggregated.to(self.config.params_dtype)
+
+        pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(aggregated)
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            pre_mlp_layernorm_output = pre_mlp_layernorm_output[0]
+
+        nvtx_range_push(suffix="mlp")
+        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+        nvtx_range_pop(suffix="mlp")
+
+        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                mlp_output_with_bias,
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+            )
+        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+        return output
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Produce n-stream ``[s, b, n*C]`` static hidden_states for CUDA-graph capture."""
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        hs = static_inputs["hidden_states"]
+        n = self.config.num_residual_streams
+        static_inputs["hidden_states"] = torch.ones(
+            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
+            dtype=hs.dtype,
+            requires_grad=hs.requires_grad,
+            device=hs.device,
+        )
+        return static_inputs
