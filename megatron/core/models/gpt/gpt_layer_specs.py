@@ -35,6 +35,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.attention_residual import AttnResModule
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
     TransformerLayer,
@@ -375,8 +376,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
     enable_hc = kwargs.pop('enable_hyper_connection', False)
+    attn_residual = kwargs.pop('attn_residual', False)
     submodules = get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs)
-    return _maybe_wrap_hyper_connection(submodules, enable_hc)
+    return _maybe_wrap_hyper_connection(submodules, enable_hc, attn_residual)
 
 
 def get_gpt_layer_local_submodules(
@@ -512,20 +514,33 @@ def get_gpt_layer_local_submodules(
 def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
     enable_hc = kwargs.pop('enable_hyper_connection', False)
+    attn_residual = kwargs.pop('attn_residual', False)
     submodules = get_gpt_layer_local_submodules(*args, **kwargs)
-    return _maybe_wrap_hyper_connection(submodules, enable_hc)
+    return _maybe_wrap_hyper_connection(submodules, enable_hc, attn_residual)
 
 
 def _maybe_wrap_hyper_connection(
-    submodules: TransformerLayerSubmodules, enable_hc: bool
+    submodules: TransformerLayerSubmodules, enable_hc: bool, attn_residual: bool = False
 ) -> ModuleSpec:
-    """Return a ModuleSpec, injecting mHC modules and selecting the mHC layer class if enabled.
+    """Return a ModuleSpec, injecting mHC / AttnRes modules and selecting the n-stream layer
+    class if enabled.
 
     When ``enable_hc`` is True the self-attention and MLP hyper-connection slots are populated
-    with :class:`HyperConnectionModule` and the layer class is
-    :class:`HyperConnectionTransformerLayer`; otherwise a plain :class:`TransformerLayer` spec is
-    returned unchanged. Cross-attention hyper connections are intentionally left as IdentityOp.
+    with :class:`HyperConnectionModule`. When ``attn_residual`` is True they are populated with
+    :class:`AttnResModule` instead (tagged with the sublayer type so each aggregation point can
+    recover its block-schedule entry). Both reuse :class:`HyperConnectionTransformerLayer` (the
+    n-stream aggregate/merge layer); otherwise a plain :class:`TransformerLayer` spec is returned
+    unchanged. ``enable_hc`` and ``attn_residual`` are mutually exclusive (enforced in config).
+    Cross-attention hyper connections are intentionally left as IdentityOp.
     """
+    if attn_residual:
+        submodules.self_attention_hyper_connection = ModuleSpec(
+            module=AttnResModule, params={"sublayer_type": "attn"}
+        )
+        submodules.mlp_hyper_connection = ModuleSpec(
+            module=AttnResModule, params={"sublayer_type": "mlp"}
+        )
+        return ModuleSpec(module=HyperConnectionTransformerLayer, submodules=submodules)
     if enable_hc:
         submodules.self_attention_hyper_connection = HyperConnectionModule
         submodules.mlp_hyper_connection = HyperConnectionModule
@@ -662,6 +677,7 @@ def get_gpt_decoder_layer_specs(
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_residual=config.attn_residual,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -678,6 +694,7 @@ def get_gpt_decoder_layer_specs(
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_residual=config.attn_residual,
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
@@ -711,6 +728,7 @@ def get_gpt_decoder_layer_specs(
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_residual=config.attn_residual,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -726,6 +744,7 @@ def get_gpt_decoder_layer_specs(
             sandwich_norm=config.sandwich_norm,
             keel=config.keel,
             enable_hyper_connection=config.enable_hyper_connections,
+            attn_residual=config.attn_residual,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.

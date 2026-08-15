@@ -24,6 +24,10 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     HyperConnectionOutputContract,
 )
+from megatron.core.transformer.attention_residual import (
+    AttnResModule,
+    AttnResOutputContract,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -392,6 +396,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 # checkpoint. Params stay in the model compute dtype (bf16); learned_output_contract
                 # upcasts to fp32 in-compute and the optimizer master weights are fp32 anyway.
                 self.hc_output_contract = HyperConnectionOutputContract(self.config)
+            elif self.config.attn_residual:
+                # AttnRes final aggregation over all block slots (the paper's (2L+1)-th
+                # aggregation point). Same submodule rationale as the mHC contract above.
+                self.hc_output_contract = AttnResOutputContract(self.config)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -766,10 +774,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
-        # mHC: expand 1-stream -> n-stream at the start of the block. Only the first PP stage
-        # expands; later stages receive the n-stream residual [s, b, n*C] from the previous stage.
+        # mHC / AttnRes: expand 1-stream -> n-stream at the start of the block. Only the first PP
+        # stage expands; later stages receive the n-stream residual [s, b, n*C] from the previous
+        # stage. mHC replicates the input to all streams; AttnRes seeds slot 0 with the embedding
+        # block and zeros the rest.
         if self.config.enable_hyper_connections and self.pre_process:
             hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+        elif self.config.attn_residual and self.pre_process:
+            hidden_states = AttnResModule.input_expand(
                 hidden_states, self.num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
 
@@ -868,9 +882,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        # mHC: contract n-stream -> 1-stream on the stage that owns the final layer norm,
+        # mHC / AttnRes: contract n-stream -> 1-stream on the stage that owns the final layer norm,
         # just before applying it. [s, b, n*C] -> [s, b, C].
-        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+        if (
+            self.config.enable_hyper_connections or self.config.attn_residual
+        ) and self.has_final_layernorm_in_this_stage():
             hidden_states = self.hc_output_contract(hidden_states)
 
         # Final layer norm.

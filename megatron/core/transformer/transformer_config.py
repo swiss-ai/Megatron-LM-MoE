@@ -1285,6 +1285,20 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of the mHC gating factor (alpha in the paper)."""
 
+    ####################
+    # Attention Residuals (AttnRes) Configuration
+    ####################
+    attn_residual: bool = False
+    """Enable Block Attention Residuals (arXiv:2603.15031). Replaces the additive residual
+    with depth-wise softmax attention over block representations. Reuses the mHC packed
+    n-stream scaffolding with ``num_residual_streams = attn_residual_num_blocks + 1`` (slot 0
+    = embedding, slots 1..N = the N block representations). Mutually exclusive with
+    ``enable_hyper_connections``, ``sandwich_norm``, ``keel`` and ``residual_output_scaling``
+    (all rewrite the residual add)."""
+
+    attn_residual_num_blocks: int = 8
+    """Number of blocks (N) for Block AttnRes. Only used when ``attn_residual`` is True."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1317,6 +1331,35 @@ class TransformerConfig(ModelParallelConfig):
                     "enable_hyper_connections (mHC) is not supported with "
                     "transformer_impl='inference_optimized' in this port."
                 )
+
+        # Block Attention Residuals (AttnRes) validation + packed-stream derivation.
+        if self.attn_residual:
+            if not isinstance(self.attn_residual_num_blocks, int) or self.attn_residual_num_blocks < 1:
+                raise ValueError(
+                    "attn_residual_num_blocks must be a positive integer when attn_residual=True, "
+                    f"got {self.attn_residual_num_blocks}."
+                )
+            if self.attn_residual_num_blocks > 2 * self.num_layers:
+                raise ValueError(
+                    "attn_residual_num_blocks must not exceed the number of sublayers "
+                    f"(2 * num_layers = {2 * self.num_layers}), got {self.attn_residual_num_blocks}."
+                )
+            if self.enable_hyper_connections:
+                raise ValueError(
+                    "attn_residual and enable_hyper_connections both own the residual stream and "
+                    "cannot be enabled together."
+                )
+            if self.sandwich_norm or self.keel or self.residual_output_scaling:
+                raise ValueError(
+                    "attn_residual rewrites the residual add and is mutually exclusive with "
+                    "sandwich_norm / keel / residual_output_scaling."
+                )
+            if getattr(self, "transformer_impl", None) == "inference_optimized":
+                raise NotImplementedError(
+                    "attn_residual is not supported with transformer_impl='inference_optimized'."
+                )
+            # Reuse the mHC packed n-stream scaffolding: slot 0 = embedding, slots 1..N = blocks.
+            self.num_residual_streams = self.attn_residual_num_blocks + 1
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
