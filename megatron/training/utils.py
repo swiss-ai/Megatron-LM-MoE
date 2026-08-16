@@ -319,6 +319,55 @@ def report_memory(name):
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
+def report_host_memory(name):
+    """Host memory report using torch.cuda.host_memory_stats().
+    """
+    gib = 1024.0**3
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if mpu.get_data_parallel_rank() != 0:
+        return
+    
+    try:
+        stats = torch.cuda.host_memory_stats()
+    except (RuntimeError, AttributeError):
+        stats = {}
+    pinned = ""
+    if stats:
+        pinned = (
+            f" | pinned reserved: {stats.get('reserved_bytes.current', 0) / gib:.2f}"
+            f" (peak {stats.get('reserved_bytes.peak', 0) / gib:.2f})"
+            f" | pinned requested: {stats.get('allocated_bytes.current', 0) / gib:.2f}"
+            f" | pinned segments: {stats.get('segment.current', 0):.0f}"
+        )
+
+    # activation cpu pool and main grad gpu pool
+    act_pool = ""
+    mgrad_pool = ""
+    try:
+        from megatron.core.transformer.moe.moe_offload import PinnedActBufferPool, GpuMainGradSlotPool
+
+        n_buf, total_bytes, free_bytes = PinnedActBufferPool.get_instance().stats()
+        if n_buf:
+            act_pool = (
+                f" | act pool: {total_bytes / gib:.2f} in {n_buf} bufs"
+                f" ({free_bytes / gib:.2f} idle)"
+            )
+        n_buf, total_bytes, free_bytes = GpuMainGradSlotPool.get_instance().stats()
+        if n_buf:
+            mgrad_pool = (
+                f" | mgrad pool: {total_bytes / gib:.2f} in {n_buf} bufs"
+                f" ({free_bytes / gib:.2f} idle)"
+            )
+    except (ImportError, AttributeError):
+        pass
+
+    print(
+        f"[Rank {rank}] {name} host memory (GiB)"
+        f"{pinned}"
+        f"{act_pool}"
+        f"{mgrad_pool}",
+        flush=True,
+    )
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""

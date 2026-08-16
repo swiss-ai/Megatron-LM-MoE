@@ -979,6 +979,14 @@ class TransformerConfig(ModelParallelConfig):
     (moe_use_offloading_experts + moe_use_inplace_fp8_param) and incompatible with moe_layer_recompute
     (the activation is not held across the pipeline gap under full-layer recompute)."""
 
+    moe_offload_main_grad: bool = False
+    """Whether to keep the routed experts' fp32 main grads in pinned host memory instead of on the
+    device, staging them back onto the GPU only for the duration of the wgrad GEMMs that accumulate
+    into them (the H2D overlaps the combine-backward phase, the D2H follows the wgrad). Trades
+    2x main-grad bytes of PCIe traffic per layer per microbatch for the whole main-grad buffer of
+    device memory. Only supported with the inplace-FP8 offloading-experts path
+    (moe_use_offloading_experts + moe_use_inplace_fp8_param)."""
+
     moe_offloading_experts_skip_post_backward_hook: bool = False
     """Whether the offloading experts MLP should skip the post backward hook."""
 

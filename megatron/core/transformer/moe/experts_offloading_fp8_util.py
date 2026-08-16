@@ -26,6 +26,8 @@ except ImportError:
 from megatron.core.transformer.moe.moe_offload import (
     ActivationOffloadHandle,
     MoEActivationOffloadManager,
+    MoEMainGradOffloadManager,
+    MainGradOffloadHandle,
     PinnedActBufferPool,
     StreamManager,
 )
@@ -106,6 +108,7 @@ class OffloadingFP8Config:
     moe_use_extra_fp8_param_storage: bool = False
     moe_offload_input: bool = False
     moe_offload_fc1_output: bool = False
+    moe_offload_main_grad: bool = False
 
     # recomputation
     recompute_granularity: str = "selective"
@@ -152,6 +155,7 @@ class OffloadingFP8Config:
             moe_offload_fc1_output=(
                 MOE_OFFLOAD_FC1_OUTPUT in (config.moe_offload_activations or [])
             ),
+            moe_offload_main_grad=config.moe_offload_main_grad,
             recompute_granularity=config.recompute_granularity,
             recompute_modules=config.recompute_modules,
             delay_wgrad_compute=config.delay_wgrad_compute,
@@ -901,6 +905,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool = False,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
+        mgrad_offload_handle: MainGradOffloadHandle = None,
     ):
         """
         dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
@@ -925,6 +930,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         assert cpu_w2.main_grad is not None
         wgrad_output = cpu_w2.main_grad
+
+        if config.moe_offload_main_grad and mgrad_offload_handle is not None:
+            wgrad_output = MoEMainGradOffloadManager.get(mgrad_offload_handle, "cpu_w2")
 
         # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
         # register the wgrad computation to be executed later.
@@ -961,9 +969,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert_cumsum: torch.Tensor,
         num_local_experts: int,
         stream_manager: StreamManager,
+        config: OffloadingFP8Config,
         wgrad_scheduler: ExpertsWgradScheduler = None,
         delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
+        mgrad_offload_handle: MainGradOffloadHandle = None,
     ):
         """
         dw1 [2*H, h] = grad_a.T [2*H, m] @ x.T [h, m]
@@ -971,6 +981,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         """
         assert cpu_w1.main_grad is not None
         wgrad_output = cpu_w1.main_grad
+
+        if config.moe_offload_main_grad and mgrad_offload_handle is not None:
+            wgrad_output = MoEMainGradOffloadManager.get(mgrad_offload_handle, "cpu_w1")
 
         # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
         # register the wgrad computation to be executed later.
@@ -1054,7 +1067,8 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # Leading differentiable inputs: per-token PolyNorm GLU coefficients (None for SwiGLU).
         a1: torch.Tensor = args[0]
         a2: torch.Tensor = args[1]
-        
+        mgrad_offload_handle: MainGradOffloadHandle = args[2]
+
         cpu_w1: torch.nn.Parameter =  args[-16]
         cpu_w2: torch.nn.Parameter =  args[-15]
         cpu_w1_list: list[torch.Tensor] = args[-14]
@@ -1196,6 +1210,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 fp8_fc1_output[1],
                 permuted_probs
             )
+
+        # main grad offloading: the handle is the module's, just carried to backward.
+        ctx.mgrad_offload_handle = mgrad_offload_handle
 
         return y, act_offload_handle
 
@@ -1366,6 +1383,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             config.gradient_accumulation_fusion,
             ctx.a1,
             ctx.a2,
+            ctx.mgrad_offload_handle,
         )
 
         # backward grad_w1 computation
@@ -1386,9 +1404,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert_cumsum,
             ctx.num_local_experts,
             stream_manager,
+            config,
             expert_wgrad_scheduler,
             config.delay_wgrad_compute,
             config.gradient_accumulation_fusion,
+            ctx.mgrad_offload_handle,
         )
 
         # NOTE: gradients have been attached in _wgrad_post_process, 
@@ -1401,11 +1421,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # the parameter is on CPU, and hence cause hanging when
         # overlap_grad_reduce is enabled
         if not config.delay_wgrad_compute:
+            MoEMainGradOffloadManager.offload(ctx.mgrad_offload_handle)
             for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
                 hook_fn()
 
-        # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU)
-        return grad_a1, grad_a2, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
+        # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU),
+        # then the main-grad offload handle at index 2.
+        return grad_a1, grad_a2, None, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
 
 
 
@@ -1430,6 +1452,7 @@ def offloading_fp8_grouped_swiglu_mlp(
     wgrad_accumulation_and_reduce_hooks: list,
     a1: torch.Tensor = None,
     a2: torch.Tensor = None,
+    mgrad_offload_handle: MainGradOffloadHandle = None,
 ) -> tuple[torch.Tensor, ActivationOffloadHandle | None]:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
@@ -1445,6 +1468,9 @@ def offloading_fp8_grouped_swiglu_mlp(
         expert_wgrad_scheduler (ExpertsWgradScheduler): scheduler for expert weight gradients
         stream_manager (StreamManager): manager for CUDA streams
         config (OffloadingFP8Config): offloading FP8 configuration
+        mgrad_offload_handle (MainGradOffloadHandle): the caller's persistent main-grad offload
+            handle (None unless ``moe_offload_main_grad`` is enabled), used by the wgrad GEMMs as
+            their accumulation target in place of the host-resident ``main_grad``.
 
     Returns:
         tuple[torch.Tensor, ActivationOffloadHandle | None]: the MLP output and the activation
@@ -1454,6 +1480,7 @@ def offloading_fp8_grouped_swiglu_mlp(
     output, act_offload_handle = OffloadingExpertsFP8GroupedSwiMLP.apply(
         a1,
         a2,
+        mgrad_offload_handle,
         cpu_w1,
         cpu_w2,
         cpu_w1_list,

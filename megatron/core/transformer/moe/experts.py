@@ -60,7 +60,10 @@ from megatron.core.transformer.moe.experts_util import (
 from megatron.core.transformer.moe.experts_fp8_util import (
     fp8_grouped_swiglu_mlp,
 )
-from megatron.core.transformer.moe.moe_offload import StreamManager
+from megatron.core.transformer.moe.moe_offload import (
+    StreamManager,
+    MoEMainGradOffloadManager,
+)
 from megatron.core.transformer.moe.experts_offloading_util import (
     offloading_grouped_swiglu_mlp,
 )
@@ -1263,6 +1266,7 @@ class OffloadingExpertsMLP(MegatronModule):
             )
             self.weight1.skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
             self.weight1.is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+            self.weight1.use_cpu_offloaded_mgrad = self.config.moe_offload_main_grad
 
             self.weight2 = Parameter(
                 torch.empty(
@@ -1276,6 +1280,7 @@ class OffloadingExpertsMLP(MegatronModule):
             )
             self.weight2.skip_backward_post_hook = config.moe_offloading_experts_skip_post_backward_hook
             self.weight2.is_cpu_offloaded = not self.config.moe_offloading_experts_debug_mode
+            self.weight2.use_cpu_offloaded_mgrad = self.config.moe_offload_main_grad
 
             self.weight1_list = None
             self.weight2_list = None
@@ -1450,6 +1455,9 @@ class OffloadingExpertsMLP(MegatronModule):
         # Transient activation-offload handle (moe_offload_activations); see forward().
         self._act_offload_handle = None
 
+        # Transient main grad offload handle (moe_offload_main_grad); see backward_dw().
+        self._main_grad_offload_handle = None
+
         # padding function
         if self.config.moe_use_inplace_fp8_param:
             self.quantization_padding = Fp8Padding(self.num_local_experts, 128)
@@ -1614,6 +1622,12 @@ class OffloadingExpertsMLP(MegatronModule):
         # inplace-FP8 path below and read by the enclosing MoE layer to wire MoEActReloadTrigger on
         # the combine output. Reset each forward so a disabled/empty path leaves no stale handle.
         self._act_offload_handle = None
+        # The main-grad handle is persistent: it carries d2h_done / host_is_zero across
+        # microbatches. Registered here but not in init as DDP attaches .main_grad afterwards.
+        if self._main_grad_offload_handle is None and self.config.moe_offload_main_grad:
+            self._main_grad_offload_handle = MoEMainGradOffloadManager.register(
+                {"cpu_w1": self.weight1, "cpu_w2": self.weight2}, self.stream_manager
+            )
         if permuted_local_hidden_states.nelement() != 0:
             if self.config.moe_offloading_experts_debug_mode:
                 return self._forward_debug(
@@ -1660,6 +1674,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.wgrad_accumulation_and_reduce_hooks,
                     a1,
                     a2,
+                    mgrad_offload_handle=self._main_grad_offload_handle,
                 )
 
                 output = self.quantization_unpadding(output, tokens_per_expert_list)
@@ -1719,6 +1734,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     self.wgrad_accumulation_and_reduce_hooks,
                     a1,
                     a2,
+                    mgrad_offload_handle=self._main_grad_offload_handle,
                 )
 
                 return output, None
@@ -1747,6 +1763,8 @@ class OffloadingExpertsMLP(MegatronModule):
         if self.config.delay_wgrad_compute and not self.config.moe_offloading_experts_debug_mode:
             self.expert_wgrad_scheduler.pop_callback()
             self.expert_wgrad_scheduler.pop_callback()
+
+            MoEMainGradOffloadManager.offload(self._main_grad_offload_handle)
 
             # trigger grad reduce hook
             for hook_fn in self.wgrad_accumulation_and_reduce_hooks:

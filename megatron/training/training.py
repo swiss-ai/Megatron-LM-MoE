@@ -243,6 +243,7 @@ from .utils import (
     print_rank_0,
     print_rank_last,
     report_memory,
+    report_host_memory,
     unwrap_model,
     update_use_dist_ckpt,
     to_empty_if_meta_device,
@@ -1066,6 +1067,7 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+    report_host_memory('after model+optimizer built')
     config = get_model_config(model[0])
 
     # Build a separate inference model for RL if requested.
@@ -2434,6 +2436,7 @@ def training_log(
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(f'(after {iteration} iterations)')
+            report_host_memory(f'iteration {iteration}')
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2931,6 +2934,7 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+    report_host_memory('before first training step')
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False

@@ -31,7 +31,10 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
-from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
+from megatron.core.transformer.moe.moe_offload import (
+    MoEActReloadTrigger,
+    MoEMainGradReloadTrigger,
+)
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -521,6 +524,15 @@ class MoELayer(BaseMoELayer):
             output = MoEActReloadTrigger.apply(output, handle)
         return output
 
+    def _wrap_main_grad_reload(self, output: torch.Tensor):
+        """Wire ``MoEMainGradReloadTrigger`` on the combine output so the offloaded main grad
+        is reloaded during the combine-backward window.
+        """
+        handle = getattr(self.experts, "_main_grad_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEMainGradReloadTrigger.apply(output, handle)
+        return output
+
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed."""
@@ -606,6 +618,7 @@ class MoELayer(BaseMoELayer):
                 # Reload the offloaded expert activations during the combine-backward
                 # window. No-op unless moe_offload_activations produced an active handle.
                 output = self._wrap_activation_reload(output)
+                output = self._wrap_main_grad_reload(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

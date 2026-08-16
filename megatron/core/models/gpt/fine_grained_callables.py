@@ -28,7 +28,10 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
-from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
+from megatron.core.transformer.moe.moe_offload import (
+    MoEActReloadTrigger,
+    MoEMainGradReloadTrigger,
+)
 
 
 def weak_method(method):
@@ -648,6 +651,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.act_offload_handle = getattr(
             layer.mlp.experts, "_act_offload_handle", None
         )
+        node.layer_state.mgrad_offload_handle = getattr(
+            layer.mlp.experts, "_main_grad_offload_handle", None
+        )
 
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
         # `routed_experts_compute`, a ref is needed to prevent it from being freed.
@@ -677,6 +683,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         handle = getattr(node.layer_state, "act_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
             output = MoEActReloadTrigger.apply(output, handle)
+        mgrad_handle = getattr(node.layer_state, "mgrad_offload_handle", None)
+        if mgrad_handle is not None and getattr(mgrad_handle, "active", False):
+            output = MoEMainGradReloadTrigger.apply(output, mgrad_handle)
         return output
 
         residual = node.layer_state.residual

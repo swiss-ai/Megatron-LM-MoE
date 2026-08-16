@@ -2,6 +2,7 @@
 """Shared MoE offloading primitives."""
 from __future__ import annotations
 from dataclasses import dataclass
+import weakref
 import torch
 
 
@@ -24,6 +25,10 @@ class StreamManager:
         # Dedicated copy streams for activation offload D2H/H2D.
         self.act_d2h_stream = torch.cuda.Stream()
         self.act_h2d_stream = torch.cuda.Stream()
+
+        # Dedicated copy streams for main-grad offload D2H/H2D.
+        self.mgrad_d2h_stream = torch.cuda.Stream()
+        self.mgrad_h2d_stream = torch.cuda.Stream()
 
     @classmethod
     def get_instance(
@@ -102,6 +107,17 @@ class StreamManager:
         for i in range(self.num_compute_streams):
             tensor.record_stream(self.compute_streams[i])
 
+    def mgrad_d2h_stream_wait_producers(self):
+        """Make the main-grad writeback D2H stream wait for the wgrad GEMMs."""
+        for launch_stream in self.get_launch_streams():
+            self.mgrad_d2h_stream.wait_stream(launch_stream)
+        for i in range(self.num_compute_streams):
+            self.mgrad_d2h_stream.wait_stream(self.compute_streams[i])
+
+    def consumer_streams_wait_mgrad_reload(self, h2d_done_event):
+        """Make the wgrad consumer streams wait until the main-grad staging H2D completes."""
+        self.consumer_streams_wait_event(h2d_done_event)
+
 
 @dataclass
 class ActivationOffloadHandle:
@@ -164,6 +180,11 @@ class PinnedActBufferPool:
         self._free: list = []
         # Keep strong refs so buffers are never GC'd / freed (avoids cudaFreeHost syncs).
         self._all: list = []
+        self._total_bytes: int = 0
+
+    def stats(self) -> tuple:
+        """(num_buffers, total_bytes, free_bytes)"""
+        return len(self._all), self._total_bytes, sum(b.numel() for b, _ev in self._free)
 
     def allocate(self, nbytes: int, wait_stream: torch.cuda.Stream) -> torch.Tensor:
         """Return a flat pinned ``uint8`` buffer with capacity >= ``nbytes``."""
@@ -186,6 +207,7 @@ class PinnedActBufferPool:
         )
         buf = torch.empty(cap, dtype=torch.uint8, device="cpu", pin_memory=True)
         self._all.append(buf)
+        self._total_bytes += cap
         return buf
 
     def free(self, buf: torch.Tensor, ready_event: torch.cuda.Event = None):
@@ -302,3 +324,273 @@ class MoEActReloadTrigger(torch.autograd.Function):
         if handle is not None and handle.active:
             MoEActivationOffloadManager.reload(handle)
         return grad_output, None
+
+
+@dataclass
+class MainGradSlot:
+    """One offloaded ``param.main_grad``: its host home plus its transient GPU staging tensor.
+
+    Unlike an activation slot, the shape is fixed by the config at module construction, so
+    ``shape``/``dtype``/``numel`` are filled in once at registration and never re-derived.
+    """
+
+    param: torch.nn.Parameter = None  # host home is read lazily as ``param.main_grad``
+    shape: tuple = None
+    dtype: torch.dtype = None
+    numel: int = 0
+    device: torch.device = None
+    gpu_slot: torch.Tensor = None  # staged fp32 accumulator, live between reload and offload
+    h2d_done: torch.cuda.Event = None
+    d2h_done: torch.cuda.Event = None
+    # when the host copy is known to be all-zero (right after ``zero_grad_buffer``) for first microbatch
+    # lets the next reload zero the GPU slot instead of paying an H2D.
+    host_is_zero: bool = False
+
+
+@dataclass(eq=False)
+class MainGradOffloadHandle:
+    """Handle carrying a layer's host-resident expert main-grads through the backward pass.
+
+    The mirror of :class:`ActivationOffloadHandle`. Because the shapes are determined, one handle is built per module at construction time and
+    reused every microbatch.
+    """
+
+    active: bool = False
+    slots: dict = None  # name -> MainGradSlot
+    stream_manager: object = None  # StreamManager carrying the mgrad_d2h/mgrad_h2d streams
+
+    def __post_init__(self):
+        if self.slots is None:
+            self.slots = {}
+
+
+class GpuMainGradSlotPool:
+    """Recycling pool of flat GPU staging buffers for main-grad offload, keyed by exact capacity.
+
+    The counterpart of :class:`PinnedActBufferPool`, with the two sides swapped: for main grads the
+    host buffer is permanent (it is the DDP grad buffer) and the *device* buffer is the transient
+    one, so this pool hands out GPU tensors.
+
+    Activation shapes vary per microbatch, which is why the pinned pool rounds capacities up to a
+    granularity and searches best-fit. Main-grad shapes are fixed by the config, so there are only
+    as many capacity classes as there are distinct expert-weight sizes (two per rank: fc1 and fc2)
+    and an exact ``(numel, dtype)`` key is enough -- no rounding, no best-fit scan, no slack.
+
+    Buffers are never released back to the caching allocator, only recycled, so the pool's
+    high-water mark is the whole GPU cost of the feature: ``concurrent_slots * slot_bytes``.
+    Because the storage is retained, consumers do not need ``record_stream`` on a slot; reuse is
+    ordered explicitly instead, by the ``d2h_done`` event a slot carries when it is freed.
+    """
+
+    _instance = None
+
+    @classmethod
+    def get_instance(cls) -> GpuMainGradSlotPool:
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        # (numel, dtype, device) -> list of [buffer, ready_event_or_None].
+        self._free: dict = {}
+        # strong refs of buffers so the memory never returned to the allocator.
+        self._all: list = []
+        self._total_bytes: int = 0
+
+    def stats(self) -> tuple:
+        """(num_buffers, total_bytes, free_bytes)"""
+        return len(self._all), self._total_bytes, sum(
+            b.numel() * b.element_size() for fl in self._free.values() for b, _ev in fl
+        )
+
+    def allocate(
+        self,
+        numel: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        wait_stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        """Return a flat GPU buffer of exactly ``numel`` elements of ``dtype``."""
+        free_list = self._free.setdefault((numel, dtype, device), [])
+        if free_list:
+            buf, ready_event = free_list.pop()
+            if ready_event is not None:
+                # a previous writeback D2H is pending
+                # wait until the copy has landed.
+                wait_stream.wait_event(ready_event)
+            return buf
+
+        # if there is no free buffer, allocate a new one and add into reference
+        buf = torch.empty(numel, dtype=dtype, device=device)
+        self._all.append(buf)
+        self._total_bytes += buf.numel() * buf.element_size()
+        return buf
+
+    def free(self, buf: torch.Tensor, ready_event: torch.cuda.Event = None):
+        """Return ``buf`` to the pool, tagged with the event after which it is safe to overwrite."""
+        self._free.setdefault((buf.numel(), buf.dtype, buf.device), []).append([buf, ready_event])
+
+
+class MoEMainGradOffloadManager:
+    """Stateless driver for staging/writing back host-resident expert main-grads.
+
+    Similar to :class:`MoEActivationOffloadManager`: ``reload`` performs H2D ``offload`` performs D2H. 
+    Main-grad is reloaded before backward and offloaded once the wgrad GEMMs completed.
+    """
+
+    # un-awaited writeback event per D2H stream: cuda stream -> torch.Event
+    # host buffer must not be read or writed while one of these is outstanding.
+    _pending_writebacks: dict = {}
+
+    # all live handles for all modules. DDP can mark the whole model's main-grads zero in one call 
+    _live_handles: weakref.WeakSet = weakref.WeakSet()
+
+    @staticmethod
+    def register(
+        params: dict,
+        stream_manager,
+    ) -> MainGradOffloadHandle:
+        """Build the persistent handle for a module's expert weights. Called **once per module**.
+
+        ``params``: ``{"w1": self.weight1, "w2": self.weight2}``. 
+        """
+        handle = MainGradOffloadHandle(stream_manager=stream_manager)
+        for name, param in params.items():
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is None or main_grad.device.type != "cpu":
+                return MainGradOffloadHandle(stream_manager=stream_manager)
+            handle.slots[name] = MainGradSlot(
+                param=param,
+                shape=tuple(main_grad.shape),
+                dtype=main_grad.dtype,
+                numel=main_grad.numel(),
+                device=torch.device(torch.cuda.current_device()),
+            )
+        handle.active = len(handle.slots) > 0
+        if handle.active:
+            # upon register the buffer DDP allocated is zeroed
+            # and stays zeroed until the first writeback
+            MoEMainGradOffloadManager.mark_host_zero(handle)
+            MoEMainGradOffloadManager._live_handles.add(handle)
+        return handle
+
+    @staticmethod
+    def reload(
+        handle: MainGradOffloadHandle,
+    ) -> None:
+        """Stage every slot's host main-grad into a fresh GPU accumulator."""
+        if handle is None or not handle.active:
+            return
+        stream_manager = handle.stream_manager
+        h2d_stream = stream_manager.mgrad_h2d_stream
+        pool = GpuMainGradSlotPool.get_instance()
+        for name, slot in handle.slots.items():
+            assert slot.gpu_slot is None, (
+                f"main-grad slot '{name}' is already staged -- reload ran twice without an "
+                "intervening offload, which would drop a microbatch's wgrad."
+            )
+            if slot.d2h_done is not None:
+                # wait until the previous d2h write is done
+                h2d_stream.wait_event(slot.d2h_done)
+            with torch.cuda.stream(h2d_stream):
+                gpu_flat = pool.allocate(slot.numel, slot.dtype, slot.device, h2d_stream)
+                if slot.host_is_zero:
+                    # skip the H2D.
+                    gpu_flat.zero_()
+                else:
+                    gpu_flat.copy_(slot.param.main_grad.reshape(-1), non_blocking=True)
+            slot.gpu_slot = gpu_flat.view(slot.shape)
+            slot.h2d_done = torch.cuda.Event()
+            slot.h2d_done.record(h2d_stream)
+
+    @staticmethod
+    def get(
+        handle: MainGradOffloadHandle,
+        name: str,
+    ) -> torch.Tensor:
+        """Return the staged GPU accumulator for ``name``, ordered after its staging H2D.
+        """
+        slot = handle.slots[name]
+        assert slot.gpu_slot is not None, (
+            f"main-grad slot '{name}' was not staged before the wgrad GEMM. "
+            "MoEMainGradReloadTrigger must be wired on the combine output when "
+            "moe_offload_main_grads is enabled."
+        )
+        handle.stream_manager.consumer_streams_wait_mgrad_reload(slot.h2d_done)
+        return slot.gpu_slot
+
+    @staticmethod
+    def offload(
+        handle: MainGradOffloadHandle,
+    ) -> None:
+        """Write every staged accumulator back to its host main-grad and release the GPU slot."""
+        if handle is None or not handle.active:
+            return
+        stream_manager = handle.stream_manager
+        d2h_stream = stream_manager.mgrad_d2h_stream
+        pool = GpuMainGradSlotPool.get_instance()
+        stream_manager.mgrad_d2h_stream_wait_producers()
+        for slot in handle.slots.values():
+            if slot.gpu_slot is None:
+                # no wgrad ran for this slot this microbatch (e.g. no tokens routed here).
+                continue
+            # Only ``get`` orders the GEMMs behind the staging H2D, so a slot staged but never
+            # handed to a GEMM never took that dependency -- wait the H2D directly too.
+            d2h_stream.wait_event(slot.h2d_done)
+            gpu_flat = slot.gpu_slot.reshape(-1)
+            with torch.cuda.stream(d2h_stream):
+                slot.param.main_grad.reshape(-1).copy_(gpu_flat, non_blocking=True)
+            slot.d2h_done = torch.cuda.Event()
+            slot.d2h_done.record(d2h_stream)
+            slot.host_is_zero = False
+            pool.free(gpu_flat, slot.d2h_done)
+            slot.gpu_slot = None
+            slot.h2d_done = None
+            MoEMainGradOffloadManager._pending_writebacks[d2h_stream.cuda_stream] = slot.d2h_done
+
+    @staticmethod
+    def mark_host_zero(handle: MainGradOffloadHandle) -> None:
+        """Record that the host main-grads are all-zero, letting the next reload skip its H2D."""
+        for slot in handle.slots.values():
+            slot.host_is_zero = True
+
+    @staticmethod
+    def mark_all_host_zero() -> None:
+        """Mark every live handle's host main-grads zero, after DDP cleared the grad buffers.
+        """
+        assert not MoEMainGradOffloadManager._pending_writebacks, (
+            "grad buffers were zeroed while a main-grad writeback was still in flight -- the D2H "
+            "would land after the zero_() and resurrect last iteration's gradients. "
+            "MoEMainGradOffloadManager.synchronize() must run before zero_grad_buffer()."
+        )
+        for handle in MoEMainGradOffloadManager._live_handles:
+            MoEMainGradOffloadManager.mark_host_zero(handle)
+
+    @staticmethod
+    def synchronize() -> None:
+        """Block until every outstanding writeback D2H has landed in host memory.
+
+        Must be called before operations on ``main_grad``: the DDP grad reduce / zero_grad
+        """
+        pending = MoEMainGradOffloadManager._pending_writebacks
+        for event in pending.values():
+            event.synchronize()
+        pending.clear()
+
+
+class MoEMainGradReloadTrigger(torch.autograd.Function):
+    """Identity node whose backward stages the host main-grads onto the GPU.
+    """
+
+    @staticmethod
+    def forward(ctx, output, handle):
+        ctx.main_grad_offload_handle = handle
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        handle = ctx.main_grad_offload_handle
+        if handle is not None and handle.active:
+            MoEMainGradOffloadManager.reload(handle)
+        return grad_output, None
+
