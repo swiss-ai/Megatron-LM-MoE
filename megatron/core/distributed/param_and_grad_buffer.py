@@ -18,7 +18,7 @@ import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.moe.moe_offload import MoEMainGradOffloadManager
+from megatron.core.transformer.moe.moe_offload import MoEOffloadManager
 from megatron.core.utils import log_single_rank
 
 from ..fp8_utils import (
@@ -615,7 +615,7 @@ class _ParamAndGradBucketGroup:
 
         # guarantee the main grad is fully synchronized
         if any(bucket.grad_data.device.type == "cpu" for bucket in self.buckets):
-            MoEMainGradOffloadManager.synchronize()
+            MoEOffloadManager.synchronize()
 
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local

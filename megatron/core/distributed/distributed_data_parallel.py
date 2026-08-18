@@ -10,7 +10,7 @@ from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
-from ..transformer.moe.moe_offload import MoEMainGradOffloadManager
+from ..transformer.moe.moe_offload import MoEOffloadManager
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
@@ -583,7 +583,7 @@ class DistributedDataParallel(_BaseDataParallel):
             bucket_group.reset()
 
         # mark cpu main grad as zeroed
-        MoEMainGradOffloadManager.mark_all_host_zero()
+        MoEOffloadManager.mark_main_grad_zero()
 
     def broadcast_params(self):
         """

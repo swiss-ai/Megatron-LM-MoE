@@ -32,8 +32,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
 from megatron.core.transformer.moe.moe_offload import (
-    MoEActReloadTrigger,
-    MoEMainGradReloadTrigger,
+    MoEReloadTrigger,
 )
 
 try:
@@ -511,7 +510,7 @@ class MoELayer(BaseMoELayer):
         return output
 
     def _wrap_activation_reload(self, output: torch.Tensor):
-        """Wire ``MoEActReloadTrigger`` on the combine output so the offloaded expert input
+        """Wire ``MoEReloadTrigger`` on the combine output so the offloaded expert input
         activation is reloaded during the combine-backward window.
 
         Reads the handle set by ``OffloadingExpertsMLP.forward``. Safe against VPP
@@ -521,7 +520,7 @@ class MoELayer(BaseMoELayer):
         """
         handle = getattr(self.experts, "_act_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
-            output = MoEActReloadTrigger.apply(output, handle)
+            output = MoEReloadTrigger.apply(output, handle)
         return output
 
     def _wrap_main_grad_reload(self, output: torch.Tensor):
@@ -530,7 +529,7 @@ class MoELayer(BaseMoELayer):
         """
         handle = getattr(self.experts, "_main_grad_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
-            output = MoEMainGradReloadTrigger.apply(output, handle)
+            output = MoEReloadTrigger.apply(output, handle)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):

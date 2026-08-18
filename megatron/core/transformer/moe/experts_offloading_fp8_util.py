@@ -24,12 +24,9 @@ except ImportError:
     grouped_gemm = None
 
 from megatron.core.transformer.moe.moe_offload import (
-    ActivationOffloadHandle,
-    MoEActivationOffloadManager,
-    MoEMainGradOffloadManager,
-    MainGradOffloadHandle,
-    PinnedActBufferPool,
     StreamManager,
+    MoEOffloadManager,
+    MoEOffloadHandle,
 )
 from megatron.core.transformer.moe.experts_util import (
     ExpertsWgradScheduler,
@@ -905,7 +902,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool = False,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
-        mgrad_offload_handle: MainGradOffloadHandle = None,
+        mgrad_offload_handle: MoEOffloadHandle = None,
     ):
         """
         dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
@@ -932,7 +929,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         wgrad_output = cpu_w2.main_grad
 
         if config.moe_offload_main_grad and mgrad_offload_handle is not None:
-            wgrad_output = MoEMainGradOffloadManager.get(mgrad_offload_handle, "cpu_w2")
+            wgrad_output = MoEOffloadManager.get(mgrad_offload_handle, "cpu_w2")
 
         # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
         # register the wgrad computation to be executed later.
@@ -973,7 +970,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         wgrad_scheduler: ExpertsWgradScheduler = None,
         delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
-        mgrad_offload_handle: MainGradOffloadHandle = None,
+        mgrad_offload_handle: MoEOffloadHandle = None,
     ):
         """
         dw1 [2*H, h] = grad_a.T [2*H, m] @ x.T [h, m]
@@ -983,7 +980,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         wgrad_output = cpu_w1.main_grad
 
         if config.moe_offload_main_grad and mgrad_offload_handle is not None:
-            wgrad_output = MoEMainGradOffloadManager.get(mgrad_offload_handle, "cpu_w1")
+            wgrad_output = MoEOffloadManager.get(mgrad_offload_handle, "cpu_w1")
 
         # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
         # register the wgrad computation to be executed later.
@@ -1067,7 +1064,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # Leading differentiable inputs: per-token PolyNorm GLU coefficients (None for SwiGLU).
         a1: torch.Tensor = args[0]
         a2: torch.Tensor = args[1]
-        mgrad_offload_handle: MainGradOffloadHandle = args[2]
+        mgrad_offload_handle: MoEOffloadHandle = args[2]
 
         cpu_w1: torch.nn.Parameter =  args[-16]
         cpu_w2: torch.nn.Parameter =  args[-15]
@@ -1184,7 +1181,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # storage. It is reloaded by MoEActReloadTrigger.backward before this Function's backward.
         act_offload_handle = None
         if config.moe_offload_input and fp8_x_full.numel() > 0:
-            act_offload_handle = MoEActivationOffloadManager.offload(fp8_x_full, stream_manager)
+            act_offload_handle = MoEOffloadManager.offload_activation(fp8_x_full, stream_manager, "fp8_x")
             ctx.fp8_hidden_state_per_chunk = None
         ctx.act_offload_handle = act_offload_handle
         # When offloading, do not keep the (now-freed) GPU tensor in save_for_backward; the input is
@@ -1202,7 +1199,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_fc1_output = per_token_cast_to_fp8(fc1_output, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
             saved_fp8_fc1 = fp8_fc1_output[0]
             if config.moe_offload_fc1_output and act_offload_handle is not None:
-                MoEActivationOffloadManager.offload_fc1(act_offload_handle, saved_fp8_fc1)
+                MoEOffloadManager.offload_activation(saved_fp8_fc1, stream_manager, "fp8_fc1", act_offload_handle)
                 saved_fp8_fc1 = None
             ctx.save_for_backward(
                 saved_fp8_x,
@@ -1249,27 +1246,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # Reconstruct fp8_x from the host-offloaded copy. MoEActReloadTrigger.backward has already
         # launched the H2D (overlapping the combine-backward all-to-all); wait for it before use and
         # rebuild the per-chunk views that were dropped in forward.
-        act_offload_handle: ActivationOffloadHandle = getattr(ctx, "act_offload_handle", None)
+        act_offload_handle: MoEOffloadHandle = getattr(ctx, "act_offload_handle", None)
         if act_offload_handle is not None and act_offload_handle.active:
-            assert act_offload_handle.gpu_slot is not None, (
-                "Activation reload did not run before expert backward -- MoEActReloadTrigger must be "
-                "wired on the combine output when moe_offload_activations is enabled."
-            )
-            stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done)
-            stream_manager.consumer_streams_record(act_offload_handle.gpu_slot)
-            fp8_permuted_local_hidden_states = act_offload_handle.gpu_slot
+            fp8_permuted_local_hidden_states = MoEOffloadManager.get(act_offload_handle, "fp8_x")
             fp8_x_chunks = list(
                 torch.split(fp8_permuted_local_hidden_states, total_token_num_per_chunk, dim=0)
             )
             fp8_hidden_state_per_chunk = (fp8_x_chunks, fp8_permuted_local_hidden_states_sf_chunks)
-            # Recycle the pinned host buffer, guarded by the reload event so a future D2H write does
-            # not overwrite it until this reload's H2D read has completed.
-            PinnedActBufferPool.get_instance().free(
-                act_offload_handle.cpu_base, act_offload_handle.h2d_done
-            )
-            act_offload_handle.cpu_base = None
-            act_offload_handle.cpu_flat = None
-            act_offload_handle.gpu_slot = None
 
         if ctx.activation_recompute:
             # recompute the activation for backward
@@ -1287,24 +1270,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             )
         else:
             # if fc1 was offloaded, its reload H2D has been flowing on act_h2d_stream since the
-            # reload trigger (serial after fp8_x's). wait its OWN event here
+            # reload trigger (serial after fp8_x's). fetch it from its own slot; the slot only
+            # exists when moe_offload_fc1_output parked it in forward.
             if (
                 act_offload_handle is not None
-                and getattr(act_offload_handle, "fc1_active", False)
+                and "fp8_fc1" in act_offload_handle.slots
             ):
-                assert act_offload_handle.gpu_slot_fc1 is not None, (
-                    "fc1 activation reload did not run before expert backward -- "
-                    "MoEActivationOffloadManager.reload must handle the fc1 slot when fc1_active is set."
-                )
-                stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done_fc1)
-                stream_manager.consumer_streams_record(act_offload_handle.gpu_slot_fc1)
-                fp8_fc1_output = act_offload_handle.gpu_slot_fc1
-                PinnedActBufferPool.get_instance().free(
-                    act_offload_handle.cpu_base_fc1, act_offload_handle.h2d_done_fc1
-                )
-                act_offload_handle.cpu_base_fc1 = None
-                act_offload_handle.cpu_flat_fc1 = None
-                act_offload_handle.gpu_slot_fc1 = None
+                fp8_fc1_output = MoEOffloadManager.get(act_offload_handle, "fp8_fc1")
             fc1_output = per_token_dequant_from_fp8(fp8_fc1_output, fp8_fc1_output_scales)
 
         grad_y = grad_outputs[0].contiguous()
@@ -1421,7 +1393,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # the parameter is on CPU, and hence cause hanging when
         # overlap_grad_reduce is enabled
         if not config.delay_wgrad_compute:
-            MoEMainGradOffloadManager.offload(ctx.mgrad_offload_handle)
+            MoEOffloadManager.offload_main_grad(ctx.mgrad_offload_handle)
             for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
                 hook_fn()
 
@@ -1452,8 +1424,8 @@ def offloading_fp8_grouped_swiglu_mlp(
     wgrad_accumulation_and_reduce_hooks: list,
     a1: torch.Tensor = None,
     a2: torch.Tensor = None,
-    mgrad_offload_handle: MainGradOffloadHandle = None,
-) -> tuple[torch.Tensor, ActivationOffloadHandle | None]:
+    mgrad_offload_handle: MoEOffloadHandle = None,
+) -> tuple[torch.Tensor, MoEOffloadHandle | None]:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
     Args:
@@ -1468,7 +1440,7 @@ def offloading_fp8_grouped_swiglu_mlp(
         expert_wgrad_scheduler (ExpertsWgradScheduler): scheduler for expert weight gradients
         stream_manager (StreamManager): manager for CUDA streams
         config (OffloadingFP8Config): offloading FP8 configuration
-        mgrad_offload_handle (MainGradOffloadHandle): the caller's persistent main-grad offload
+        mgrad_offload_handle (MoEOffloadHandle): the caller's persistent main-grad offload
             handle (None unless ``moe_offload_main_grad`` is enabled), used by the wgrad GEMMs as
             their accumulation target in place of the host-resident ``main_grad``.
 

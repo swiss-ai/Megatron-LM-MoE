@@ -62,7 +62,7 @@ from megatron.core.transformer.moe.experts_fp8_util import (
 )
 from megatron.core.transformer.moe.moe_offload import (
     StreamManager,
-    MoEMainGradOffloadManager,
+    MoEOffloadManager,
 )
 from megatron.core.transformer.moe.experts_offloading_util import (
     offloading_grouped_swiglu_mlp,
@@ -1625,7 +1625,7 @@ class OffloadingExpertsMLP(MegatronModule):
         # The main-grad handle is persistent: it carries d2h_done / host_is_zero across
         # microbatches. Registered here but not in init as DDP attaches .main_grad afterwards.
         if self._main_grad_offload_handle is None and self.config.moe_offload_main_grad:
-            self._main_grad_offload_handle = MoEMainGradOffloadManager.register(
+            self._main_grad_offload_handle = MoEOffloadManager.register(
                 {"cpu_w1": self.weight1, "cpu_w2": self.weight2}, self.stream_manager
             )
         if permuted_local_hidden_states.nelement() != 0:
@@ -1764,7 +1764,7 @@ class OffloadingExpertsMLP(MegatronModule):
             self.expert_wgrad_scheduler.pop_callback()
             self.expert_wgrad_scheduler.pop_callback()
 
-            MoEMainGradOffloadManager.offload(self._main_grad_offload_handle)
+            MoEOffloadManager.offload_main_grad(self._main_grad_offload_handle)
 
             # trigger grad reduce hook
             for hook_fn in self.wgrad_accumulation_and_reduce_hooks:

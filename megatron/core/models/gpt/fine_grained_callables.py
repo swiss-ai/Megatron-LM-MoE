@@ -29,8 +29,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, make_v
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api
 from megatron.core.transformer.moe.moe_offload import (
-    MoEActReloadTrigger,
-    MoEMainGradReloadTrigger,
+    MoEReloadTrigger,
 )
 
 
@@ -682,10 +681,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # all-to-all window. No-op unless moe_offload_activations produced an active handle.
         handle = getattr(node.layer_state, "act_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
-            output = MoEActReloadTrigger.apply(output, handle)
+            output = MoEReloadTrigger.apply(output, handle)
         mgrad_handle = getattr(node.layer_state, "mgrad_offload_handle", None)
         if mgrad_handle is not None and getattr(mgrad_handle, "active", False):
-            output = MoEMainGradReloadTrigger.apply(output, mgrad_handle)
+            output = MoEReloadTrigger.apply(output, mgrad_handle)
         return output
 
         residual = node.layer_state.residual
