@@ -344,19 +344,24 @@ def report_host_memory(name):
     act_pool = ""
     mgrad_pool = ""
     try:
-        from megatron.core.transformer.moe.moe_offload import PinnedActBufferPool, GpuMainGradSlotPool
+        from megatron.core.transformer.moe.moe_offload import MoEOffloadMemoryPool
 
-        n_buf, total_bytes, free_bytes = PinnedActBufferPool.get_instance().stats()
-        if n_buf:
+        stats = MoEOffloadMemoryPool.get_instance().stats()
+        
+        cpu_buf_num, cpu_buf_size, cpu_free_size = stats["cpu"]
+        gpu_buf_num, gpu_buf_size, gpu_free_size = stats["gpu"]
+
+        if cpu_buf_num > 0:
             act_pool = (
-                f" | act pool: {total_bytes / gib:.2f} in {n_buf} bufs"
-                f" ({free_bytes / gib:.2f} idle)"
+                f" | act pool: {cpu_buf_num} buffers, "
+                f"{cpu_buf_size / gib:.2f} GB total, "
+                f"{cpu_free_size / gib:.2f} GB free"
             )
-        n_buf, total_bytes, free_bytes = GpuMainGradSlotPool.get_instance().stats()
-        if n_buf:
+        if gpu_buf_num > 0:
             mgrad_pool = (
-                f" | mgrad pool: {total_bytes / gib:.2f} in {n_buf} bufs"
-                f" ({free_bytes / gib:.2f} idle)"
+                f" | mgrad pool: {gpu_buf_num} buffers, "
+                f"{gpu_buf_size / gib:.2f} GB total, "
+                f"{gpu_free_size / gib:.2f} GB free"
             )
     except (ImportError, AttributeError):
         pass
