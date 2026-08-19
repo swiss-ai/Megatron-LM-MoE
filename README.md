@@ -42,15 +42,144 @@ git submodule update --remote _research
 
 The submodule pointer pinned in this repo deliberately lags what's checked out; everyone pulls `_research` directly to stay current, and the pin is bumped only occasionally. Each run logs `PRETRAIN CONFIG COMMIT: <sha>[-dirty]` — that logged SHA, not the pin, is the source of truth for which config produced a run.
 
-## Muon-MD gain logging
+## Muon weight logging
 
-For `--optimizer md_decoupling`, pass `--log-muon-md-gains` to write effective gain
-statistics to TensorBoard and Weights & Biases at `--tensorboard-log-interval`. Metrics use
-`muon-md/gains/<family>/<axis>/<stat>`, where the axis is `row`, `col`, or `flat`; the
-statistics are `mean`, `rms`, `min`, and `max`. Families distinguish routers, embeddings,
-outputs, attention inputs/outputs, expert inputs/outputs, dense MLP inputs/outputs, and other
-matrices. Softplus gains are transformed before logging, so the values match the multipliers
-applied to model weights.
+For `--optimizer muon` or `--optimizer dist_muon`, pass `--log-muon-sparsity` and/or
+`--log-muon-param-rms` to log the Muon-managed matrices by parameter family. Metrics use
+`muon/sparsity/<family>/fraction-below-<threshold>` and `muon/params/<family>/rms`. The default
+sparsity thresholds are `1e-20`, `1e-10`, and `1e-30`; override them with
+`--muon-sparsity-thresholds`. Use `--muon-log-interval N` to override the default
+`--log-interval` cadence, and `--log-muon-per-layer` to additionally emit
+`muon/layers/<layer>/...` metrics. Sparsity and RMS are computed per logical matrix and then
+averaged equally within each family, with TP shards combined and replicated DP copies counted
+once. Pass `--log-muon-gains` to additionally log LayerNorm gains.
+
+## Muon-MD logging
+
+For `--optimizer md_decoupling`, pass `--log-muon-gains` to write effective gain
+`mean`, `rms`, `effective-rms`, `min`, and `max` to TensorBoard and Weights & Biases at
+the Muon-MD logging interval. Metrics use `muon-md/gains/<family>/<row|col|flat>/<stat>` for
+routers, embeddings, outputs, attention, experts, MoE latent projections, dense MLPs, and
+unclassified matrices. Values are
+transformed to the multipliers applied to weights, with TP shards combined and replicated TP/DP
+copies counted once. Row-column configurations also log their combined gain-field RMS at
+`muon-md/gain-field/<family>/rms`. Softplus gains additionally log per-axis saturation based on
+the softplus derivative, plus combined log scale and row-column imbalance under
+`muon-md/gauge/<family>/...`. Effective RMS, combined scale, and gauge values are computed for
+each matrix first and then averaged with equal matrix weight, so row and column gains from
+unrelated matrices are never paired. Each slice of a merged
+expert tensor counts as a separate matrix. The legacy `mean`, `rms`, `min`, `max`, and saturation
+fraction remain element-level distribution summaries.
+
+Pass `--log-muon-sparsity` to report effective-weight sparsity at
+`muon-md/sparsity/<family>/fraction-below-<threshold>`. The default thresholds are `1e-20`,
+`1e-10`, and `1e-30`; override them with, for example,
+`--muon-sparsity-thresholds 1e-8 1e-12`. Use `--muon-log-interval N` to set the collection
+and logging cadence; when omitted, it inherits `--log-interval`. Logging runs after Muon-MD
+reapplies the gains, so the model parameter already contains the effective weight, for example
+$W_{\mathrm{eff},ij}=W_{ij}\phi(r_i)\phi(c_j)$ for row-column gains. For each logical matrix $m$,
+
+$$
+\operatorname{sparsity}_{\tau}(W_{\mathrm{eff},m})
+=\frac{\#\{(i,j): |W_{\mathrm{eff},m,ij}|<\tau\}}
+       {\#\{(i,j)\}}.
+$$
+
+The family metric is the equal-weight average of these per-matrix fractions. TP shards are
+combined before computing the fraction, and each slice of a merged expert tensor is treated as a
+separate expert matrix. If a threshold is below the parameter dtype's smallest positive value,
+the metric counts exact zeros without underflowing the comparison threshold.
+
+Pass `--log-muon-param-rms` to report effective-parameter RMS at
+`muon-md/params/<family>/rms`. For each logical matrix $m$ this is
+
+$$
+\operatorname{RMS}(W_m)=\frac{\lVert W_m\rVert_F}{\sqrt{N_m}}
+=\sqrt{\frac{\sum_{i,j}W_{m,ij}^2}{N_m}}.
+$$
+
+As with sparsity, $W_m$ already includes its applied gains, TP shards are combined, merged experts
+remain separate matrices, and the family metric averages the per-matrix RMS values equally.
+
+The logged values are computed as follows:
+
+For a raw gain vector $g$, let $e=\phi(g)$ be its effective multiplier. The element-weighted
+statistics are
+
+$$
+\operatorname{mean}(e)=\frac{\sum_i e_i}{N},\qquad
+\operatorname{RMS}(e)=\sqrt{\frac{\sum_i e_i^2}{N}}.
+$$
+
+`min` and `max` are the extrema over the same effective-gain elements. For softplus gains,
+
+$$
+\text{saturated-fraction}
+=\frac{\#\{i:\operatorname{sigmoid}(g_i)<10^{-2}\}}{N}.
+$$
+
+For a TP-sharded gain axis, each rank first contributes $[\sum_i e_i^2,\,N]$, plus
+$\sum_i\log e_i$ for softplus gains. Their TP `SUM` all-reduce reconstructs the corresponding
+full-axis sums and count. The matrix-level statistics are computed only after that reduction.
+
+For matrices $m=1,\ldots,M$ in a family and axis,
+
+$$
+\text{effective-rms}
+=\frac{1}{M}\sum_{m=1}^{M}\operatorname{RMS}(e_m).
+$$
+
+Muon-MD applies row and column gains by broadcasting, so each matrix entry is multiplied as
+$W'_{ij}=W_{ij}r_i c_j$. The combined multiplier is therefore the outer-product gain field
+$rc^\top$. Its RMS factorizes exactly as
+
+$$
+\operatorname{RMS}(rc^\top)=\operatorname{RMS}(r)\operatorname{RMS}(c).
+$$
+
+For $M$ matched row and column gains $r_m,c_m$, the logged family value is
+
+$$
+\text{gain-field-rms}
+  =\frac{1}{M}\sum_{m=1}^{M}\operatorname{RMS}(r_m)\operatorname{RMS}(c_m).
+$$
+
+This describes only the multiplicative gain field. It is not the RMS of the resulting effective
+weight $W\odot rc^\top$.
+
+For positive softplus gains, row and column gains have a scale redundancy: replacing
+$r$ with $a r$ and $c$ with $c/a$ leaves the gain field $rc^\top$ unchanged. The gauge metrics
+separate the meaningful combined scale from this otherwise invisible redistribution:
+
+- `combined-log-scale` is
+  $\operatorname{mean}(\log r)+\operatorname{mean}(\log c)$, the log of the product of the row
+  and column geometric means. It tracks their combined multiplicative scale.
+- `row-col-imbalance` is
+  $\operatorname{mean}(\log r)-\operatorname{mean}(\log c)$, the log ratio between those geometric
+  means. It tracks whether scale is moving from the column gains into the row gains or vice versa.
+
+For the $M_+$ matched softplus matrices, the logged family averages are
+
+$$
+\begin{aligned}
+\text{combined-log-scale}
+  &=\frac{1}{M_+}\sum_{m=1}^{M_+}
+    \left(\operatorname{mean}(\log r_m)+\operatorname{mean}(\log c_m)\right),\\
+\text{row-col-imbalance}
+  &=\frac{1}{M_+}\sum_{m=1}^{M_+}
+    \left(\operatorname{mean}(\log r_m)-\operatorname{mean}(\log c_m)\right).
+\end{aligned}
+$$
+
+If `row-col-imbalance` drifts while `combined-log-scale` and `gain-field-rms` remain stable, the row
+and column gains are mostly rescaling each other rather than changing the combined gain field.
+
+Thus, `rms` weights every gain element equally, whereas `effective-rms`, `gain-field-rms`, and the
+gauge metrics weight every matrix equally.
+
+Pass `--log-muon-per-layer` to additionally emit whichever Muon-MD metrics are enabled for
+each global, zero-based transformer layer under `muon-md/layers/<layer>/...`. It should be used
+selectively for large models because it creates one curve per layer, family, axis, and statistic.
 
 ## About
 

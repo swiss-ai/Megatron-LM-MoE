@@ -1487,6 +1487,13 @@ def validate_args(args, defaults={}):
         assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
         assert args.bf16, "MoE expert offloading currently requires using bfloat16 precision."
         assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
+        if args.optimizer == 'muon':
+            warn_rank_0(
+                'MoE expert offloading is not currently correctly supported by the standalone '
+                'Muon optimizer: regular offloaded expert weights are orthogonalized in their '
+                'transposed fused shape without splitting gate/up, while merged FP8 expert '
+                'weights do not undergo Muon orthogonalization.'
+            )
 
         if args.overlap_grad_reduce:
             args.moe_offloading_experts_skip_post_backward_hook = True
@@ -1565,14 +1572,59 @@ def validate_args(args, defaults={}):
                 "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
                 "softplus gains are positive, so the clamp only changes values below 1e-8."
             )
-        if args.hypersphere_radius_from_init:
+        if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
-                "--hypersphere-radius-from-init only applies to --hypersphere-mode flat; "
+                "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
                 f"got {args.hypersphere_mode}."
             )
             warn_rank_0(
-                "--hypersphere-radius-from-init assumes matrix init_std is 1/sqrt(hidden); "
+                "--hypersphere-radius-mode init assumes matrix init_std is 1/sqrt(hidden); "
                 "set --init-method-std accordingly."
+            )
+            if args.muon_tp_mode == "blockwise":
+                warn_rank_0(
+                    "--hypersphere-radius-mode init with --muon-tp-mode blockwise scales the Muon "
+                    "update from local shard shapes while the weight is projected with global "
+                    "shapes; the two spheres disagree under TP > 1."
+                )
+        elif args.hypersphere_radius_mode == "fan_in":
+            sphere_modes = {
+                "--hypersphere-mode": args.hypersphere_mode,
+                "--hypersphere-embedding-mode": args.hypersphere_embedding_mode,
+                "--hypersphere-router-mode": args.hypersphere_router_mode,
+            }
+            active = {k: v for k, v in sphere_modes.items() if v not in (None, "none")}
+            assert active, (
+                "--hypersphere-radius-mode fan_in only moves the sphere radius, so it needs at "
+                "least one active hypersphere mode."
+            )
+            if not args.md_normalize_update_to_weight_norm:
+                unsupported = {k: v for k, v in active.items() if v not in ("row", "flat")}
+                assert not unsupported, (
+                    "--hypersphere-radius-mode fan_in puts ||W||_F at sqrt(d_out), which the "
+                    "'row' (unit rows) and 'flat' modes reach but the column-normalizing modes "
+                    f"do not; got {unsupported}."
+                )
+                if args.num_experts is not None:
+                    assert args.num_experts <= args.hidden_size, (
+                        "--hypersphere-radius-mode fan_in keeps the router's Muon scale "
+                        "unmodified, which matches the sqrt(num_experts) router sphere only when "
+                        f"num_experts <= hidden_size; got {args.num_experts=} and "
+                        f"{args.hidden_size=}."
+                    )
+                assert args.muon_scale_mode == "shape_up", (
+                    "--hypersphere-radius-mode fan_in targets ||update||_F = sqrt(d_out), which "
+                    f"only agrees with --muon-scale-mode shape_up; got {args.muon_scale_mode}."
+                )
+                assert args.muon_tp_mode != "blockwise", (
+                    "--hypersphere-radius-mode fan_in is inconsistent with --muon-tp-mode "
+                    "blockwise (the update would be scaled from local shard shapes while the "
+                    "weight is projected with global shapes); use duplicated or distributed."
+                )
+            warn_rank_0(
+                "--hypersphere-radius-mode fan_in assumes matrix init_std is 1/sqrt(fan_in); set "
+                "the init accordingly, or the first projection will rescale blocks whose d_in "
+                "differs from the init denominator."
             )
         assert not (args.hypersphere_scale_out_proj_init and args.residual_output_scaling), (
             "--hypersphere-scale-out-proj-init and --residual-output-scaling both apply the "
@@ -2594,6 +2646,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-no-split-fc1', action='store_false', default=True,
+                       dest='muon_split_fc1',
+                       help='Whether to split fused GLU FC1 parameters into gate/up matrices '
+                       'for Muon or MDDecoupling')
     group.add_argument('--muon-split-mla-per-head', action='store_true',
                        help='Split MLA up-projection parameters per attention head for Muon or '
                        'MDDecoupling.')
@@ -2621,9 +2677,12 @@ def _add_regularization_args(parser):
                        'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
-    group.add_argument('--muon-tp-mode', type=str, default='blockwise',
+    group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed'],
-                       help='How to perform NS calculation for tensor model parallel weights')
+                       help='How to perform NS calculation for tensor model parallel weights. '
+                       'Defaults to "duplicated" (orthogonalize the full TP-unsharded matrix); '
+                       '"blockwise" treats each shard as its own matrix and is rejected with '
+                       '--hypersphere-radius-mode fan_in.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
@@ -2903,11 +2962,18 @@ def _add_training_args(parser):
                        help='Scale the hypersphere target radius for is_out_proj params '
                        '(linear_proj, linear_fc2) by 1/sqrt(2 * num_layers), matching '
                        'scaled_init_method_normal.')
-    group.add_argument('--hypersphere-radius-from-init', action='store_true', default=False,
-                       help='Place each flat-mode matrix sphere at its init Frobenius norm '
-                       '(init_std=1/sqrt(hidden)) instead of sqrt(max(d_out,d_in)), rescaling both '
-                       'the projection target and the Muon update by sqrt(min(d_out,d_in)/hidden). '
-                       'Keeps narrow matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere.')
+    group.add_argument('--hypersphere-radius-mode', type=str, default='shape_native',
+                       choices=['shape_native', 'init', 'fan_in'],
+                       help='Where to place the hypersphere, relative to the shape-native radius '
+                       '(unit row/col slices, sqrt(max(d_out,d_in)) for flat). "init" places each '
+                       'flat-mode sphere at the matrix init Frobenius norm '
+                       '(init_std=1/sqrt(hidden)), rescaling both the projection target and the '
+                       'Muon update by sqrt(min(d_out,d_in)/hidden), which keeps narrow matrices '
+                       '(MLA lora, MoE fc2, GQA K/V) on their init sphere. "fan_in" instead '
+                       'assumes init_std=1/sqrt(d_in), giving ||W||_F = sqrt(d_out) (unit rows) '
+                       'for any shape under both --hypersphere-mode row and flat, with the Muon '
+                       'update rescaled to the same norm; it is independent of hidden size, so it '
+                       'also holds for blocks whose axes are both off the residual stream.')
     group.add_argument('--md-router-use-orthogonal-updates',
                        type=lambda s: {'true': True, 'false': False}[s.lower()],
                        default=None, choices=[True, False],
@@ -2947,6 +3013,11 @@ def _add_training_args(parser):
                        help='Use Muon-style orthogonalized updates for matrix params under '
                        'md_decoupling. Use --no-use-orthogonal-updates to disable. '
                        'Embedding + LM head ALWAYS use the Adam branch.')
+    group.add_argument('--md-normalize-update-to-weight-norm', action='store_true',
+                       help='For each existing logical MuonMD block, rescale U to '
+                       'U / ||U||_F * R_W using the measured update norm rather than the ideal '
+                       'semi-orthogonal norm. Each weight-block norm R_W is cached once. This '
+                       'supersedes --muon-scale-mode and other scalar update scaling.')
     group.add_argument('--use-layer-wise-distributed-optimizer', action='store_true', default=False,
                        help='For --optimizer md_decoupling: wrap the optimizer with '
                        'LayerWiseDistributedOptimizer to shard optimizer state over the '

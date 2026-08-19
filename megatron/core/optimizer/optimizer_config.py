@@ -268,6 +268,10 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_fc1: bool = True
+    """Whether to split fused GLU FC1 parameters into gate/up matrices for Muon and
+    MDDecoupling."""
+
     muon_split_mla_per_head: bool = False
     """Whether to split MLA up-projection parameters per attention head for Muon optimizer."""
 
@@ -294,8 +298,10 @@ class OptimizerConfig:
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
-    muon_tp_mode: str = "blockwise"
-    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+    muon_tp_mode: str = "duplicated"
+    """How to perform NS calculation for tensor parallel weights. Defaults to "duplicated", which
+    orthogonalizes the full (TP-unsharded) matrix; "blockwise" treats each shard as its own matrix,
+    which is incompatible with hypersphere_radius_mode='fan_in'."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
@@ -364,11 +370,15 @@ class OptimizerConfig:
     """Scale the hypersphere target radius for is_out_proj params (linear_proj, linear_fc2) by
     1/sqrt(2 * num_layers), matching scaled_init_method_normal."""
 
-    hypersphere_radius_from_init: bool = False
-    """Place each flat-mode matrix's sphere at its init Frobenius norm (init_std=1/sqrt(hidden))
-    instead of the shape-native sqrt(max(d_out,d_in)). Rescales both the projection target and the
-    Muon update by sqrt(min(d_out,d_in)/hidden), so narrow matrices (MLA lora, MoE fc2, GQA K/V)
-    stay on their init sphere. No-op for matrices whose smaller dim already equals hidden."""
+    hypersphere_radius_mode: str = 'shape_native'
+    """Where to place the hypersphere, relative to the shape-native radius (unit row/col slices,
+    sqrt(max(d_out,d_in)) for flat). One of 'shape_native'/'init'/'fan_in'.
+    'init': flat-mode sphere at the matrix's init Frobenius norm (assumes init_std=1/sqrt(hidden)),
+    rescaling both the projection target and the Muon update by sqrt(min(d_out,d_in)/hidden) so
+    narrow matrices (MLA lora, MoE fc2, GQA K/V) stay on their init sphere.
+    'fan_in': sphere at init_std=1/sqrt(d_in), i.e. ||W||_F = sqrt(d_out) (unit rows) for any shape
+    and both the 'row' and 'flat' sphere modes, with the Muon update rescaled to match. Independent
+    of hidden_size, so it also holds for blocks whose axes are both off the residual stream."""
 
     md_router_use_orthogonal_updates: Optional[bool] = True
     """Per-param-group override for use_orthogonal_updates on MoE router weights. True forces
@@ -377,6 +387,13 @@ class OptimizerConfig:
     use_orthogonal_updates: bool = True
     """Use Muon-style orthogonalized updates for matrix params under md_decoupling. Embedding +
     LM head ALWAYS use the Adam branch regardless of this flag."""
+
+    md_normalize_update_to_weight_norm: bool = False
+    """If true, rescale each existing logical MuonMD update block ``U`` to
+    ``U / ||U||_F * R_W``. This measures the actual update norm instead of assuming an ideal
+    semi-orthogonal norm of ``sqrt(min(d_out, d_in))``. Each corresponding weight-block norm
+    ``R_W`` is measured once before the first update and cached. Muon scale modes and other
+    scalar update factors are superseded for this path."""
 
     hypersphere_gains_mode: Optional[str] = 'rowcol'
     """Learnable per-axis gains for matrix params. One of

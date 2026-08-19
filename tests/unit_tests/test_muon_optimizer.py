@@ -763,6 +763,22 @@ def test_muon_builder_routes_kda_decay_parameters_to_scalar_optimizer(monkeypatc
     assert captured["scalar"][1] is model.dt_bias
 
 
+def test_muon_glu_fc1_orthogonalizes_gate_and_up_separately():
+    param = torch.nn.Parameter(torch.empty(8, 4, device='cuda'))
+    param.glu_split_dim = 0
+    grad = torch.arange(32, dtype=torch.float32, device='cuda').view_as(param)
+
+    output, calls = _record_muon_split_output(
+        param,
+        grad,
+        split_fc1=True,
+    )
+
+    assert [tuple(call.shape) for call in calls] == [(4, 4), (4, 4)]
+    assert torch.equal(output[:4], torch.ones_like(output[:4]))
+    assert torch.equal(output[4:], torch.full_like(output[4:], 2.0))
+
+
 @pytest.mark.parametrize(
     ("split_mla_per_head", "expected_q_up_proj_head_dim"),
     [(False, None), (True, 8)],
@@ -781,12 +797,19 @@ def test_muon_builder_uses_per_head_mla_kv_split_shapes(
                 v_head_dim=5,
                 qk_pos_emb_head_dim=2,
                 q_lora_rank=None,
+                gated_linear_unit=True,
             )
             self.kv_up = torch.nn.Parameter(torch.ones(88, 5))
+            self.grouped_fc1 = torch.nn.Parameter(torch.ones(8, 5))
+            self.offloaded_fc1 = torch.nn.Parameter(torch.ones(5, 8))
 
         def named_parameters(self):
             return iter(
-                [("decoder.layers.0.self_attention.linear_kv_up_proj.weight", self.kv_up)]
+                [
+                    ("decoder.layers.0.self_attention.linear_kv_up_proj.weight", self.kv_up),
+                    ("decoder.layers.0.mlp.experts.linear_fc1.weight0", self.grouped_fc1),
+                    ("decoder.layers.0.mlp.experts.weight1_expert_0", self.offloaded_fc1),
+                ]
             )
 
     captured_kwargs = {}
@@ -825,14 +848,17 @@ def test_muon_builder_uses_per_head_mla_kv_split_shapes(
     config.fp16 = False
     config.bf16 = False
 
+    model_chunk = _FakeModelChunk()
     muon_module.get_megatron_muon_optimizer(
         config,
-        [_FakeModelChunk()],
+        [model_chunk],
         pg_collection=SimpleNamespace(),
     )
 
     assert captured_kwargs["kv_up_proj_split_shapes"] == (6, 5)
     assert captured_kwargs["q_up_proj_head_dim"] == expected_q_up_proj_head_dim
+    assert model_chunk.grouped_fc1.glu_split_dim == 0
+    assert not hasattr(model_chunk.offloaded_fc1, "glu_split_dim")
 
 
 def test_muon_optimizer_mla_kv_up_proj_split():

@@ -208,8 +208,25 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
-    log_muon_md_gains: bool = False
-    """If set, log effective Muon-MD gain statistics by parameter family and gain axis."""
+    log_muon_gains: bool = False
+    """If set, log available Muon or Muon-MD gain statistics by parameter family."""
+
+    log_muon_sparsity: bool = False
+    """If set, log weight sparsity by Muon parameter family."""
+
+    log_muon_param_rms: bool = False
+    """If set, log weight RMS by Muon parameter family."""
+
+    log_muon_per_layer: bool = False
+    """If set, additionally log all Muon statistics by global layer."""
+
+    muon_log_interval: int | None = None
+    """Muon logging interval. Defaults to log_interval when unset."""
+
+    muon_sparsity_thresholds: list[float] = field(
+        default_factory=lambda: [1e-20, 1e-10, 1e-30]
+    )
+    """Absolute weight thresholds used for Muon sparsity logging."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
