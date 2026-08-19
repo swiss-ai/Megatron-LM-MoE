@@ -279,6 +279,15 @@ class KimiDeltaAttention(GatedDeltaNet):
             pg_collection=pg_collection,
         )
 
+        # KDA's short depthwise conv1d requires a silu/swish activation (FLA's causal_conv1d
+        # kernel and the Kimi-Linear reference). Decouple it from config.activation_func, which
+        # may be set to a non-silu MoE/GLU activation (e.g. sslu/xpr) for the MLP path and would
+        # otherwise trip `assert self.activation in ["silu", "swish"]` below. In KDA, act_fn /
+        # activation are used ONLY for this conv (the output gate uses sigmoid), so forcing them
+        # to silu here is safe and leaves the MoE activation untouched.
+        self.act_fn = F.silu
+        self.activation = "silu"
+
         # The reference KDA uses low-rank projections for both the decay input
         # and output gate:
         #   f_b(f_a(x)): hidden -> value_head_dim -> num_v_heads * key_head_dim
