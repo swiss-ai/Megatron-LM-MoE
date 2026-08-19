@@ -569,6 +569,14 @@ class TransformerConfig(ModelParallelConfig):
     out_norm is dropped when this is set. The output gate itself (linear_attention_use_output_gate)
     is unaffected."""
 
+    kda_disable_sandwich_norm: bool = False
+    """If True, exclude Kimi Delta Attention layers from sandwich norm: their post-attention and
+    post-MLP norm slots stay IdentityOp even when sandwich_norm is on, restoring the original KDA
+    behavior (the KDA spec left those slots unpopulated). The interleaved standard-attention layers
+    still get the sandwich post-norm. Only affects the KDA experimental-attention variant; other
+    variants (e.g. gated_delta_net) keep the uniform sandwich norm. No effect when sandwich_norm is
+    off."""
+
     linear_attention_carry_state: bool = False
     """If True, carry the recurrent state across forward passes. Each forward pulls the
     previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back

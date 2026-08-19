@@ -230,22 +230,38 @@ def get_transformer_block_with_experimental_attention_variant_spec(
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
     # Optional sandwich norm: normalize each sublayer's output before the residual add
-    # (x = x + Norm(Sublayer(Norm(x)))). Applied uniformly to every layer in the hybrid
-    # block -- both the experimental-attention (e.g. KDA/GDN) sublayers and the interleaved
-    # standard-attention sublayers -- matching the standard gpt_layer_specs path. When
-    # sandwich_norm is off, these slots stay IdentityOp (the TransformerLayerSubmodules
-    # default) and the post-norm code paths in TransformerLayer are inert.
-    post_layer_norm = (
+    # (x = x + Norm(Sublayer(Norm(x)))), matching the standard gpt_layer_specs path. Applied
+    # uniformly to every layer in the hybrid block by default; with kda_disable_sandwich_norm
+    # the KDA layers are excluded (their post-norm slots stay IdentityOp — see the per-layer
+    # post_layer_norm inside the loop). When sandwich_norm is off, every layer's slots stay
+    # IdentityOp (the TransformerLayerSubmodules default) and the post-norm code paths in
+    # TransformerLayer are inert.
+    sandwich_post_norm = (
         backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         if config.sandwich_norm
         else IdentityOp
     )
+    # Opt-in exclusion of KDA layers from sandwich norm (--kda-disable-sandwich-norm), which
+    # restores the original KDA behavior where the KDA spec left the post-norm slots
+    # unpopulated. Only the KDA variant is affected; other experimental variants (e.g.
+    # gated_delta_net) keep the uniform sandwich norm regardless of this flag.
+    exclude_kda_from_sandwich = (
+        config.kda_disable_sandwich_norm
+        and config.experimental_attention_variant == "kda"
+    )
     layer_specs = []
     for layer_number in range(config.num_layers):
+        is_experimental_attention_layer = experimental_attention_pattern[layer_number] == 1
         attention = (
             experimental_attention_spec
-            if experimental_attention_pattern[layer_number] == 1
+            if is_experimental_attention_layer
             else standard_attention_spec
+        )
+        # Standard-attention layers keep sandwich norm; KDA layers do not.
+        post_layer_norm = (
+            IdentityOp
+            if (exclude_kda_from_sandwich and is_experimental_attention_layer)
+            else sandwich_post_norm
         )
         mlp = moe_layer_spec if moe_layer_pattern[layer_number] == 1 else dense_mlp_layer_spec
         input_layernorm = (
