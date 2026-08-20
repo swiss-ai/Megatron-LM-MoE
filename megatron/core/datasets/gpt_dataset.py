@@ -12,6 +12,12 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+from megatron.core.datasets.goldfish import (
+    GOLDFISH_TOKEN_ID,
+    apply_goldfish,
+    get_exemption_lut,
+    get_hash_table,
+)
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
@@ -311,6 +317,17 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     max_docs_per_bin: int = 0
     """Maximum number of documents allowed per sample in bfd, 0 means no limit"""
 
+    goldfish_loss: bool = False
+    """Enable Goldfish loss: deterministically drop ~1/goldfish_k of tokens from the loss to
+       mitigate verbatim memorization. Pretraining only."""
+
+    goldfish_k: int = 50
+    """Goldfish drop frequency: each eligible position is dropped with probability 1 / k."""
+
+    goldfish_h: int = 50
+    """Goldfish context width: the h labels ending at (and including) a position are
+    hashed to decide its drop."""
+
     tokenizer_extra_metadata: Optional[TokenizerExtraMetadata] = None
     """Parsed tokenizer metadata forwarded to dataset workers."""
 
@@ -332,6 +349,19 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.goldfish_loss:
+            assert self.goldfish_k >= 2, (
+                f"goldfish_k (drop frequency 1/k) must be >= 2; got {self.goldfish_k} "
+                "(k=1 would drop ~100% of eligible tokens)."
+            )
+            assert (
+                self.goldfish_h > 0
+            ), f"goldfish_h (context width) must be > 0; got {self.goldfish_h}."
+            assert self.goldfish_h < self.sequence_length, (
+                f"goldfish_h ({self.goldfish_h}) must be < sequence_length "
+                f"({self.sequence_length}); else the context-window unfold has no valid windows."
+            )
 
         if self.modality_weights:
             omni = (
@@ -392,6 +422,8 @@ class GPTDataset(MegatronDataset):
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
+        # Goldfish drops need no cache opt-out: loss_mask is cloned out of the cache on
+        # read (and cloned into it on store), so per-sample mutation cannot leak back.
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -408,14 +440,43 @@ class GPTDataset(MegatronDataset):
             self._build_document_sample_shuffle_indices()
         )
 
-        # Snapshot the modality-weighting inputs; the vocab_size property can walk an
-        # O(vocab) HF chain, too expensive for the per-sample path in __getitem__.
+        # Goldfish loss: memorization-mitigation via deterministic loss-mask drops. The
+        # hash table / coefficients / exemption LUT are shared per-process caches in
+        # megatron.core.datasets.goldfish: identical for every dataset instance, and
+        # blended runs build one instance per blend component.
+        if self.config.goldfish_loss:
+            self._goldfish_k = self.config.goldfish_k
+            self._goldfish_h = self.config.goldfish_h
+            self._goldfish_token_id = GOLDFISH_TOKEN_ID
+            # Goldfish-exempt token ids = the model's full known special-token set for
+            # text-only and omni tokenizers alike. None when no metadata was supplied.
+            # Stored as a tuple: it doubles as the exemption-LUT cache key.
+            metadata = self.config.tokenizer_extra_metadata
+            self._goldfish_exemption_ids = (
+                tuple(metadata.special_tokens.full_ids) if metadata is not None else None
+            )
+            # Drops apply to the train split only, so only its instances log.
+            if self.index_split == Split.train:
+                if self._goldfish_exemption_ids:
+                    n_exempt = len(self._goldfish_exemption_ids)
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"Goldfish exemption enabled for {n_exempt} token ids.",
+                    )
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "Goldfish loss is enabled but the tokenizer provides no special-token "
+                        "id set; special tokens may be dropped from the loss.",
+                    )
+
         if self.config.modality_weights:
             self._omni_modalities = self.config.tokenizer_extra_metadata.omni.modalities
             self._modality_weights = {
                 name: float(weight) for name, weight in self.config.modality_weights.items()
             }
-            self._lut_vocab_size = int(self.config.tokenizer.vocab_size)
             # The LUT itself is built on first __getitem__, i.e. in the dataloader
             # worker, so the tensor is never pickled per instance.
             self._weight_lut = None
@@ -424,6 +485,11 @@ class GPTDataset(MegatronDataset):
                 logging.INFO,
                 f"Per-modality loss weights enabled: {self.config.modality_weights}",
             )
+
+        if self.config.goldfish_loss or self.config.modality_weights:
+            # Snapshot: the vocab_size property can walk an O(vocab) HF chain, too
+            # expensive for the per-sample LUT paths in __getitem__.
+            self._tokenizer_vocab_size = int(self.config.tokenizer.vocab_size)
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -557,13 +623,38 @@ class GPTDataset(MegatronDataset):
         tokens[tokens == self._pad_token_id] = 0
         labels[padding] = 0
 
+        # Goldfish loss: deterministically drop ~1/k of tokens from the loss based on a
+        # hash of the h labels ending at each position. Only loss_mask is zeroed;
+        # the returned labels are left untouched (apply_goldfish works on a clone).
+        # Train split only: dropping from validation/test would make eval losses
+        # incomparable to non-goldfish runs (the hash excludes the same content from
+        # every eval). Skipped for the idx is None batch-padding sample, whose
+        # loss_mask is fully zeroed just below anyway.
+        if self.config.goldfish_loss and self.index_split == Split.train and idx is not None:
+            exemption_lut = (
+                get_exemption_lut(
+                    self._goldfish_exemption_ids, self._tokenizer_vocab_size, device=labels.device
+                )
+                if self._goldfish_exemption_ids
+                else None
+            )
+            goldfish_labels = apply_goldfish(
+                labels,
+                goldfish_token_id=self._goldfish_token_id,
+                k=self._goldfish_k,
+                goldfish_hash_table=get_hash_table(labels.device),
+                goldfish_context_width=self._goldfish_h,
+                exemption_lut=exemption_lut,
+            )
+            loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
+
         # Weight each prediction target by modality.
         if self.config.modality_weights and idx is not None:
             if self._weight_lut is None:
                 self._weight_lut = get_modality_weight_lut(
                     self._omni_modalities,
                     self._modality_weights,
-                    self._lut_vocab_size,
+                    self._tokenizer_vocab_size,
                     device=labels.device,
                 )
             loss_mask = loss_mask * self._weight_lut[labels]

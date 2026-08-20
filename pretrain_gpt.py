@@ -420,6 +420,9 @@ def core_gpt_dataset_config_from_args(args):
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
+        "goldfish_loss": args.goldfish_loss,
+        "goldfish_k": args.goldfish_k,
+        "goldfish_h": args.goldfish_h,
         "tokenizer_extra_metadata": tokenizer_extra_metadata,
         # Omit no-op modality weights.
         "modality_weights": {
@@ -433,6 +436,10 @@ def core_gpt_dataset_config_from_args(args):
     assert not (data_args["modality_weights"] and args.sft), (
         "--vision-weight/--audio-weight are not supported with --sft: SFTDataset does "
         "not apply modality weights to its loss mask."
+    )
+    assert not (args.goldfish_loss and args.sft), (
+        "--goldfish-loss is not supported with --sft: SFTDataset builds its own loss "
+        "mask and would silently skip goldfish dropping."
     )
 
     # add FIM args to the config

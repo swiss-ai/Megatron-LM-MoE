@@ -51,7 +51,8 @@ Omni content tokens are excluded even though artifacts flag them special.
   `set_global_variables`) — the single access path; forwarded to dataloader workers via
   `GPTDatasetConfig.tokenizer_extra_metadata`. `.special_tokens` always present,
   `.omni` (`OmniMetadata`) only for omni tokenizers.
-- **Goldfish exemption** (planned) ← full special-token set (`ModelSpecialTokens.full_ids`).
+- **Goldfish exemption** ← full special-token set (`ModelSpecialTokens.full_ids`); see
+  `docs/goldfish_loss.md`.
 - **Per-modality loss weighting** (`--vision-weight`/`--audio-weight`) ← content range
   + `ModalityInfo.structure_ids`; see `docs/modality_loss_weighting.md`.
 - **Per-modality loss tracking** (`--log-per-modality-loss`) ← same classification,

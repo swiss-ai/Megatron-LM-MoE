@@ -19,8 +19,9 @@ effective_loss_mask[i] = base_loss_mask[i] * modality_weight(labels[i])
 ```
 
 The target `labels[i]`, rather than the input token, determines which prediction is
-weighted. Existing zeros from padding, EOD masking, or another masking stage remain
-zero.
+weighted. Existing zeros from padding, EOD masking, or goldfish dropping
+([`docs/goldfish_loss.md`](goldfish_loss.md), applied before the weight multiply)
+remain zero.
 
 ## Technical flow
 
@@ -76,9 +77,10 @@ loss numerators and denominators add up to the `lm loss` pair for the supported
 configurations. Targets labeled `-100` are excluded from error reporting; this
 covers GPT/SFT padding and ignored SFT targets.
 
-Denominators are clamped to ≥ 1 in the per-step reduction (`training.py`), so an
-empty group reports `0.0`, not NaN. A modality weighted to `0.0` has zero weighted
-count, so its `<name> loss` is `0.0` — track it via `<name> error`.
+Denominators are clamped to ≥ 1 in both the per-step and the evaluation reductions
+(`training.py`), so an empty group reports `0.0`, not NaN. A modality weighted to
+`0.0` has zero weighted count, so its `<name> loss` is `0.0` — track it via
+`<name> error`.
 
 ## Requirements & validation
 
