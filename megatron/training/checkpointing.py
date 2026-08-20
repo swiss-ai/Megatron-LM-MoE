@@ -1632,6 +1632,12 @@ def load_args_from_checkpoint(
     _set_arg('linear_attention_full_rank_output_gate', force=True)
     _set_arg('linear_attention_safe_output_gate', force=True)
     _set_arg('linear_attention_safe_output_gate_lower_bound', force=True)
+    # Fuses an extra Q-sized gate block into linear_qkv (layout [Q, Gate, K, V]), so it changes
+    # the model's parameter shapes and forward. Must be restored (force=True: it defaults False,
+    # so _set_arg would otherwise early-return and leave a resumed/inference build ungated).
+    # Because the gate block is Q-sized, an ungated rebuild coincidentally matches the gated
+    # linear_qkv width, so the mismatch loads silently-wrong rather than erroring.
+    _set_arg('attention_output_gate', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
