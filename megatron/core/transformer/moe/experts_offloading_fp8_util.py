@@ -1178,7 +1178,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx.fp8_permuted_local_hidden_states_sf_chunks = fp8_x_sf_chunks
 
         # activation offload: park fp8_x on pinned host during the combine phase and free its GPU
-        # storage. It is reloaded by MoEActReloadTrigger.backward before this Function's backward.
+        # storage. It is reloaded by MoEReloadTrigger.backward before this Function's backward.
         act_offload_handle = None
         if config.moe_offload_input and fp8_x_full.numel() > 0:
             act_offload_handle = MoEOffloadManager.offload_activation(fp8_x_full, stream_manager, "fp8_x")
@@ -1243,7 +1243,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             permuted_probs
         ) = ctx.saved_tensors
 
-        # Reconstruct fp8_x from the host-offloaded copy. MoEActReloadTrigger.backward has already
+        # Reconstruct fp8_x from the host-offloaded copy. MoEReloadTrigger.backward has already
         # launched the H2D (overlapping the combine-backward all-to-all); wait for it before use and
         # rebuild the per-chunk views that were dropped in forward.
         act_offload_handle: MoEOffloadHandle = getattr(ctx, "act_offload_handle", None)
@@ -1445,9 +1445,9 @@ def offloading_fp8_grouped_swiglu_mlp(
             their accumulation target in place of the host-resident ``main_grad``.
 
     Returns:
-        tuple[torch.Tensor, ActivationOffloadHandle | None]: the MLP output and the activation
+        tuple[torch.Tensor, MoEOffloadHandle | None]: the MLP output and the activation
         offload handle (None unless ``moe_offload_activations`` produced one). The caller must wire
-        the handle into ``MoEActReloadTrigger`` on the combine output so it is reloaded in backward.
+        the handle into ``MoEReloadTrigger`` on the combine output so it is reloaded in backward.
     """
     output, act_offload_handle = OffloadingExpertsFP8GroupedSwiMLP.apply(
         a1,

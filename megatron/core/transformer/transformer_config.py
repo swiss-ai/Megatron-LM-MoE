@@ -2013,7 +2013,7 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"moe_offload_activations={self.moe_offload_activations!r}: "
                     f"'{MOE_OFFLOAD_FC1_OUTPUT}' requires '{MOE_OFFLOAD_INPUT}' -- the fc1 reload "
-                    "rides the same ActivationOffloadHandle / MoEActReloadTrigger as fp8_x."
+                    "rides the same MoEOffloadHandle / MoEReloadTrigger as fp8_x."
                 )
 
         if self.moe_layer_recompute:

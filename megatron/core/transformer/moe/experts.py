@@ -1619,7 +1619,7 @@ class OffloadingExpertsMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         # Transient slot for the activation-offload handle (moe_offload_activations). Set by the
-        # inplace-FP8 path below and read by the enclosing MoE layer to wire MoEActReloadTrigger on
+        # inplace-FP8 path below and read by the enclosing MoE layer to wire MoEReloadTrigger on
         # the combine output. Reset each forward so a disabled/empty path leaves no stale handle.
         self._act_offload_handle = None
         # The main-grad handle is persistent: it carries d2h_done / host_is_zero across

@@ -524,7 +524,7 @@ class MoELayer(BaseMoELayer):
         return output
 
     def _wrap_main_grad_reload(self, output: torch.Tensor):
-        """Wire ``MoEMainGradReloadTrigger`` on the combine output so the offloaded main grad
+        """Wire ``MoEReloadTrigger`` on the combine output so the offloaded main grad
         is reloaded during the combine-backward window.
         """
         handle = getattr(self.experts, "_main_grad_offload_handle", None)
