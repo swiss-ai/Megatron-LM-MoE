@@ -630,12 +630,20 @@ class KimiDeltaAttention(GatedDeltaNet):
             ).clamp(min=1e-4)
             inv_dt = dt + torch.log(-torch.expm1(-dt))
             self.dt_bias.data.copy_(inv_dt)
-            A = torch.empty(
-                self.num_v_heads_local_tp,
-                dtype=torch.float32,
-                device=torch.cuda.current_device(),
-            ).uniform_(*A_init_range)
-            self.A_log.data.copy_(torch.log(A))
+            if self.config.linear_attention_safe_output_gate:
+                # Safe (lower-bound) gate g = g_min*sigmoid(exp(A_log)*(z+dt_bias)):
+                # A_log is init to 0 (exp(A_log)=1), matching the Kimi-Linear reference.
+                # The uniform(1,16) init below is for the softplus form; reusing it here
+                # multiplies dt_bias (~[-6.9,-2.3]) by 1..16, saturating the sigmoid near
+                # 0 so every head starts at ~no-decay -- killing timescale diversity.
+                self.A_log.data.zero_()
+            else:
+                A = torch.empty(
+                    self.num_v_heads_local_tp,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ).uniform_(*A_init_range)
+                self.A_log.data.copy_(torch.log(A))
 
     @jit_fuser
     def _activate_beta(self, beta):

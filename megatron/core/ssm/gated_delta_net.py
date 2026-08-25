@@ -396,12 +396,18 @@ class GatedDeltaNet(MegatronModule):
                     device=torch.cuda.current_device(),
                 )
                 # A_log
-                A = torch.empty(
-                    self.num_v_heads_local_tp,
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
-                ).uniform_(*self.A_init_range)
-                self.A_log.data.copy_(torch.log(A))
+                if self.config.linear_attention_safe_output_gate:
+                    # Safe (lower-bound) gate: A_log init to 0 (exp(A_log)=1), matching
+                    # the Kimi-Linear reference. The uniform(A_init_range) init is for the
+                    # softplus decay and mis-scales the sigmoid argument.
+                    self.A_log.data.zero_()
+                else:
+                    A = torch.empty(
+                        self.num_v_heads_local_tp,
+                        dtype=self.config.params_dtype,
+                        device=torch.cuda.current_device(),
+                    ).uniform_(*self.A_init_range)
+                    self.A_log.data.copy_(torch.log(A))
 
     def _resolve_packed_cu_seqlens(
         self,
