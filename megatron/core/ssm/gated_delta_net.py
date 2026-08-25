@@ -861,7 +861,17 @@ class GatedDeltaNet(MegatronModule):
         Optional ablations (linear_attention_beta_bias_init, _beta_scale) apply a
         learnable additive bias on the beta logit and a post-sigmoid scale.
         """
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
+        if self.config.linear_attention_safe_output_gate:
+            # Kimi-K3 / FlashKDA 'safe' decay: a bounded reparameterization of the
+            # log-decay, g = g_min * sigmoid(exp(A_log) * (z + dt_bias)), so g stays in
+            # (g_min, 0) and exp(cumsum(g)) stays representable in bf16 without the
+            # inference-kernel rescaling trick. This REPLACES the softplus form (it is
+            # not a clamp of it): dt_bias is added first, then scaled by exp(A_log)
+            # inside the sigmoid (cf. fla.ops.kda naive_kda_lowerbound_gate).
+            lb = self.config.linear_attention_safe_output_gate_lower_bound
+            g = lb * torch.sigmoid(A_log_local_cp.exp() * (alpha.float() + dt_bias_local_cp))
+        else:
+            g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
         if not self.config.linear_attention_use_decay:
             g = g * 0.0
         if self.beta_bias is not None:

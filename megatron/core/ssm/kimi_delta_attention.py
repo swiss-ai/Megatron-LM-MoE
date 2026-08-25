@@ -193,6 +193,27 @@ _KDA_SUPPORTS_FUSED_DECAY_GATE = _chunk_kda_supports(
     "use_gate_in_kernel"
 ) and _chunk_kda_accepts("A_log")
 
+# Kimi-K3 'safe' decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)):
+# supported natively by chunk_kda (safe_gate + lower_bound) and by fused_kda_gate
+# (lower_bound), both only in recent FLA. Probe each so older builds fall back to
+# the torch reparameterization in _activate_decay_torch.
+_KDA_SUPPORTS_SAFE_GATE_IN_KERNEL = _chunk_kda_supports("lower_bound") and _chunk_kda_supports(
+    "safe_gate"
+)
+
+
+def _fused_kda_gate_supports_lower_bound() -> bool:
+    """Whether the installed fused_kda_gate exposes the lower_bound (safe-gate) arg."""
+    if not HAVE_FUSED_KDA_GATE:
+        return False
+    try:
+        return "lower_bound" in inspect.signature(fused_kda_gate).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_KDA_FUSED_GATE_SUPPORTS_LOWER_BOUND = _fused_kda_gate_supports_lower_bound()
+
 logger = logging.getLogger(__name__)
 
 
@@ -212,7 +233,10 @@ class KimiDeltaAttention(GatedDeltaNet):
         produced by the reference low-rank projection hidden -> value_head_dim ->
         num_value_heads*key_head_dim.
       - the output gate uses the matching low-rank projection and sigmoid gated
-        RMSNorm from the reference KDA architecture.
+        RMSNorm from the reference KDA architecture. With
+        linear_attention_full_rank_output_gate (Kimi-K3) the output gate is instead
+        a full-rank hidden -> v_dim projection fused into in_proj and sharded on
+        value heads, which drops the output gate's TP/CP all-gather.
       - the chunkwise op is `chunk_kda` (FLA 0.4.0+).
       - A_log is one fp32 scalar per value head, while dt_bias is fp32 and
         channel-wise within each value head.
@@ -310,15 +334,29 @@ class KimiDeltaAttention(GatedDeltaNet):
         #   g_b(g_a(x)): hidden -> value_head_dim -> value_dim
         # Fuse all projections that consume hidden_states directly into one
         # column-parallel GEMM. The second-stage projections remain separate.
+        #
+        # With linear_attention_full_rank_output_gate (Kimi-K3), the output gate
+        # instead is a single full-rank projection hidden -> v_dim, fused straight
+        # into in_proj and sharded on value heads like V, so it needs no second
+        # stage and no TP/CP all-gather. Only the decay keeps its low-rank
+        # bottleneck.
+        self._full_rank_output_gate = self.config.linear_attention_full_rank_output_gate
         self.gate_low_rank_dim = self.value_head_dim
         assert self.gate_low_rank_dim % self.tp_size == 0, (
             "KDA gate low-rank dimension must be divisible by tensor parallel size"
         )
         self.alpha_dim = self.num_value_heads * self.key_head_dim
+        # in_proj tail after Q/K/V: decay bottleneck (f_a) + output gate + beta.
+        # The output gate slot is either the low-rank bottleneck (g_a,
+        # gate_low_rank_dim) or the full-rank gate (v_dim).
+        output_gate_in_proj_dim = (
+            self.v_dim if self._full_rank_output_gate else self.gate_low_rank_dim
+        )
         self.in_proj_dim = (
             self.qk_dim * 2
             + self.v_dim
-            + 2 * self.gate_low_rank_dim
+            + self.gate_low_rank_dim
+            + output_gate_in_proj_dim
             + self.num_value_heads
         )
 
@@ -341,12 +379,12 @@ class KimiDeltaAttention(GatedDeltaNet):
         # the six reference matrices so Muon/MuonMD orthogonalize them separately.
         self.in_proj.weight.is_kda_in_proj = True
         self.in_proj.weight.kda_split_shapes = (
-            self.qk_dim,               # Q
-            self.qk_dim,               # K
-            self.v_dim,                # V
-            self.gate_low_rank_dim,     # f_a (decay bottleneck)
-            self.gate_low_rank_dim,     # g_a (output-gate bottleneck)
-            self.num_value_heads,       # beta
+            self.qk_dim,                    # Q
+            self.qk_dim,                    # K
+            self.v_dim,                     # V
+            self.gate_low_rank_dim,         # f_a (decay bottleneck)
+            output_gate_in_proj_dim,        # g_a bottleneck, or full-rank output gate
+            self.num_value_heads,           # beta
         )
 
         # decay_low_rank/gate_low_rank are already full-sequence by this point
@@ -370,19 +408,25 @@ class KimiDeltaAttention(GatedDeltaNet):
             tp_comm_buffer_name="kda_decay_out",
             tp_group=self.pg_collection.tp,
         )
-        self.gate_out_proj = build_module(
-            submodules.gate_out_proj,
-            self.gate_low_rank_dim,
-            self.v_dim,
-            config=second_stage_config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=True,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="kda_gate_out",
-            tp_group=self.pg_collection.tp,
-        )
+        # Full-rank output gate has no second stage: the gate leaves in_proj
+        # already at v_dim, sharded on value heads. Only the low-rank variant
+        # needs g_b (gate_low_rank_dim -> v_dim).
+        if self._full_rank_output_gate:
+            self.gate_out_proj = None
+        else:
+            self.gate_out_proj = build_module(
+                submodules.gate_out_proj,
+                self.gate_low_rank_dim,
+                self.v_dim,
+                config=second_stage_config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=True,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="kda_gate_out",
+                tp_group=self.pg_collection.tp,
+            )
 
         # Reference shapes: A_log is scalar per value head; dt_bias is
         # channel-wise. Store dt_bias flattened, as FLA does, so both parameters
@@ -416,17 +460,38 @@ class KimiDeltaAttention(GatedDeltaNet):
         self._use_fused_decay_gate = _KDA_SUPPORTS_FUSED_DECAY_GATE and _env_flag(
             "KDA_USE_GATE_IN_KERNEL", True
         )
+        # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
+        # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
+        # lower_bound); we only route to the torch reparameterization when the
+        # installed FLA cannot. No clamp and no forced un-fusing.
+        self._safe_gate = self.config.linear_attention_safe_output_gate
+        self._gate_lower_bound = self.config.linear_attention_safe_output_gate_lower_bound
+        if self._safe_gate and self._use_fused_decay_gate and not _KDA_SUPPORTS_SAFE_GATE_IN_KERNEL:
+            logger.warning(
+                "linear_attention_safe_output_gate is on but the installed "
+                "flash-linear-attention's chunk_kda has no safe_gate/lower_bound; "
+                "falling back to the fused_kda_gate/torch decay gate."
+            )
+            self._use_fused_decay_gate = False
         # Without the in-kernel gate, prefer FLA's fused_kda_gate over torch.
         self._kda_gate_style = (
             None
             if self._use_fused_decay_gate
             else (_KDA_GATE_STYLE if _env_flag("KDA_FUSED_GATE", True) else None)
         )
+        # fused_kda_gate can only do the safe decay in the 0.5 style with a
+        # lower_bound arg; otherwise fall through to the torch reparameterization.
+        if (
+            self._safe_gate
+            and self._kda_gate_style is not None
+            and not (self._kda_gate_style == "0.5" and _KDA_FUSED_GATE_SUPPORTS_LOWER_BOUND)
+        ):
+            self._kda_gate_style = None
         if self._kda_gate_style is None and not self._use_fused_decay_gate:
             logger.warning(
-                "Neither chunk_kda's use_gate_in_kernel nor fused_kda_gate is "
-                "usable in the installed flash-linear-attention; computing the "
-                "decay gate in torch instead (correct, but slower)."
+                "Neither chunk_kda's use_gate_in_kernel nor a lower_bound-capable "
+                "fused_kda_gate is usable in the installed flash-linear-attention; "
+                "computing the decay gate in torch instead (correct, but slower)."
             )
 
         # Dtype of the decay when one is materialized at all (None = fp32, the
@@ -528,6 +593,19 @@ class KimiDeltaAttention(GatedDeltaNet):
         tensor that only has 2*qk + v + 2*gate_low_rank + num_v_heads, which
         fails the moment a distributed checkpoint is saved.
         """
+        if self._full_rank_output_gate:
+            # Output gate is full-rank (v_dim), sharded on value heads like V.
+            return (
+                [
+                    self.qk_dim_local_tp,                     # Q
+                    self.qk_dim_local_tp,                     # K
+                    self.v_dim_local_tp,                      # V
+                    self.gate_low_rank_dim // self.tp_size,   # f_a, decay bottleneck
+                    self.v_dim_local_tp,                      # full-rank output gate
+                    self.num_value_heads // self.tp_size,     # beta
+                ],
+                ["query", "key", "value", "decay_low_rank", "gate", "beta"],
+            )
         return (
             [
                 self.qk_dim_local_tp,                     # Q
@@ -568,11 +646,20 @@ class KimiDeltaAttention(GatedDeltaNet):
         return beta
 
     def _activate_decay(self, alpha, A_log_local_cp, dt_bias_local_cp):
-        """g = -exp(A_log) * softplus(alpha + dt_bias), fp32, [b, s, h, d_k].
+        """Materialize the decay gate g, fp32, [b, s, h, d_k].
+
+        Default: g = -exp(A_log) * softplus(alpha + dt_bias). With
+        linear_attention_safe_output_gate (Kimi-K3), the bounded reparameterization
+        g = g_min * sigmoid(exp(A_log) * (alpha + dt_bias)) is used instead, passed to
+        FLA via fused_kda_gate's `lower_bound` (or done in torch when unsupported).
 
         `alpha` arrives flat ([b, s, h*d_k]), as it leaves decay_out_proj. The
         reshape is per-branch: 0.4's fused_kda_gate splits per head itself.
         """
+        # None => mode 1 (softplus); a value => mode 2 (bounded sigmoid). Only the
+        # lower_bound-capable 0.5 fused gate reaches here with _safe_gate set;
+        # __init__ routes other cases to the torch reparameterization below.
+        lb = self._gate_lower_bound if self._safe_gate else None
         if self._kda_gate_style == "0.4":
             g = fused_kda_gate(
                 alpha, A_log_local_cp, self.key_head_dim, g_bias=dt_bias_local_cp
@@ -582,10 +669,12 @@ class KimiDeltaAttention(GatedDeltaNet):
         if self._kda_gate_style == "0.5":
             # 0.5 can emit the decay in a narrower dtype directly; 0.4 cannot.
             if self._decay_dtype is None:
-                return fused_kda_gate(alpha, A_log_local_cp, dt_bias_local_cp)
+                return fused_kda_gate(
+                    alpha, A_log_local_cp, dt_bias_local_cp, lower_bound=lb
+                )
             return fused_kda_gate(
                 alpha, A_log_local_cp, dt_bias_local_cp,
-                output_dtype=self._decay_dtype,
+                lower_bound=lb, output_dtype=self._decay_dtype,
             )
         g = self._activate_decay_torch(alpha, A_log_local_cp, dt_bias_local_cp)
         return g if self._decay_dtype is None else g.to(self._decay_dtype)
@@ -595,13 +684,33 @@ class KimiDeltaAttention(GatedDeltaNet):
         """Torch fallback for `_activate_decay`; `alpha` already [b, s, h, d_k]."""
         decay_scale = A_log_local_cp.exp().view(1, 1, -1, 1)
         bias = dt_bias_local_cp.view(1, 1, -1, self.key_head_dim)
+        if self._safe_gate:
+            # Kimi-K3 safe decay: g = g_min * sigmoid(exp(A_log) * (alpha + dt_bias)).
+            # Mirrors fla.ops.kda naive_kda_lowerbound_gate (bias added first, then
+            # scaled by exp(A_log) inside the sigmoid).
+            return self._gate_lower_bound * torch.sigmoid(decay_scale * (alpha.float() + bias))
         return -decay_scale * F.softplus(alpha.float() + bias)
 
     def _expand_low_rank_inputs(self, projected):
         """Split in_proj output and apply KDA's two second-stage projections."""
         num_v_heads_tp = self.num_value_heads // self.tp_size
         low_rank_local_tp = self.gate_low_rank_dim // self.tp_size
-        if self._fuse_low_rank_gather and self.tp_size > 1:
+        if self._full_rank_output_gate:
+            qkv, decay_low_rank, gate, beta = torch.split(
+                projected,
+                [
+                    self.conv_dim_local_tp,
+                    low_rank_local_tp,
+                    self.v_dim_local_tp,
+                    num_v_heads_tp,
+                ],
+                dim=-1,
+            )
+            if self.tp_size > 1:
+                decay_low_rank = gather_from_tensor_model_parallel_region(
+                    decay_low_rank, group=self.pg_collection.tp
+                )
+        elif self._fuse_low_rank_gather and self.tp_size > 1:
             qkv, low_rank_pair, beta = torch.split(
                 projected,
                 [self.conv_dim_local_tp, 2 * low_rank_local_tp, num_v_heads_tp],
@@ -638,7 +747,8 @@ class KimiDeltaAttention(GatedDeltaNet):
                     gate_low_rank, group=self.pg_collection.tp
                 )
         alpha, _ = self.decay_out_proj(decay_low_rank)
-        gate, _ = self.gate_out_proj(gate_low_rank)
+        if not self._full_rank_output_gate:
+            gate, _ = self.gate_out_proj(gate_low_rank)
         return qkv, gate, beta, alpha
 
     def _prepare_g_and_beta(self, alpha, beta, A_log, dt_bias):
@@ -977,6 +1087,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         if cu_seqlens is not None:
             kda_kwargs["cu_seqlens"] = cu_seqlens
+        if self._safe_gate and self._use_fused_decay_gate:
+            kda_kwargs["safe_gate"] = True
+            kda_kwargs["lower_bound"] = self._gate_lower_bound
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query, key, value, **kda_kwargs
         )
@@ -1226,7 +1339,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         """Execute deferred weight-gradient computation for all KDA linear projections."""
         self.in_proj.backward_dw()
         self.decay_out_proj.backward_dw()
-        self.gate_out_proj.backward_dw()
+        if self.gate_out_proj is not None:
+            self.gate_out_proj.backward_dw()
         self.out_proj.backward_dw()
 
     def _apply_gated_norm(self, x, gate):
