@@ -508,6 +508,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                             "recompute.",
                         )
                         return False
+                    if self.config.overlap_moe_expert_parallel_comm:
+                        # with EP overlap the MoE runs through fine_grained_callables
+                        # the paired CheckpointWithoutOutput.checkpoint() lives inside the graphed capture 
+                        # while the discard_output lives outside the graphed capture.
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            "pre_mlp_layernorm recompute is not supported with moe router "
+                            "cudagraph + EP overlap. Disabling pre_mlp_layernorm recompute.",
+                        )
+                        return False
                     if CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope and (
                         self.config.moe_token_dispatcher_type == "alltoall"
                         or self.config.moe_latent_size
