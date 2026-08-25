@@ -31,6 +31,10 @@ class StreamManager:
         self.mgrad_d2h_stream = torch.cuda.Stream()
         self.mgrad_h2d_stream = torch.cuda.Stream()
 
+        # Dedicated copy streams for moe weight offload D2H/H2D.
+        self.param_d2h_stream = torch.cuda.Stream()
+        self.param_h2d_stream = torch.cuda.Stream()
+
     @classmethod
     def get_instance(
         cls,
@@ -143,7 +147,9 @@ class MoEOffloadSlot:
 
     param: torch.nn.Parameter = None  # main grad: host home owner, read as ``param.main_grad``
     host_base: torch.Tensor = None  # activation: full pinned uint8 buffer owned by the pool
-    host_buf: torch.Tensor = None  # activation: typed view sliced out of the base
+    # activation: typed view sliced out of host_base
+    # parameter: permanent packed FP8 source
+    host_buf: torch.Tensor = None
     gpu_buf: torch.Tensor = None  # device-side copy
 
     d2h_done: torch.cuda.Event = None
@@ -166,9 +172,10 @@ class MoEOffloadHandle:
 
     Per-slot state machine the driver maintains::
 
-        RELEASED --offload--> HOST --reload--> DEVICE --get--> RELEASED   (act)
+        RELEASED --offload--> HOST --reload--> DEVICE --get--> RELEASED   (activation)
                                 ^                |
                                 +-----offload----+                        (main grad)
+                                +-----release----+                        (parameter)
     """
 
     policy: MoEOffloadPolicy = None
@@ -271,13 +278,13 @@ class MoEOffloadMemoryPool:
 class MoEOffloadManager:
     """ Unified **stateless** driver for offloading/reloading MoE weights (WIP), activations and main gradients. """
 
-    WEIGHT_OFFLOAD = MoEOffloadPolicy(
-        kind="weight",
+    PARAM_OFFLOAD = MoEOffloadPolicy(
+        kind="parameter",
         host_pool=None,
         device_pool=MoEOffloadMemoryPool,
         writeback=False,
-        d2h_stream_attr="weight_d2h_stream",
-        h2d_stream_attr="weight_h2d_stream",
+        d2h_stream_attr="param_d2h_stream",
+        h2d_stream_attr="param_h2d_stream",
     )
 
     ACTIVATION_OFFLOAD = MoEOffloadPolicy(
@@ -435,11 +442,7 @@ class MoEOffloadManager:
     def reload(
         handle: MoEOffloadHandle,
     ) -> None:
-        """Stage every host-resident slot of ``handle`` back onto the device. Serves both kinds.
-
-        Driven from the reload trigger's backward so the H2D overlaps the combine-backward
-        all-to-all. Activation slots already consumed by ``get`` are skipped.
-        """
+        """Stage every host-resident slot of ``handle`` on the device."""
         if handle is None or not handle.active:
             return
         for name, slot in handle.slots.items():
@@ -469,12 +472,41 @@ class MoEOffloadManager:
             # the device buffer is on demand allocated inside by H2D stream context
             # guarantee the consumer streams record the buffer
             stream_manager.consumer_streams_record(gpu_buf)
-        if not handle.policy.writeback:
+        if handle.policy.kind == "activation":
             # the device buffer is read-only, so the slot reference can be released
             # to save memory
             slot.gpu_buf = None
             slot.state = SlotState.RELEASED
         return gpu_buf
+
+    @staticmethod
+    def release_parameters(handle: MoEOffloadHandle) -> None:
+        """Release read-only parameters after their final expert consumer launches."""
+        if handle is None or not handle.active:
+            return
+        if handle.policy.kind != "parameter":
+            raise ValueError("Handle must be of kind 'parameter' for releasing parameters.")
+
+        # the D2H here does not actually happen
+        # the wait here is to guarantee the GEMM is finished before the buffer is recycled
+        stream_manager = handle.stream_manager
+        release_stream = stream_manager.param_d2h_stream
+        stream_manager.d2h_stream_wait_producers(release_stream)
+        for slot in handle.slots.values():
+            if slot.state is SlotState.DEVICE and slot.h2d_done is not None:
+                release_stream.wait_event(slot.h2d_done)
+        release_done = torch.cuda.Event()
+        release_done.record(release_stream)
+
+        pool = MoEOffloadMemoryPool.get_instance()
+        for slot in handle.slots.values():
+            if slot.state is not SlotState.DEVICE:
+                continue
+            pool.free(slot.gpu_buf.reshape(-1), release_done)
+            slot.gpu_buf = None
+            slot.h2d_done = None
+            slot.d2h_done = release_done
+            slot.state = SlotState.HOST
 
 
     # -------------- Active Offload Methods --------------
@@ -483,29 +515,61 @@ class MoEOffloadManager:
     def register(
         params: dict[str, torch.nn.Parameter],
         stream_manager,
-    ) -> MoEOffloadHandle:
-        handle = MoEOffloadHandle(policy=MoEOffloadManager.MAIN_GRAD_OFFLOAD, stream_manager=stream_manager)
-        for name, param in params.items():
-            main_grad = getattr(param, "main_grad", None)
-            if main_grad is None or main_grad.device.type != "cpu":
-                # NOTE (fuguan): rethink this design
-                # all-or-nothing: if any param.main_grad is not on CPU, don't register any of them
-                return MoEOffloadHandle(policy=MoEOffloadManager.MAIN_GRAD_OFFLOAD, stream_manager=stream_manager)
-            slot = MoEOffloadSlot(
-                param=param,
-                shape=tuple(param.shape),
-                dtype=param.main_grad.dtype,
-                numel=param.main_grad.numel(),
-                element_size=param.main_grad.element_size(),
-                device=torch.device(torch.cuda.current_device()),
-                host_is_zero=True,  # must be zero upon initialization
-                state=SlotState.HOST, # already on host
+        offload_param: bool = False,
+        offload_main_grad: bool = True,
+        parameter_tensors: dict[str, torch.Tensor] = None,
+    ) -> tuple[MoEOffloadHandle, MoEOffloadHandle]:
+        """Register persistent coarse-weight and main-gradient handles."""
+        p_handle = None
+        g_handle = None
+        if offload_main_grad:
+            g_handle = MoEOffloadHandle(policy=MoEOffloadManager.MAIN_GRAD_OFFLOAD, stream_manager=stream_manager)
+            for name, param in params.items():
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is None or main_grad.device.type != "cpu":
+                    # NOTE (fuguan): rethink this design
+                    # all-or-nothing: if any param.main_grad is not on CPU, don't register any of them
+                    g_handle.slots.clear()
+                    break
+                slot = MoEOffloadSlot(
+                    param=param,
+                    shape=tuple(param.shape),
+                    dtype=param.main_grad.dtype,
+                    numel=param.main_grad.numel(),
+                    element_size=param.main_grad.element_size(),
+                    device=torch.device(torch.cuda.current_device()),
+                    host_is_zero=True,  # must be zero upon initialization
+                    state=SlotState.HOST, # already on host
+                )
+                g_handle.slots[name] = slot
+            g_handle.active = len(g_handle.slots) > 0
+            if g_handle.active:
+                MoEOffloadManager._live_persistent_handles.add(g_handle)
+
+        if offload_param:
+            assert parameter_tensors is not None, (
+                "coarse-grained parameter offload requires packed FP8 parameter tensors"
             )
-            handle.slots[name] = slot
-        handle.active = len(handle.slots) > 0
-        if handle.active:
-            MoEOffloadManager._live_persistent_handles.add(handle)
-        return handle
+            p_handle = MoEOffloadHandle(policy=MoEOffloadManager.PARAM_OFFLOAD, stream_manager=stream_manager)
+            for name, tensor in parameter_tensors.items():
+                assert tensor.device.type == "cpu" and tensor.is_pinned(), (
+                    f"coarse parameter '{name}' must be a pinned host tensor"
+                )
+                slot = MoEOffloadSlot(
+                    host_buf=tensor,
+                    shape=tuple(tensor.shape),
+                    dtype=tensor.dtype,
+                    numel=tensor.numel(),
+                    element_size=tensor.element_size(),
+                    device=torch.device(torch.cuda.current_device()),
+                    state=SlotState.HOST, # already on host
+                )
+                p_handle.slots[name] = slot
+            p_handle.active = len(p_handle.slots) > 0
+            if p_handle.active:
+                MoEOffloadManager._live_persistent_handles.add(p_handle)
+
+        return p_handle, g_handle
 
     @staticmethod
     def synchronize():

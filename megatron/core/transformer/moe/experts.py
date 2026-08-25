@@ -68,6 +68,7 @@ from megatron.core.transformer.moe.experts_offloading_util import (
     offloading_grouped_swiglu_mlp,
 )
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
+    FP8ExpertsParameterManager,
     OffloadingFP8Config,
     offloading_fp8_grouped_swiglu_mlp,
 )
@@ -1398,50 +1399,57 @@ class OffloadingExpertsMLP(MegatronModule):
                     weights_in_te_layout=False,
                 )
 
-        # GPU buffer to prefetch CPU weights
-        self.num_stages = self.config.moe_offloading_num_stages
-        self.num_chunks = self.config.moe_offloading_num_chunks
-        assert num_local_experts % self.num_chunks == 0, "num_local_experts should be divisible by num_steps."
-        self.chunk_size = num_local_experts // self.num_chunks # one chunk contains num_local_experts // self.num_chunks experts
-        self.config.moe_offloading_chunk_size = self.chunk_size
+        # under fine-grained offloading mode, we need to allocate GPU buffers
+        # for each module
+        self.experts1_gpu_buffers = None
+        self.experts2_gpu_buffers = None
+        self.experts1_gpu_chunks = None
+        self.experts2_gpu_chunks = None
+        if self.config.moe_offloading_mode == "fine-grained":
+            # GPU buffer to prefetch CPU weights
+            self.num_stages = self.config.moe_offloading_num_stages
+            self.num_chunks = self.config.moe_offloading_num_chunks
+            assert num_local_experts % self.num_chunks == 0, "num_local_experts should be divisible by num_steps."
+            self.chunk_size = num_local_experts // self.num_chunks # one chunk contains num_local_experts // self.num_chunks experts
+            self.config.moe_offloading_chunk_size = self.chunk_size
+
+            # allocate tensors for gpu buffers
+            buffer_dtype = config.params_dtype if not self.config.moe_use_inplace_fp8_param else torch.float8_e4m3fn
+            experts1_gpu_buffers_storage = torch.empty(
+                self.num_stages * self.chunk_size * fc1_expert_weight_shape[0] * fc1_expert_weight_shape[1],
+                device=torch.cuda.current_device(),
+                dtype=buffer_dtype,
+            ).view(
+                self.num_stages, self.chunk_size, fc1_expert_weight_shape[0], fc1_expert_weight_shape[1]
+            )
+            experts2_gpu_buffers_storage = torch.empty(
+                self.num_stages * self.chunk_size * fc2_expert_weight_shape[0] * fc2_expert_weight_shape[1],
+                device=torch.cuda.current_device(),
+                dtype=buffer_dtype,
+            ).view(
+                self.num_stages, self.chunk_size, fc2_expert_weight_shape[0], fc2_expert_weight_shape[1]
+            )
+
+            # organize as [num_stages, chunk_size, (in, out)]
+            self.experts1_gpu_buffers = [
+                [experts1_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
+                for s in range(self.num_stages)
+            ]
+            self.experts2_gpu_buffers = [
+                [experts2_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
+                for s in range(self.num_stages)
+            ]
+
+            # organize as [num_stages, (chunk_size, in, out)]
+            self.experts1_gpu_chunks = [
+                experts1_gpu_buffers_storage[s] for s in range(self.num_stages)
+            ]
+            self.experts2_gpu_chunks = [
+                experts2_gpu_buffers_storage[s] for s in range(self.num_stages)
+            ]
 
         # lightweight config for the FP8 offloading autograd function
         self.fp8_config = OffloadingFP8Config.from_transformer_config(self.config)
-
-        # allocate tensors for gpu buffers
-        buffer_dtype = config.params_dtype if not self.config.moe_use_inplace_fp8_param else torch.float8_e4m3fn
-        experts1_gpu_buffers_storage = torch.empty(
-            self.num_stages * self.chunk_size * fc1_expert_weight_shape[0] * fc1_expert_weight_shape[1],
-            device=torch.cuda.current_device(),
-            dtype=buffer_dtype,
-        ).view(
-            self.num_stages, self.chunk_size, fc1_expert_weight_shape[0], fc1_expert_weight_shape[1]
-        )
-        experts2_gpu_buffers_storage = torch.empty(
-            self.num_stages * self.chunk_size * fc2_expert_weight_shape[0] * fc2_expert_weight_shape[1],
-            device=torch.cuda.current_device(),
-            dtype=buffer_dtype,
-        ).view(
-            self.num_stages, self.chunk_size, fc2_expert_weight_shape[0], fc2_expert_weight_shape[1]
-        )
-
-        # organize as [num_stages, chunk_size, (in, out)]
-        self.experts1_gpu_buffers = [
-            [experts1_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
-            for s in range(self.num_stages)
-        ]
-        self.experts2_gpu_buffers = [
-            [experts2_gpu_buffers_storage[s, c] for c in range(self.chunk_size)]
-            for s in range(self.num_stages)
-        ]
-
-        # organize as [num_stages, (chunk_size, in, out)]
-        self.experts1_gpu_chunks = [
-            experts1_gpu_buffers_storage[s] for s in range(self.num_stages)
-        ]
-        self.experts2_gpu_chunks = [
-            experts2_gpu_buffers_storage[s] for s in range(self.num_stages)
-        ]
 
         # cuda stream manager for h2d transfer and computation
         self.stream_manager = StreamManager.get_instance(num_compute_streams=1 if self.config.moe_use_inplace_fp8_param else 4)
@@ -1455,8 +1463,11 @@ class OffloadingExpertsMLP(MegatronModule):
         # Transient activation-offload handle (moe_offload_activations); see forward().
         self._act_offload_handle = None
 
-        # Transient main grad offload handle (moe_offload_main_grad); see backward_dw().
+        # Persistent main-grad and expert param offload handles
+        # initialized in _init_offload_handles(), called before dispatch()
         self._main_grad_offload_handle = None
+        self._param_offload_handle = None
+        self._persistent_offload_handles_initialized = False
 
         # padding function
         if self.config.moe_use_inplace_fp8_param:
@@ -1612,6 +1623,63 @@ class OffloadingExpertsMLP(MegatronModule):
         a2 = torch.repeat_interleave(torch.abs(self.polynorm_glu.alpha_2), tpe_tensor)
         return a1, a2
 
+    def init_and_preload(self):
+        """Initialize offload handles and launch whole-weight H2D before dispatch."""
+        if self.config.moe_offloading_experts_debug_mode:
+            return None
+
+        coarse_reload = self.config.moe_offloading_mode == "coarse-grained"
+        if not coarse_reload and not self.config.moe_offload_main_grad:
+            return None
+
+        parameter_tensors = None
+        if coarse_reload:
+            assert self.config.moe_use_inplace_fp8_param, (
+                "coarse-grained expert weight offload is only supported by the FP8 path"
+            )
+            # DDP may remap the fused parameter storage, so construct expert views only after the
+            # model has been wrapped and immediately before their first use.
+            if self.weight1_list is None:
+                self.weight1_list = list(torch.unbind(self.weight1, dim=0))
+            if self.weight2_list is None:
+                self.weight2_list = list(torch.unbind(self.weight2, dim=0))
+
+            fp8_parameter_manager = FP8ExpertsParameterManager.get_instance()
+            packed_w1, _, packed_w1_t, _ = fp8_parameter_manager.get_coarse_fp8_weights(
+                self.weight1_list
+            )
+            packed_w2, _, packed_w2_t, _ = fp8_parameter_manager.get_coarse_fp8_weights(
+                self.weight2_list
+            )
+            parameter_tensors = {
+                "w1": packed_w1,
+                "w2": packed_w2,
+                "w1_t": packed_w1_t,
+                "w2_t": packed_w2_t,
+            }
+
+        if not self._persistent_offload_handles_initialized:
+            self._param_offload_handle, self._main_grad_offload_handle = (
+                MoEOffloadManager.register(
+                    {"cpu_w1": self.weight1, "cpu_w2": self.weight2},
+                    self.stream_manager,
+                    offload_param=coarse_reload,
+                    offload_main_grad=self.config.moe_offload_main_grad,
+                    parameter_tensors=parameter_tensors,
+                )
+            )
+            self._persistent_offload_handles_initialized = True
+
+        if coarse_reload:
+            states = [slot.state for slot in self._param_offload_handle.slots.values()]
+            state = states[0]
+            assert all(slot_state is state for slot_state in states)
+            if state.name == "HOST":
+                MoEOffloadManager.reload(self._param_offload_handle)
+            else:
+                assert state.name == "DEVICE", f"invalid coarse parameter state: {state.name}"
+        return self._param_offload_handle
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1622,12 +1690,6 @@ class OffloadingExpertsMLP(MegatronModule):
         # inplace-FP8 path below and read by the enclosing MoE layer to wire MoEReloadTrigger on
         # the combine output. Reset each forward so a disabled/empty path leaves no stale handle.
         self._act_offload_handle = None
-        # The main-grad handle is persistent: it carries d2h_done / host_is_zero across
-        # microbatches. Registered here but not in init as DDP attaches .main_grad afterwards.
-        if self._main_grad_offload_handle is None and self.config.moe_offload_main_grad:
-            self._main_grad_offload_handle = MoEOffloadManager.register(
-                {"cpu_w1": self.weight1, "cpu_w2": self.weight2}, self.stream_manager
-            )
         if permuted_local_hidden_states.nelement() != 0:
             if self.config.moe_offloading_experts_debug_mode:
                 return self._forward_debug(
@@ -1675,6 +1737,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     a1,
                     a2,
                     mgrad_offload_handle=self._main_grad_offload_handle,
+                    param_offload_handle=self._param_offload_handle,
                 )
 
                 output = self.quantization_unpadding(output, tokens_per_expert_list)
@@ -1735,6 +1798,7 @@ class OffloadingExpertsMLP(MegatronModule):
                     a1,
                     a2,
                     mgrad_offload_handle=self._main_grad_offload_handle,
+                    param_offload_handle=self._param_offload_handle,
                 )
 
                 return output, None

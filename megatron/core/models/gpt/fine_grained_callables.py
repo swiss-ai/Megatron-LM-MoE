@@ -597,6 +597,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
+        # coarse-grained expert weights reload
+        layer.mlp._preload_expert_weights()
         dispatched_tokens, dispatched_tokens_sf, dispatched_probs = layer.mlp.dispatch(
             local_tokens, local_tokens_sf, probs
         )
@@ -653,7 +655,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.layer_state.mgrad_offload_handle = getattr(
             layer.mlp.experts, "_main_grad_offload_handle", None
         )
-
+        node.layer_state.param_offload_handle = getattr(
+            layer.mlp.experts, "_param_offload_handle", None
+        )
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
         # `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep:
@@ -685,6 +689,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         mgrad_handle = getattr(node.layer_state, "mgrad_offload_handle", None)
         if mgrad_handle is not None and getattr(mgrad_handle, "active", False):
             output = MoEReloadTrigger.apply(output, mgrad_handle)
+        param_handle = getattr(node.layer_state, "param_offload_handle", None)
+        if param_handle is not None and getattr(param_handle, "active", False):
+            output = MoEReloadTrigger.apply(output, param_handle)
         return output
 
         residual = node.layer_state.residual

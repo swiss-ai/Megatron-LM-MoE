@@ -956,6 +956,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_use_offloading_experts: bool = False
     """Whether to use offloading experts for MoE."""
 
+    moe_offloading_mode: Literal['fine-grained', 'coarse-grained'] = "fine-grained"
+    """Expert-weight reload granularity; coarse mode overlaps whole-weight H2D with MoE
+    communication."""
+
     moe_offloading_num_chunks: int = 8
     """Number of chunks to split the expert weights into for offloading. """
 
@@ -2014,6 +2018,22 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_offload_activations={self.moe_offload_activations!r}: "
                     f"'{MOE_OFFLOAD_FC1_OUTPUT}' requires '{MOE_OFFLOAD_INPUT}' -- the fc1 reload "
                     "rides the same MoEOffloadHandle / MoEReloadTrigger as fp8_x."
+                )
+
+        if self.moe_offloading_mode not in ("fine-grained", "coarse-grained"):
+            raise ValueError(
+                "moe_offloading_mode must be either 'fine-grained' or 'coarse-grained', "
+                f"got {self.moe_offloading_mode!r}."
+            )
+        if self.moe_use_offloading_experts and self.moe_offloading_mode == "coarse-grained":
+            if not self.moe_use_inplace_fp8_param:
+                raise ValueError(
+                    "coarse-grained expert weight offload requires moe_use_inplace_fp8_param."
+                )
+            if self.moe_offloading_experts_debug_mode:
+                raise ValueError(
+                    "coarse-grained expert weight offload is incompatible with "
+                    "moe_offloading_experts_debug_mode, which keeps weights GPU-resident."
                 )
 
         if self.moe_layer_recompute:
