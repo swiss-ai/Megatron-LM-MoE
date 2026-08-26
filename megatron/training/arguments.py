@@ -1386,6 +1386,16 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k >= 2, \
+            f"--goldfish-k (drop frequency 1/k) must be >= 2; k=1 drops ~100%. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, \
+            f"--goldfish-h (context width) must be a positive integer. ({args.goldfish_h})"
+        if args.seq_length is not None:
+            assert args.goldfish_h < args.seq_length, \
+                f"--goldfish-h ({args.goldfish_h}) must be < --seq-length ({args.seq_length})."
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -3523,6 +3533,16 @@ def _add_data_args(parser):
                             'efficiency and don\'t cut the samples if < sequence_length.')
     group.add_argument('--max-docs-per-bin', type=int, default=0,
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable Goldfish loss during pretraining: deterministically drop '
+                            '~1/k of tokens from the loss to mitigate verbatim memorization. '
+                            'Train split only. Special tokens declared by the (HuggingFace-backed) '
+                            'tokenizer are never dropped. Supported by pretrain_gpt.py only.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Goldfish drop factor k; drop probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,
+                       help='Goldfish context width: the h labels ending at (and including) '
+                            'a position are hashed to decide its drop.')
     return parser
 
 

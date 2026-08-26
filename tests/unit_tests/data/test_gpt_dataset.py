@@ -14,6 +14,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.utils.tokenizer_extra_metadata import (
+    ModelSpecialTokens,
+    TokenizerExtraMetadata,
+)
 from megatron.core.utils import _merge_cu_seqlens_across_micro_batch
 from tests.unit_tests.test_utilities import Utils
 
@@ -226,6 +230,141 @@ def test_inter_document_masking():
     assert torch.all(merged[1:] - merged[:-1] > 0)
 
 
+def test_mock_gpt_dataset_goldfish():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    text_tokenizer_extra_metadata = TokenizerExtraMetadata(
+        special_tokens=ModelSpecialTokens(full_ids=[1, 2, 3])
+    )
+    # Cache-friendly flags on purpose: goldfish alone must not disable the mask cache,
+    # and interleaved access must not leak one sample's drops into another (the cache
+    # hands out clones).
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        tokenizer_extra_metadata=text_tokenizer_extra_metadata,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    def build(**overrides):
+        config = GPTDatasetConfig(**base, **overrides)
+        return BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [100, 100, 100], lambda: True, config
+        ).build()
+
+    goldfish_sets = build(goldfish_loss=True, goldfish_k=4, goldfish_h=13)
+    plain_sets = build()
+    ds, plain = goldfish_sets[0], plain_sets[0]
+
+    assert ds.masks_and_position_ids_are_cacheable
+    assert ds._goldfish_exemption_ids == (1, 2, 3)
+
+    # Goldfish zeroes a strict superset of the plain loss mask (~1/k of the tail);
+    # the returned labels are untouched.
+    gf_mask, plain_mask = ds[0]["loss_mask"].clone(), plain[0]["loss_mask"]
+    assert not torch.any((gf_mask == 1) & (plain_mask == 0))
+    n_extra = int(((gf_mask == 0) & (plain_mask == 1)).sum())
+    assert n_extra > 0, "goldfish produced no drops"
+    assert torch.equal(ds[0]["labels"], plain[0]["labels"])
+
+    # Exempt ids are never dropped.
+    labels = ds[0]["labels"]
+    assert not torch.any((gf_mask == 0) & (plain_mask == 1) & (labels <= 3) & (labels >= 1))
+
+    # Train split only: the validation and test splits get no drops.
+    for split_index in (1, 2):
+        assert torch.equal(
+            goldfish_sets[split_index][0]["loss_mask"], plain_sets[split_index][0]["loss_mask"]
+        )
+        assert torch.equal(
+            goldfish_sets[split_index][0]["labels"], plain_sets[split_index][0]["labels"]
+        )
+
+    # Same index -> identical mask; interleaving other samples must not accumulate
+    # zeros through the cache (fresh dataset accessed in a different order agrees).
+    _ = ds[1]
+    assert torch.equal(ds[0]["loss_mask"], gf_mask)
+    fresh_sets = build(goldfish_loss=True, goldfish_k=4, goldfish_h=13)
+    assert torch.equal(fresh_sets[0][1]["loss_mask"], ds[1]["loss_mask"])
+
+    # The idx-None batch-padding sample stays fully masked.
+    assert not torch.any(goldfish_sets[1][None]["loss_mask"])
+
+    # Composes with inter-document masking: the goldfish mask is applied before the
+    # cu_seqlens return branch, so the same drops appear there.
+    idm_sets = build(
+        goldfish_loss=True, goldfish_k=4, goldfish_h=13, inter_document_masking=True
+    )
+    idm_sample = idm_sets[0][0]
+    assert "cu_seqlens" in idm_sample
+    assert torch.equal(idm_sample["loss_mask"], gf_mask)
+
+    # Exemption ids must index the vocab-sized LUT: fail at dataset build, not lazily
+    # in a dataloader worker. (The null tokenizer reports vocab_size + 1 for EOD, so
+    # derive the out-of-range id from the tokenizer, not from _MOCK_VOCAB_SIZE.)
+    base_bad = dict(base)
+    base_bad["tokenizer_extra_metadata"] = TokenizerExtraMetadata(
+        special_tokens=ModelSpecialTokens(full_ids=[1, tokenizer.vocab_size])
+    )
+    # The mock builder rewraps construction errors; the assertion is the chained cause.
+    with pytest.raises(Exception, match="failed to build") as excinfo:
+        BlendedMegatronDatasetBuilder(
+            MockGPTDataset,
+            [100, 100, 100],
+            lambda: True,
+            GPTDatasetConfig(**base_bad, goldfish_loss=True, goldfish_k=4, goldfish_h=13),
+        ).build()
+    assert isinstance(excinfo.value.__cause__, AssertionError)
+    assert "outside the tokenizer vocab" in str(excinfo.value.__cause__)
+
+
+def test_goldfish_config_validation():
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    base = dict(
+        random_seed=1234,
+        sequence_length=1024,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+    )
+
+    # A valid goldfish config constructs without error.
+    GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=50, **base)
+
+    # k must be >= 2 (k=1 drops ~100% of tokens).
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=1, goldfish_h=50, **base)
+
+    # h must be < sequence_length (else the unfold has no valid window).
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=1024, **base)
+
+    # h must be a positive context width.
+    with pytest.raises(AssertionError):
+        GPTDatasetConfig(goldfish_loss=True, goldfish_k=50, goldfish_h=0, **base)
+
+
 if __name__ == "__main__":
     test_mock_gpt_dataset()
     test_inter_document_masking()
+    test_mock_gpt_dataset_goldfish()
+    test_goldfish_config_validation()

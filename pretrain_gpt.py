@@ -29,7 +29,6 @@ from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import (
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
@@ -40,6 +39,7 @@ from megatron.core.utils import (
 from megatron.training import (
     get_args,
     get_timers,
+    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -287,7 +287,9 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = build_tokenizer(args)
+    # Use the same tokenizer instance from which set_global_variables extracted
+    # tokenizer_extra_metadata; rebuilding here can diverge for stateful/custom tokenizers.
+    tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -328,7 +330,17 @@ def core_gpt_dataset_config_from_args(args):
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
         "inter_document_masking": args.dataloader_inter_document_masking,
+        "goldfish_loss": args.goldfish_loss,
+        "goldfish_k": args.goldfish_k,
+        "goldfish_h": args.goldfish_h,
+        # Special-token ids extracted from the tokenizer in set_global_variables; the
+        # dataset derives the Goldfish exemption set from them.
+        "tokenizer_extra_metadata": getattr(args, "tokenizer_extra_metadata", None),
     }
+    assert not (args.goldfish_loss and args.sft), (
+        "--goldfish-loss is not supported with --sft: SFTDataset builds its own loss "
+        "mask and would silently skip goldfish dropping."
+    )
 
     # add FIM args to the config
     if args.fim_data:
