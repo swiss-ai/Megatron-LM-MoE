@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import collections
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -24,10 +24,9 @@ except ImportError:
     grouped_gemm = None
 
 from megatron.core.transformer.moe.moe_offload import (
-    ActivationOffloadHandle,
-    MoEActivationOffloadManager,
-    PinnedActBufferPool,
     StreamManager,
+    MoEOffloadManager,
+    MoEOffloadHandle,
 )
 from megatron.core.transformer.moe.experts_util import (
     ExpertsWgradScheduler,
@@ -69,6 +68,9 @@ from megatron.core.fusions.fused_polynorm_glu import (
 from megatron.core.fusions.fused_bias_ssglu import sslu
 from megatron.core.activations import rlglu_act, sssglu_act
 
+CoarseWeightRef = tuple[MoEOffloadHandle, str, torch.Tensor]
+
+
 @dataclass(frozen=True)
 class OffloadingFP8Config:
     """Lightweight config for OffloadingExpertsFP8GroupedSwiMLP.
@@ -102,10 +104,13 @@ class OffloadingFP8Config:
     moe_offloading_chunk_size: int = -1
     moe_offloading_num_chunks: int = 1
     moe_offloading_num_stages: int = 1
+    moe_offloading_mode: str = "fine-grained"
+    coarse_grained_reload: bool = field(init=False)
     moe_offloading_experts_debug_mode: bool = False
     moe_use_extra_fp8_param_storage: bool = False
     moe_offload_input: bool = False
     moe_offload_fc1_output: bool = False
+    moe_offload_main_grad: bool = False
 
     # recomputation
     recompute_granularity: str = "selective"
@@ -126,6 +131,11 @@ class OffloadingFP8Config:
             "fc1_out_size",
             self.moe_ffn_hidden_size * (2 if self.gated_linear_unit else 1),
         )
+        object.__setattr__(
+            self,
+            "coarse_grained_reload",
+            self.moe_offloading_mode == "coarse-grained",
+        )
 
     @classmethod
     def from_transformer_config(cls, config: TransformerConfig) -> OffloadingFP8Config:
@@ -144,6 +154,7 @@ class OffloadingFP8Config:
             moe_offloading_chunk_size=config.moe_offloading_chunk_size,
             moe_offloading_num_chunks=config.moe_offloading_num_chunks,
             moe_offloading_num_stages=config.moe_offloading_num_stages,
+            moe_offloading_mode=config.moe_offloading_mode,
             moe_offloading_experts_debug_mode=config.moe_offloading_experts_debug_mode,
             moe_use_extra_fp8_param_storage=config.moe_use_extra_fp8_param_storage,
             moe_offload_input=(
@@ -152,6 +163,7 @@ class OffloadingFP8Config:
             moe_offload_fc1_output=(
                 MOE_OFFLOAD_FC1_OUTPUT in (config.moe_offload_activations or [])
             ),
+            moe_offload_main_grad=config.moe_offload_main_grad,
             recompute_granularity=config.recompute_granularity,
             recompute_modules=config.recompute_modules,
             delay_wgrad_compute=config.delay_wgrad_compute,
@@ -354,6 +366,7 @@ class FP8ExpertsParameterManager:
         
         # uid is the data pointer of the first local expert weight
         self._uid_to_fp8_weights_map = {}
+        self._uid_to_coarse_fp8_weights_map = {}
 
         # flag to indicate whether it is the first microbatch
         # which is used to determine whether to refresh the fp8 weights
@@ -440,8 +453,16 @@ class FP8ExpertsParameterManager:
                 fp8_weight, _, fp8_weight_t, _ = self._wid_to_fp8_weight_map[wid]
                 self._wid_to_fp8_weight_map[wid] = (fp8_weight, fp8_weights_scales_list[eid], fp8_weight_t, fp8_weights_t_scales_list[eid])
             
-            fp8_weights_scales_stack_per_chunk = list(torch.split(fp8_weights_scales_stack, self.config.moe_offloading_chunk_size))
-            fp8_weights_t_scales_stack_per_chunk = list(torch.split(fp8_weights_t_scales_stack, self.config.moe_offloading_chunk_size))
+            if self.config.coarse_grained_reload:
+                fp8_weights_scales_stack_per_chunk = [fp8_weights_scales_stack]
+                fp8_weights_t_scales_stack_per_chunk = [fp8_weights_t_scales_stack]
+            else:
+                fp8_weights_scales_stack_per_chunk = list(
+                    torch.split(fp8_weights_scales_stack, self.config.moe_offloading_chunk_size)
+                )
+                fp8_weights_t_scales_stack_per_chunk = list(
+                    torch.split(fp8_weights_t_scales_stack, self.config.moe_offloading_chunk_size)
+                )
             self._uid_to_fp8_weights_map[uid] = \
                 (fp8_weights, fp8_weights_scales_stack_per_chunk, fp8_weights_t, fp8_weights_t_scales_stack_per_chunk)
             self._uid_to_is_first_microbatch[uid] = False
@@ -459,6 +480,50 @@ class FP8ExpertsParameterManager:
             return fp8_weights_t, fp8_weights_t_scales
         else:
             return fp8_weights, fp8_weights_scales
+
+    def get_coarse_fp8_weights(
+        self,
+        bf16_weights: list[torch.nn.Parameter] | list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, list[torch.Tensor]]:
+        """Return stable, contiguous pinned tensors for whole-layer FP8 reload."""
+        assert self.config.coarse_grained_reload
+        uid = bf16_weights[0].data_ptr()
+        needs_repack = (
+            uid not in self._uid_to_fp8_weights_map
+            or self._uid_to_is_first_microbatch.get(uid, False)
+        )
+
+        fp8_weights, fp8_weight_scales = self.get_fp8_weights(bf16_weights)
+        fp8_weights_t, fp8_weight_t_scales = self.get_fp8_weights(
+            bf16_weights, transposed=True
+        )
+
+        packed = self._uid_to_coarse_fp8_weights_map.get(uid)
+        if packed is None:
+            packed_weights = torch.empty(
+                (len(fp8_weights), *fp8_weights[0].shape),
+                dtype=fp8_weights[0].dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            packed_weights_t = torch.empty(
+                (len(fp8_weights_t), *fp8_weights_t[0].shape),
+                dtype=fp8_weights_t[0].dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            packed = (packed_weights, packed_weights_t)
+            self._uid_to_coarse_fp8_weights_map[uid] = packed
+            needs_repack = True
+
+        if needs_repack:
+            packed_weights, packed_weights_t = packed
+            for dst, src in zip(packed_weights, fp8_weights):
+                dst.copy_(src)
+            for dst, src in zip(packed_weights_t, fp8_weights_t):
+                dst.copy_(src)
+
+        return packed[0], fp8_weight_scales, packed[1], fp8_weight_t_scales
     
     def refresh_fp8_weights(
         self,
@@ -478,6 +543,7 @@ class FP8ExpertsParameterManager:
         self._wid_to_bf16_weight_map.clear()
         self._wid_to_fp8_weight_map.clear()
         self._uid_to_fp8_weights_map.clear()
+        self._uid_to_coarse_fp8_weights_map.clear()
 
     def set_is_first_microbatch(self):
         for uid in self._uid_to_is_first_microbatch:
@@ -595,6 +661,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
         config: OffloadingFP8Config,
+        coarse_weight: CoarseWeightRef = None,
     ):
         # allocate output buffer for the first linear layer
         fc1_output = torch.empty(
@@ -604,6 +671,20 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             dtype=torch.bfloat16,
         )
         fc1_output_per_chunk = list(torch.split(fc1_output, total_token_num_per_chunk))
+
+        if coarse_weight is not None:
+            assert len(total_token_num_per_chunk) == 1
+            coarse_weight = cls._resolve_coarse_weight(coarse_weight)
+            stream_manager.compute_streams_wait_launch_streams()
+            m_grouped_fp8_gemm_nt_contiguous(
+                tokens_per_expert_chunks_psum[0],
+                (hidden_state_per_chunk[0][0], hidden_state_per_chunk[1][0]),
+                coarse_weight,
+                output=fc1_output,
+                compute_stream=stream_manager.compute_streams[0],
+            )
+            stream_manager.launch_streams_wait_compute_streams()
+            return fc1_output
 
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w1, gpu_w1_buffers, stream_manager, fp8_parameter_manager, config)
@@ -655,9 +736,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         config: OffloadingFP8Config,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
+        coarse_weight: CoarseWeightRef = None,
     ):
-        # prefetch the first chunk of expert weights to GPU
-        curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config)
+        if coarse_weight is None:
+            # Fine-grained mode starts fc2's first chunk while the activation is computed.
+            curr_buffer_metadata = cls.prefetch_expert_weights(
+                0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config
+            )
 
 
         if config.gated_polynorm_linear_unit:
@@ -692,6 +777,20 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # fc2 chunk-level interleaving computation
         fc2_output = torch.empty_like(permuted_local_hidden_states[0], dtype=torch.bfloat16)
         fc2_output_per_chunk = list(torch.split(fc2_output, total_token_num_per_chunk))
+
+        if coarse_weight is not None:
+            assert len(total_token_num_per_chunk) == 1
+            coarse_weight = cls._resolve_coarse_weight(coarse_weight)
+            stream_manager.compute_streams_wait_launch_streams()
+            m_grouped_fp8_gemm_nt_contiguous(
+                tokens_per_expert_chunks_psum[0],
+                (fp8_s_chunks[0], fp8_s_scales_chunks[0]),
+                coarse_weight,
+                output=fc2_output,
+                compute_stream=stream_manager.compute_streams[0],
+            )
+            stream_manager.launch_streams_wait_compute_streams()
+            return fc2_output, fp8_s, inv if config.gated_polynorm_linear_unit else None
 
         stream_manager.compute_streams_wait_launch_streams()
         for chunk_idx in range(config.moe_offloading_num_chunks):
@@ -740,6 +839,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
         inv: torch.Tensor = None,
+        coarse_weight: CoarseWeightRef = None,
     ):
         """
         ds [m, H] = grad_y [m, h] @ w2.T [H, h]
@@ -755,41 +855,58 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             dtype=torch.bfloat16,
         )
         grad_s_per_chunk = list(torch.split(grad_s, total_token_num_per_chunk))
-        
-        # prefetch the first chunk of expert weights to GPU
-        curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config, True)
 
-        stream_manager.compute_streams_wait_launch_streams()
-        for chunk_idx in range(config.moe_offloading_num_chunks):
-            # prefetch the next chunk of expert weights to GPU buffer
-            if chunk_idx + 1 < config.moe_offloading_num_chunks:
-                next_buffer_metadata = cls.prefetch_expert_weights(chunk_idx + 1, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config, True)
-
-            # computation on the current GPU buffer
-            # fp8_experts_chunk = gpu_w2_buffers[curr_buffer_metadata[0]]
-            fp8_experts_chunk = gpu_w2_chunks[curr_buffer_metadata[0]].view(
-                config.moe_offloading_chunk_size,
-                config.moe_ffn_hidden_size,
-                config.input_hidden_size,
-            )
-            fp8_experts_chunk_scales = curr_buffer_metadata[2]
-            fp8_grad_y_chunk = fp8_grad_y_per_chunk[chunk_idx]
-            fp8_grad_y_chunk_scales = fp8_grad_y_scales_per_chunk[chunk_idx]
-
-            stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
+        if coarse_weight is not None:
+            assert len(total_token_num_per_chunk) == 1
+            coarse_weight = cls._resolve_coarse_weight(coarse_weight)
+            stream_manager.compute_streams_wait_launch_streams()
             m_grouped_fp8_gemm_nt_contiguous(
-                tokens_per_expert_chunks_psum[chunk_idx],
-                (fp8_grad_y_chunk, fp8_grad_y_chunk_scales),
-                (fp8_experts_chunk, fp8_experts_chunk_scales),
-                output=grad_s_per_chunk[chunk_idx],
+                tokens_per_expert_chunks_psum[0],
+                (fp8_grad_y_per_chunk[0], fp8_grad_y_scales_per_chunk[0]),
+                coarse_weight,
+                output=grad_s,
                 compute_stream=stream_manager.compute_streams[0],
             )
-            stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
+            stream_manager.launch_streams_wait_compute_streams()
+        else:
+            # prefetch the first chunk of expert weights to GPU
+            curr_buffer_metadata = cls.prefetch_expert_weights(
+                0, cpu_w2, gpu_w2_buffers, stream_manager, fp8_parameter_manager, config, True
+            )
 
-            # update current buffer metadata
-            curr_buffer_metadata = next_buffer_metadata if chunk_idx + 1 < config.moe_offloading_num_chunks else None
+            stream_manager.compute_streams_wait_launch_streams()
+            for chunk_idx in range(config.moe_offloading_num_chunks):
+                # prefetch the next chunk of expert weights to GPU buffer
+                if chunk_idx + 1 < config.moe_offloading_num_chunks:
+                    next_buffer_metadata = cls.prefetch_expert_weights(
+                        chunk_idx + 1, cpu_w2, gpu_w2_buffers, stream_manager,
+                        fp8_parameter_manager, config, True
+                    )
 
-        stream_manager.launch_streams_wait_compute_streams()
+                fp8_experts_chunk = gpu_w2_chunks[curr_buffer_metadata[0]].view(
+                    config.moe_offloading_chunk_size,
+                    config.moe_ffn_hidden_size,
+                    config.input_hidden_size,
+                )
+                fp8_experts_chunk_scales = curr_buffer_metadata[2]
+
+                stream_manager.consumer_streams_wait_event(curr_buffer_metadata[-1])
+                m_grouped_fp8_gemm_nt_contiguous(
+                    tokens_per_expert_chunks_psum[chunk_idx],
+                    (fp8_grad_y_per_chunk[chunk_idx], fp8_grad_y_scales_per_chunk[chunk_idx]),
+                    (fp8_experts_chunk, fp8_experts_chunk_scales),
+                    output=grad_s_per_chunk[chunk_idx],
+                    compute_stream=stream_manager.compute_streams[0],
+                )
+                stream_manager.h2d_stream_wait_consumer_streams(curr_buffer_metadata[1])
+
+                curr_buffer_metadata = (
+                    next_buffer_metadata
+                    if chunk_idx + 1 < config.moe_offloading_num_chunks
+                    else None
+                )
+
+            stream_manager.launch_streams_wait_compute_streams()
         if config.gated_polynorm_linear_unit:
             grad_a, grad_a1, grad_a2, grad_probs = fused_polynorm_glu_backward(
                 grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
@@ -820,6 +937,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         stream_manager: StreamManager,
         fp8_parameter_manager: FP8ExpertsParameterManager,
         config: OffloadingFP8Config,
+        coarse_weight: CoarseWeightRef = None,
     ):
         """
         dx [m, h] = a [m, 2*H] @ w1.T [h, 2*H]
@@ -833,6 +951,20 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             dtype=torch.bfloat16
         )
         grad_x_per_chunk = list(torch.split(grad_x, total_token_num_per_chunk))
+
+        if coarse_weight is not None:
+            assert len(total_token_num_per_chunk) == 1
+            coarse_weight = cls._resolve_coarse_weight(coarse_weight)
+            stream_manager.compute_streams_wait_launch_streams()
+            m_grouped_fp8_gemm_nt_contiguous(
+                tokens_per_expert_chunks_psum[0],
+                (fp8_grad_a_per_chunk[0], fp8_grad_a_scales_per_chunk[0]),
+                coarse_weight,
+                output=grad_x,
+                compute_stream=stream_manager.compute_streams[0],
+            )
+            stream_manager.launch_streams_wait_compute_streams()
+            return grad_x
 
         # prefetch the first chunk of expert weights to GPU
         curr_buffer_metadata = cls.prefetch_expert_weights(0, cpu_w1, gpu_w1_buffers, stream_manager, fp8_parameter_manager, config, True)
@@ -901,6 +1033,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fuse_gradient_accumulation: bool = False,
         a1: torch.Tensor = None,
         a2: torch.Tensor = None,
+        mgrad_offload_handle: MoEOffloadHandle = None,
     ):
         """
         dw2 [h, H] = grad_y.T [h, m] @ s.T [H, m]
@@ -925,6 +1058,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
 
         assert cpu_w2.main_grad is not None
         wgrad_output = cpu_w2.main_grad
+
+        if config.moe_offload_main_grad and mgrad_offload_handle is not None:
+            wgrad_output = MoEOffloadManager.get(mgrad_offload_handle, "cpu_w2")
 
         # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
         # register the wgrad computation to be executed later.
@@ -961,9 +1097,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         tokens_per_expert_cumsum: torch.Tensor,
         num_local_experts: int,
         stream_manager: StreamManager,
+        config: OffloadingFP8Config,
         wgrad_scheduler: ExpertsWgradScheduler = None,
         delay_wgrad_compute: bool = False,
         fuse_gradient_accumulation: bool = False,
+        mgrad_offload_handle: MoEOffloadHandle = None,
     ):
         """
         dw1 [2*H, h] = grad_a.T [2*H, m] @ x.T [h, m]
@@ -971,6 +1109,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         """
         assert cpu_w1.main_grad is not None
         wgrad_output = cpu_w1.main_grad
+
+        if config.moe_offload_main_grad and mgrad_offload_handle is not None:
+            wgrad_output = MoEOffloadManager.get(mgrad_offload_handle, "cpu_w1")
 
         # If delay_wgrad_compute is True and wgrad_scheduler is provided, 
         # register the wgrad computation to be executed later.
@@ -994,6 +1135,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         )
         stream_manager.launch_streams_wait_compute_streams()
         cls._wgrad_post_process([cpu_w1], wgrad_output, fuse_gradient_accumulation)
+
+    @staticmethod
+    def _resolve_coarse_weight(
+        weight_ref: CoarseWeightRef,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        handle, name, scale = weight_ref
+        return MoEOffloadManager.get(handle, name), scale
 
     @classmethod
     def prefetch_expert_weights(
@@ -1054,7 +1202,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # Leading differentiable inputs: per-token PolyNorm GLU coefficients (None for SwiGLU).
         a1: torch.Tensor = args[0]
         a2: torch.Tensor = args[1]
-        
+        mgrad_offload_handle: MoEOffloadHandle = args[2]
+        param_offload_handle: MoEOffloadHandle = args[3]
+
         cpu_w1: torch.nn.Parameter =  args[-16]
         cpu_w2: torch.nn.Parameter =  args[-15]
         cpu_w1_list: list[torch.Tensor] = args[-14]
@@ -1077,13 +1227,30 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         assert cpu_w1.shape[0] == num_local_experts, f"Expected cpu_w1 to have {num_local_experts} experts, but got {cpu_w1.shape[0]}"
         assert cpu_w2.shape[0] == num_local_experts, f"Expected cpu_w2 to have {num_local_experts} experts, but got {cpu_w2.shape[0]}"
     
-        # split hidden states, outputs and token_per_experts into chunks for each expert chunks
-        # NOTE: this part of logic is CPU-bound and presents ovehead. 
-        # tokens_per_expert_chunks = torch.split(tokens_per_expert, config.moe_offloading_chunk_size)
-        # tokens_per_expert_chunks_psum = [torch.cumsum(t, dim=0).to(torch.int32).to(permuted_local_hidden_states.device) for t in tokens_per_expert_chunks]
-        # total_token_num_per_chunk = [chunk.sum().item() for chunk in tokens_per_expert_chunks]
-        tokens_per_expert_chunks_psum, total_token_num_per_chunk = \
-            grouped_gemm.grouped_gemm.backend.tokens_per_expert_chunk_sum(tokens_per_expert, config.moe_offloading_chunk_size, permuted_local_hidden_states.device)
+        if config.coarse_grained_reload:
+            tokens_per_expert_chunks_psum = [
+                torch.cumsum(tokens_per_expert, dim=0)
+                .to(dtype=torch.int32, device=permuted_local_hidden_states.device)
+            ]
+            total_token_num_per_chunk = [tokens_per_expert.sum().item()]
+            assert param_offload_handle is not None and param_offload_handle.active, (
+                "coarse-grained FP8 compute requires expert weights to be reloaded before dispatch"
+            )
+            _, w1_scales = fp8_parameter_manager.get_fp8_weights(cpu_w1_list)
+            _, w2_scales = fp8_parameter_manager.get_fp8_weights(cpu_w2_list)
+            coarse_w1 = (param_offload_handle, "w1", w1_scales[0])
+            coarse_w2_scale = w2_scales[0]
+        else:
+            # split the tokens and expert groups to match the fine-grained weight pipeline.
+            tokens_per_expert_chunks_psum, total_token_num_per_chunk = (
+                grouped_gemm.grouped_gemm.backend.tokens_per_expert_chunk_sum(
+                    tokens_per_expert,
+                    config.moe_offloading_chunk_size,
+                    permuted_local_hidden_states.device,
+                )
+            )
+            coarse_w1 = None
+            coarse_w2_scale = None
 
         # per-chunk FP8 quantize: produces sf buffers in MN-major
         # TMA-aligned layout so DeepGEMM's transform_sf_into_required_layout
@@ -1111,7 +1278,12 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             stream_manager,
             fp8_parameter_manager,
             config,
+            coarse_w1,
         )
+
+        coarse_w2 = None
+        if config.coarse_grained_reload:
+            coarse_w2 = (param_offload_handle, "w2", coarse_w2_scale)
 
         # activation and forward for the second linear layer
         y, _, inv = OffloadingExpertsFP8GroupedSwiMLP.call_forward_y(
@@ -1128,7 +1300,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             config,
             a1,
             a2,
+            coarse_w2,
         )
+
+        if param_offload_handle is not None:
+            MoEOffloadManager.release_parameters(param_offload_handle)
 
         # context saving for polynorm GLU
         ctx.a1 = a1
@@ -1167,10 +1343,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx.fp8_permuted_local_hidden_states_sf_chunks = fp8_x_sf_chunks
 
         # activation offload: park fp8_x on pinned host during the combine phase and free its GPU
-        # storage. It is reloaded by MoEActReloadTrigger.backward before this Function's backward.
+        # storage. It is reloaded by MoEReloadTrigger.backward before this Function's backward.
         act_offload_handle = None
         if config.moe_offload_input and fp8_x_full.numel() > 0:
-            act_offload_handle = MoEActivationOffloadManager.offload(fp8_x_full, stream_manager)
+            act_offload_handle = MoEOffloadManager.offload_activation(fp8_x_full, stream_manager, "fp8_x")
             ctx.fp8_hidden_state_per_chunk = None
         ctx.act_offload_handle = act_offload_handle
         # When offloading, do not keep the (now-freed) GPU tensor in save_for_backward; the input is
@@ -1188,7 +1364,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             fp8_fc1_output = per_token_cast_to_fp8(fc1_output, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
             saved_fp8_fc1 = fp8_fc1_output[0]
             if config.moe_offload_fc1_output and act_offload_handle is not None:
-                MoEActivationOffloadManager.offload_fc1(act_offload_handle, saved_fp8_fc1)
+                MoEOffloadManager.offload_activation(saved_fp8_fc1, stream_manager, "fp8_fc1", act_offload_handle)
                 saved_fp8_fc1 = None
             ctx.save_for_backward(
                 saved_fp8_x,
@@ -1196,6 +1372,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 fp8_fc1_output[1],
                 permuted_probs
             )
+
+        # main grad offloading: the handle is the module's, just carried to backward.
+        ctx.mgrad_offload_handle = mgrad_offload_handle
+        ctx.param_offload_handle = param_offload_handle
 
         return y, act_offload_handle
 
@@ -1229,32 +1409,39 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             permuted_probs
         ) = ctx.saved_tensors
 
-        # Reconstruct fp8_x from the host-offloaded copy. MoEActReloadTrigger.backward has already
+        param_offload_handle: MoEOffloadHandle = getattr(ctx, "param_offload_handle", None)
+        if config.coarse_grained_reload:
+            assert param_offload_handle is not None and param_offload_handle.active
+            _, w1_scales = fp8_parameter_manager.get_fp8_weights(cpu_w1_list)
+            _, w2_t_scales = fp8_parameter_manager.get_fp8_weights(
+                cpu_w2_list, transposed=True
+            )
+            _, w1_t_scales = fp8_parameter_manager.get_fp8_weights(
+                cpu_w1_list, transposed=True
+            )
+            coarse_w1_scale = w1_scales[0]
+            coarse_w2_t_scale = w2_t_scales[0]
+            coarse_w1_t_scale = w1_t_scales[0]
+        else:
+            coarse_w1_scale = None
+            coarse_w2_t_scale = None
+            coarse_w1_t_scale = None
+
+        # Reconstruct fp8_x from the host-offloaded copy. MoEReloadTrigger.backward has already
         # launched the H2D (overlapping the combine-backward all-to-all); wait for it before use and
         # rebuild the per-chunk views that were dropped in forward.
-        act_offload_handle: ActivationOffloadHandle = getattr(ctx, "act_offload_handle", None)
+        act_offload_handle: MoEOffloadHandle = getattr(ctx, "act_offload_handle", None)
         if act_offload_handle is not None and act_offload_handle.active:
-            assert act_offload_handle.gpu_slot is not None, (
-                "Activation reload did not run before expert backward -- MoEActReloadTrigger must be "
-                "wired on the combine output when moe_offload_activations is enabled."
-            )
-            stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done)
-            stream_manager.consumer_streams_record(act_offload_handle.gpu_slot)
-            fp8_permuted_local_hidden_states = act_offload_handle.gpu_slot
+            fp8_permuted_local_hidden_states = MoEOffloadManager.get(act_offload_handle, "fp8_x")
             fp8_x_chunks = list(
                 torch.split(fp8_permuted_local_hidden_states, total_token_num_per_chunk, dim=0)
             )
             fp8_hidden_state_per_chunk = (fp8_x_chunks, fp8_permuted_local_hidden_states_sf_chunks)
-            # Recycle the pinned host buffer, guarded by the reload event so a future D2H write does
-            # not overwrite it until this reload's H2D read has completed.
-            PinnedActBufferPool.get_instance().free(
-                act_offload_handle.cpu_base, act_offload_handle.h2d_done
-            )
-            act_offload_handle.cpu_base = None
-            act_offload_handle.cpu_flat = None
-            act_offload_handle.gpu_slot = None
 
         if ctx.activation_recompute:
+            coarse_w1 = None
+            if config.coarse_grained_reload:
+                coarse_w1 = (param_offload_handle, "w1", coarse_w1_scale)
             # recompute the activation for backward
             fc1_output = OffloadingExpertsFP8GroupedSwiMLP.call_forward_a(
                 cpu_w1_list,
@@ -1267,27 +1454,17 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 stream_manager,
                 fp8_parameter_manager,
                 config,
+                coarse_w1,
             )
         else:
             # if fc1 was offloaded, its reload H2D has been flowing on act_h2d_stream since the
-            # reload trigger (serial after fp8_x's). wait its OWN event here
+            # reload trigger (serial after fp8_x's). fetch it from its own slot; the slot only
+            # exists when moe_offload_fc1_output parked it in forward.
             if (
                 act_offload_handle is not None
-                and getattr(act_offload_handle, "fc1_active", False)
+                and "fp8_fc1" in act_offload_handle.slots
             ):
-                assert act_offload_handle.gpu_slot_fc1 is not None, (
-                    "fc1 activation reload did not run before expert backward -- "
-                    "MoEActivationOffloadManager.reload must handle the fc1 slot when fc1_active is set."
-                )
-                stream_manager.consumer_streams_wait_act_reload(act_offload_handle.h2d_done_fc1)
-                stream_manager.consumer_streams_record(act_offload_handle.gpu_slot_fc1)
-                fp8_fc1_output = act_offload_handle.gpu_slot_fc1
-                PinnedActBufferPool.get_instance().free(
-                    act_offload_handle.cpu_base_fc1, act_offload_handle.h2d_done_fc1
-                )
-                act_offload_handle.cpu_base_fc1 = None
-                act_offload_handle.cpu_flat_fc1 = None
-                act_offload_handle.gpu_slot_fc1 = None
+                fp8_fc1_output = MoEOffloadManager.get(act_offload_handle, "fp8_fc1")
             fc1_output = per_token_dequant_from_fp8(fp8_fc1_output, fp8_fc1_output_scales)
 
         grad_y = grad_outputs[0].contiguous()
@@ -1312,6 +1489,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks = per_token_cast_to_fp8_chunked_fused(
             grad_y, total_token_num_per_chunk, gran_k=128,
         )
+        coarse_w2_t = None
+        if config.coarse_grained_reload:
+            coarse_w2_t = (param_offload_handle, "w2_t", coarse_w2_t_scale)
         grad_a, grad_probs, grad_a1, grad_a2 = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_a(
             (fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks),
             fc1_output,
@@ -1327,12 +1507,16 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             ctx.a1,
             ctx.a2,
             ctx.inv,
+            coarse_w2_t,
         )
 
         # backward grad_x computation
         fp8_grad_a_full, fp8_grad_a_chunks, fp8_grad_a_sf_chunks = per_token_cast_to_fp8_chunked_fused(
             grad_a, total_token_num_per_chunk, gran_k=128,
         )
+        coarse_w1_t = None
+        if config.coarse_grained_reload:
+            coarse_w1_t = (param_offload_handle, "w1_t", coarse_w1_t_scale)
         grad_x = OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_x(
             (fp8_grad_a_full, fp8_grad_a_chunks, fp8_grad_a_sf_chunks),
             cpu_w1_list,
@@ -1343,7 +1527,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             stream_manager,
             fp8_parameter_manager,
             config,
+            coarse_w1_t,
         )
+
+        if param_offload_handle is not None:
+            MoEOffloadManager.release_parameters(param_offload_handle)
 
         # backward grad_w2 computation
         fp8_grad_y_t = guarded_per_channel_cast_to_fp8_pack_kmajor(
@@ -1366,6 +1554,7 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             config.gradient_accumulation_fusion,
             ctx.a1,
             ctx.a2,
+            ctx.mgrad_offload_handle,
         )
 
         # backward grad_w1 computation
@@ -1386,9 +1575,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             tokens_per_expert_cumsum,
             ctx.num_local_experts,
             stream_manager,
+            config,
             expert_wgrad_scheduler,
             config.delay_wgrad_compute,
             config.gradient_accumulation_fusion,
+            ctx.mgrad_offload_handle,
         )
 
         # NOTE: gradients have been attached in _wgrad_post_process, 
@@ -1401,11 +1592,13 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         # the parameter is on CPU, and hence cause hanging when
         # overlap_grad_reduce is enabled
         if not config.delay_wgrad_compute:
+            MoEOffloadManager.offload_main_grad(ctx.mgrad_offload_handle)
             for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
                 hook_fn()
 
-        # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU)
-        return grad_a1, grad_a2, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
+        # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU),
+        # then the main-grad and parameter offload handles at indices 2 and 3.
+        return grad_a1, grad_a2, None, None, grad_w1_ret, grad_w2_ret, None, None, None, None, None, None, grad_x, None, None, grad_probs, None, None, None, None
 
 
 
@@ -1430,7 +1623,9 @@ def offloading_fp8_grouped_swiglu_mlp(
     wgrad_accumulation_and_reduce_hooks: list,
     a1: torch.Tensor = None,
     a2: torch.Tensor = None,
-) -> tuple[torch.Tensor, ActivationOffloadHandle | None]:
+    mgrad_offload_handle: MoEOffloadHandle = None,
+    param_offload_handle: MoEOffloadHandle = None,
+) -> tuple[torch.Tensor, MoEOffloadHandle | None]:
     """Autograd function for Offloading Experts Grouped SwiGLU MLP.
 
     Args:
@@ -1445,15 +1640,22 @@ def offloading_fp8_grouped_swiglu_mlp(
         expert_wgrad_scheduler (ExpertsWgradScheduler): scheduler for expert weight gradients
         stream_manager (StreamManager): manager for CUDA streams
         config (OffloadingFP8Config): offloading FP8 configuration
+        mgrad_offload_handle (MoEOffloadHandle): the caller's persistent main-grad offload
+            handle (None unless ``moe_offload_main_grad`` is enabled), used by the wgrad GEMMs as
+            their accumulation target in place of the host-resident ``main_grad``.
+        param_offload_handle (MoEOffloadHandle): coarse FP8 weight handle staged around dispatch
+            and combine-backward communication.
 
     Returns:
-        tuple[torch.Tensor, ActivationOffloadHandle | None]: the MLP output and the activation
+        tuple[torch.Tensor, MoEOffloadHandle | None]: the MLP output and the activation
         offload handle (None unless ``moe_offload_activations`` produced one). The caller must wire
-        the handle into ``MoEActReloadTrigger`` on the combine output so it is reloaded in backward.
+        the handle into ``MoEReloadTrigger`` on the combine output so it is reloaded in backward.
     """
     output, act_offload_handle = OffloadingExpertsFP8GroupedSwiMLP.apply(
         a1,
         a2,
+        mgrad_offload_handle,
+        param_offload_handle,
         cpu_w1,
         cpu_w2,
         cpu_w1_list,

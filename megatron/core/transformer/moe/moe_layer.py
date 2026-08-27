@@ -31,7 +31,9 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
-from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
+from megatron.core.transformer.moe.moe_offload import (
+    MoEReloadTrigger,
+)
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -507,8 +509,14 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
+    def _preload_expert_weights(self):
+        """Start coarse expert-weight reload before the dispatch collective for MLP forward."""
+        init_and_preload = getattr(self.experts, "init_and_preload", None)
+        if init_and_preload is not None:
+            init_and_preload()
+
     def _wrap_activation_reload(self, output: torch.Tensor):
-        """Wire ``MoEActReloadTrigger`` on the combine output so the offloaded expert input
+        """Wire ``MoEReloadTrigger`` on the combine output so the offloaded expert input
         activation is reloaded during the combine-backward window.
 
         Reads the handle set by ``OffloadingExpertsMLP.forward``. Safe against VPP
@@ -518,7 +526,23 @@ class MoELayer(BaseMoELayer):
         """
         handle = getattr(self.experts, "_act_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
-            output = MoEActReloadTrigger.apply(output, handle)
+            output = MoEReloadTrigger.apply(output, handle)
+        return output
+
+    def _wrap_main_grad_reload(self, output: torch.Tensor):
+        """Wire ``MoEReloadTrigger`` on the combine output so the offloaded main grad
+        is reloaded during the combine-backward window.
+        """
+        handle = getattr(self.experts, "_main_grad_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEReloadTrigger.apply(output, handle)
+        return output
+
+    def _wrap_parameter_reload(self, output: torch.Tensor):
+        """Reload coarse FP8 weights during combine-backward communication for MLP backward."""
+        handle = getattr(self.experts, "_param_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEReloadTrigger.apply(output, handle)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
@@ -597,6 +621,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, hidden_states_sf, probs = intermediate_tensors
 
+                self._preload_expert_weights()
                 dispatched_input, _, probs = self.dispatch(hidden_states, hidden_states_sf, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
@@ -606,6 +631,8 @@ class MoELayer(BaseMoELayer):
                 # Reload the offloaded expert activations during the combine-backward
                 # window. No-op unless moe_offload_activations produced an active handle.
                 output = self._wrap_activation_reload(output)
+                output = self._wrap_main_grad_reload(output)
+                output = self._wrap_parameter_reload(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

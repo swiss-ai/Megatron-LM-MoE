@@ -319,6 +319,60 @@ def report_memory(name):
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
+def report_host_memory(name):
+    """Host memory report using torch.cuda.host_memory_stats().
+    """
+    gib = 1024.0**3
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if mpu.get_data_parallel_rank() != 0:
+        return
+    
+    try:
+        stats = torch.cuda.host_memory_stats()
+    except (RuntimeError, AttributeError):
+        stats = {}
+    pinned = ""
+    if stats:
+        pinned = (
+            f" | pinned reserved: {stats.get('reserved_bytes.current', 0) / gib:.2f}"
+            f" (peak {stats.get('reserved_bytes.peak', 0) / gib:.2f})"
+            f" | pinned requested: {stats.get('allocated_bytes.current', 0) / gib:.2f}"
+            f" | pinned segments: {stats.get('segment.current', 0):.0f}"
+        )
+
+    # activation cpu pool and main grad gpu pool
+    act_pool = ""
+    mgrad_pool = ""
+    try:
+        from megatron.core.transformer.moe.moe_offload import MoEOffloadMemoryPool
+
+        stats = MoEOffloadMemoryPool.get_instance().stats()
+        
+        cpu_buf_num, cpu_buf_size, cpu_free_size = stats["cpu"]
+        gpu_buf_num, gpu_buf_size, gpu_free_size = stats["gpu"]
+
+        if cpu_buf_num > 0:
+            act_pool = (
+                f" | act pool: {cpu_buf_num} buffers, "
+                f"{cpu_buf_size / gib:.2f} GB total, "
+                f"{cpu_free_size / gib:.2f} GB free"
+            )
+        if gpu_buf_num > 0:
+            mgrad_pool = (
+                f" | mgrad pool: {gpu_buf_num} buffers, "
+                f"{gpu_buf_size / gib:.2f} GB total, "
+                f"{gpu_free_size / gib:.2f} GB free"
+            )
+    except (ImportError, AttributeError):
+        pass
+
+    print(
+        f"[Rank {rank}] {name} host memory (GiB)"
+        f"{pinned}"
+        f"{act_pool}"
+        f"{mgrad_pool}",
+        flush=True,
+    )
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""

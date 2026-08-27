@@ -1694,6 +1694,15 @@ def validate_args(args, defaults={}):
                 and not args.moe_shared_expert_overlap
             )
             if wgrad_in_graph_scope:
+                assert args.cuda_graph_impl == 'none' or args.pipeline_model_parallel_size > 1, (
+                    'CUDA graph with delay_wgrad_compute is not supported at '
+                    'pipeline-model-parallel-size 1. On graph replay the delayed wgrad of the '
+                    'modules inside the graph scope (shared experts / fc1_latent_proj) is done '
+                    'by replaying the captured wgrad graph, which never runs the Python '
+                    'grad-ready hooks, so DDP never issues the grad reduce for those params and '
+                    'finish_grad_sync() asserts on the first replayed iteration. Use '
+                    '--pipeline-model-parallel-size > 1, or disable CUDA graphs.'
+                )
                 assert is_te_min_version(
                     "2.12.0"
                 ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
