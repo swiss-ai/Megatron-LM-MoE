@@ -17,11 +17,22 @@ class RerunStateMachineConfig:
     """Use re-run engine to validate results (default) or to emit stats
     on variability of computations due to non-deterministic algorithms."""
 
+    rerun_strategy: Literal["rerun_in_place", "skip_iteration"] = "rerun_in_place"
+    """What to do when a result is rejected. 'rerun_in_place' (default) replays the iteration.
+    'skip_iteration' instead discards the current global batch and reruns the
+    forward-backward pass on the next batch."""
+
     check_for_nan_in_loss: bool = True
     """Check for NaN in the loss."""
 
     check_for_spiky_loss: bool = False
     """Check for spiky loss."""
+
+    check_grad_norm: bool = False
+    """Check for spiky grad norm. Only supported by the md_decoupling optimizer."""
+
+    check_grad_norm_threshold: float = 5.0
+    """Threshold for spiky grad norm detection."""
 
 
 @dataclass(kw_only=True)
