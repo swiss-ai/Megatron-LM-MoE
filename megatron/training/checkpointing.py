@@ -1629,6 +1629,9 @@ def load_args_from_checkpoint(
     _set_arg('xssglu', force=True)
     _set_arg('polynorm', force=True)
     _set_arg('qk_layernorm', force=True)
+    _set_arg('linear_attention_full_rank_output_gate', force=True)
+    _set_arg('linear_attention_safe_output_gate', force=True)
+    _set_arg('linear_attention_safe_output_gate_lower_bound', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
