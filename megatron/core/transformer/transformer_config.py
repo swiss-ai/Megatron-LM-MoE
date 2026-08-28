@@ -2062,10 +2062,6 @@ class TransformerConfig(ModelParallelConfig):
                         "qkv in recompute_modules is not supported with multi_latent_attention; "
                         "use mla_up_proj instead."
                     )
-                if self.attention_output_gate:
-                    raise ValueError(
-                        "qkv in recompute_modules is not supported with attention_output_gate."
-                    )
                 if self.fine_grained_activation_offloading and self.offload_modules is not None:
                     conflicts = {"qkv_linear", "core_attn"} & set(self.offload_modules)
                     if conflicts:
