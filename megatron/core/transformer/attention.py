@@ -424,14 +424,22 @@ class Attention(MegatronModule, ABC):
         return hidden_states
 
     def _qkv_and_rope(self, hidden_states, key_value_states, rotary_pos_emb, packed_seq_params):
-        """Produce the query/key/value tensors consumed by the attention kernel.
+        """Produce the query/key/value tensors (and output gate, if enabled) consumed by the
+        attention kernel.
 
         Function wrapper for: QKV projection, the QK layernorms and the RoPE application
         Used as the recompute region for `recompute_modules=["qkv"]`.
         """
-        query, key, value = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, split_qkv=True, output_gate=False
+        qkv_output = self.get_query_key_value_tensors(
+            hidden_states,
+            key_value_states,
+            split_qkv=True,
+            output_gate=self.config.attention_output_gate,
         )
+        if self.config.attention_output_gate:
+            query, key, value, gate = qkv_output
+        else:
+            query, key, value = qkv_output
 
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if is_thd:
@@ -476,6 +484,8 @@ class Attention(MegatronModule, ABC):
                     cp_group=self.pg_collection.cp,
                 )
 
+        if self.config.attention_output_gate:
+            return query, key, value, gate
         return query, key, value
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
@@ -1112,19 +1122,23 @@ class Attention(MegatronModule, ABC):
             and self.training
             and inference_context is None
             and split_qkv
-            and not self.config.attention_output_gate
         )
 
         if recompute_qkv:
             self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 fp8=self.config.fp8 or self.config.fp4
             )
-            query, key, value = self.qkv_checkpoint.checkpoint(
+            qkv_output = self.qkv_checkpoint.checkpoint(
                 lambda hs: self._qkv_and_rope(
                     hs, key_value_states, rotary_pos_emb, packed_seq_params
                 ),
                 hidden_states,
             )
+            gate = None
+            if self.config.attention_output_gate:
+                query, key, value, gate = qkv_output
+            else:
+                query, key, value = qkv_output
             nvtx_range_pop(suffix="qkv")
             return self._core_attn_and_output_proj(
                 query,
@@ -1136,7 +1150,7 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params,
                 inference_context,
                 block_table=None,
-                gate=None,
+                gate=gate,
             )
 
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
@@ -1383,15 +1397,16 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        if self.qkv_checkpoint is not None:
-            self.qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
-            self.qkv_checkpoint = None
-
         # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
+
+        # release after output gate
+        if self.qkv_checkpoint is not None:
+            self.qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
+            self.qkv_checkpoint = None
 
         # =================
         # Output. [sq, b, h]
