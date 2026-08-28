@@ -830,23 +830,29 @@ class RerunStateMachine:
             return True
 
         # if load from ckpt, check based on previous step value
-        if reload: 
-            if context not in self.prev_step_value:
-                if value >= threshold:
-                    return True
-                self.prev_step_value[context] = value
-                return False
-            else:
-                if value >= threshold or value >= self.prev_step_value[context] * 5:
-                    return True
-                self.prev_step_value[context] = value
-                return False
+        if reload:
+            prev_value = self.prev_step_value.get(context)
+            if value >= threshold or (prev_value is not None and value >= prev_value * 5):
+                # do not record a rejected value
+                return True
+            self.prev_step_value[context] = value
+            return False
 
         if resample or context not in self.large_value_counts:
             self.large_value_counts[context] = 0
         if self.large_value_counts[context] < num_samples:
+            # if the context sampling is not finished
+            # check rerun condition based on previous step value
+            prev_value = self.prev_step_value.get(context)
+            if value >= 20 or (prev_value is not None and value >= prev_value * 5):
+                # do not record a rejected value
+                return True
+
+            # record the max value and count for the context, capped so a large but accepted
+            # value cannot lift the post-sampling bar and mask later spikes
+            self.prev_step_value[context] = value
             self.large_value_counts[context] += 1
-            self.max_values[context] = max(self.max_values.get(context, 0.0), value)
+            self.max_values[context] = min(max(self.max_values.get(context, 0.0), value), 5.0)
             if self.large_value_counts[context] == num_samples:
                 logger.warning(f"Max value for {context}: {self.max_values[context]}")
             return False
