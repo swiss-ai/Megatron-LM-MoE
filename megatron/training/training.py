@@ -1994,7 +1994,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     rejection_func=partial(
                         rerun_state_machine.is_spiky_grad_norm,
                         context="grad_norm",
-                        num_samples=50,
+                        num_samples=20,
                         reload=args.load is not None and args.iteration > 0,
                         threshold=args.check_grad_norm_threshold,
                     ),
@@ -2227,6 +2227,19 @@ def training_log(
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
+        rerun_state_machine = get_rerun_state_machine()
+        writer.add_scalar('rerun-count', rerun_state_machine.rerun_count, iteration)
+        writer.add_scalar(
+            'rerun-count-this-iteration', rerun_state_machine.rerun_count_this_iteration, iteration
+        )
+        if wandb_writer:
+            wandb_writer.log(
+                {
+                    'rerun-count': rerun_state_machine.rerun_count,
+                    'rerun-count-this-iteration': rerun_state_machine.rerun_count_this_iteration,
+                },
+                iteration,
+            )
         writer.add_scalar('batch-size', batch_size, iteration)
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:

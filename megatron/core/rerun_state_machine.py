@@ -249,6 +249,8 @@ class RerunStateMachine:
         self.prev_step_value: dict[str, float] = {}
         self.skipped_iteration: int = 0
         self.discarded_batches: int = 0
+        self.rerun_count: int = 0
+        self.rerun_count_this_iteration: int = 0
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
@@ -333,6 +335,7 @@ class RerunStateMachine:
             self.continue_requested = False
             self.injected_result = None
             self.discarded_batches = 0
+            self.rerun_count_this_iteration = 0
             self.current_iteration += 1
             self.state = RerunState.INITIAL_RUN
             return True
@@ -377,6 +380,8 @@ class RerunStateMachine:
 
             if self.mode == RerunMode.VALIDATE_RESULTS and safe_get_rank() == 0:
                 logger.warning("Need to rerun step to check reproducibility of initial result")
+            self.rerun_count += 1
+            self.rerun_count_this_iteration += 1
             self.state = RerunState.RERUNNING_IN_PLACE
             self._restore_state()
             if data_iterators:

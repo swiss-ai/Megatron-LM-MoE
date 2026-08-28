@@ -22,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -343,6 +344,20 @@ class GatedDeltaNet(MegatronModule):
             assert not self.config.linear_attention_learnable_initial_state, (
                 "linear_attention_carry_state and linear_attention_learnable_initial_state "
                 "are mutually exclusive."
+            )
+            # The rerun engine replays an iteration in place after rewinding the data
+            # iterator, but it only restores the RNG state plus whatever is registered
+            # through register_state_save_restore_funcs(). _carried_state is advanced
+            # under no_grad on every microbatch and is not registered, so the replay
+            # would resume from an already-advanced state and never reproduce the
+            # initial run -- reported as a spurious "possible transient error".
+            assert get_rerun_state_machine().get_mode() == RerunMode.DISABLED, (
+                "linear_attention_carry_state is incompatible with the rerun engine "
+                f"(--rerun-mode {get_rerun_state_machine().get_mode().value}): the carried "
+                "recurrent state is mutated by every forward and is not restored by "
+                "RerunStateMachine._restore_state(), so a replayed iteration starts from "
+                "the wrong state. Pass --rerun-mode disabled, or drop "
+                "--linear-attention-carry-state."
             )
             self._carry_enabled = True
             self._carried_state = None  # lazy-init in forward
