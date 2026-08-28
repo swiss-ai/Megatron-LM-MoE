@@ -3076,11 +3076,19 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        # The graph's static input surface must match the token layout the pipeline
+        # actually runs with. Under THD packing (`--dataloader-inter-document-masking`
+        # or `--sft`) a microbatch is laid out as (mbs * seq, 1) rather than (seq, mbs);
+        # train_step already collapses the shape for the pipeline buffers via
+        # _pipeline_shape_args, and the capture must size its static hidden_states the
+        # same way, or the first replayed iteration fails inside TE's
+        # Graphed.forward static_input_surface.copy_() with a dim-0 size mismatch.
+        cuda_graph_seq_length, cuda_graph_micro_batch_size = _pipeline_shape_args(args)
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=cuda_graph_seq_length,
+            micro_batch_size=cuda_graph_micro_batch_size,
             optimizers=[optimizer],
         )
 
