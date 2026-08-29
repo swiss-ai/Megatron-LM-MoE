@@ -326,18 +326,19 @@ def report_host_memory(name):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if mpu.get_data_parallel_rank() != 0:
         return
-    
+
     try:
-        stats = torch.cuda.host_memory_stats()
+        host_stats = torch.cuda.host_memory_stats()
     except (RuntimeError, AttributeError):
-        stats = {}
+        host_stats = {}
     pinned = ""
-    if stats:
+    if host_stats:
         pinned = (
-            f" | pinned reserved: {stats.get('reserved_bytes.current', 0) / gib:.2f}"
-            f" (peak {stats.get('reserved_bytes.peak', 0) / gib:.2f})"
-            f" | pinned requested: {stats.get('allocated_bytes.current', 0) / gib:.2f}"
-            f" | pinned segments: {stats.get('segment.current', 0):.0f}"
+            f" | pinned pool: {host_stats.get('allocated_bytes.current', 0) / gib:.2f}"
+            f" (peak {host_stats.get('allocated_bytes.peak', 0) / gib:.2f})"
+            f" | pinned blocks: {host_stats.get('allocations.current', 0)}"
+            f" | cudaHostAlloc/Free: {host_stats.get('num_host_alloc', 0)}"
+            f"/{host_stats.get('num_host_free', 0)}"
         )
 
     # activation cpu pool and main grad gpu pool
