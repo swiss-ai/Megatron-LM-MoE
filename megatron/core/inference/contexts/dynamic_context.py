@@ -82,6 +82,7 @@ DEPRECATED_ARGS = [
     "num_cuda_graphs",
     "materialize_only_last_token_logits",
     "mamba_inference_state_config",
+    "kda_inference_state_config",
     "use_cuda_graphs_for_non_decode_steps",
     "use_flashinfer_fused_rope",
     "unified_memory_level",
@@ -283,9 +284,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if pg_collection is not None:
             tp_size = get_pg_size(pg_collection.tp)
             pp_size = get_pg_size(pg_collection.pp)
+            cp_size = get_pg_size(pg_collection.cp)
         else:
             tp_size = model_config.tensor_model_parallel_size
             pp_size = model_config.pipeline_model_parallel_size
+            cp_size = model_config.context_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         if num_attention_heads >= tp_size:
             self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
@@ -317,9 +320,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
-        # Mamba states.
+        # Recurrent-layer states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
+        kda_inference_state_config = inference_config.kda_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
+        self.has_kda = kda_inference_state_config is not None
+        assert not (self.is_hybrid_model and self.has_kda), (
+            "Models containing both Mamba and KDA layers are not supported yet"
+        )
+
+        if self.has_kda:
+            assert cp_size == 1, "Dynamic KDA inference currently requires CP=1"
+            assert not self.enable_prefix_caching, "KDA prefix caching is not supported"
+            assert self.num_speculative_tokens == 0, "KDA speculative decoding is not supported"
+            assert not model_config.linear_attention_learnable_initial_state
+            assert not model_config.linear_attention_carry_state
+            self.kda_conv_states_shape = kda_inference_state_config.conv_states_shape
+            self.kda_recurrent_states_shape = kda_inference_state_config.recurrent_states_shape
+            self.kda_conv_states_dtype = kda_inference_state_config.conv_states_dtype
+            self.kda_recurrent_states_dtype = kda_inference_state_config.recurrent_states_dtype
+            self.kda_layer_map = kda_inference_state_config.kda_layer_map
+            self.num_kda_layers = len(self.kda_layer_map)
+
         if self.is_hybrid_model:
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
@@ -340,6 +362,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | mamba_layer_map
+        elif self.has_kda:
+            self.num_attention_layers = len(kda_inference_state_config.attention_layer_map)
+            self.num_mamba_layers = 0
+            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.layer_map = kda_inference_state_config.attention_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = model_config.num_layers // pp_size
@@ -393,6 +420,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_memory_per_request *= self.num_mamba_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
                 mamba_states_memory_per_request += intermediate_memory_per_request
+
+        kda_states_memory_per_request = 0
+        if self.has_kda:
+            kda_states_memory_per_request = self.num_kda_layers * (
+                math.prod(self.kda_conv_states_shape) * self.kda_conv_states_dtype.itemsize
+                + math.prod(self.kda_recurrent_states_shape)
+                * self.kda_recurrent_states_dtype.itemsize
+            )
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -454,11 +489,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
             block_count = buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
+                self.block_size_bytes
+                + mamba_states_memory_per_request
+                + kda_states_memory_per_request
             )
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
+                self.block_size_bytes
+                + mamba_states_memory_per_request
+                + kda_states_memory_per_request
             )
 
         # If using pipeline parallelism synchronize the total block count in case the
@@ -706,6 +745,39 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.mamba_metadata = None
 
+    def _allocate_kda_states(self):
+        """Allocate request-indexed KDA states plus one CUDA-graph dummy slot."""
+        if not self.has_kda:
+            self.kda_metadata = None
+            return
+
+        state_slot_count = self.max_requests + 1
+        self.kda_dummy_state_idx = self.max_requests
+        self.kda_conv_states = torch.empty(
+            (self.num_kda_layers, state_slot_count) + self.kda_conv_states_shape,
+            dtype=self.kda_conv_states_dtype,
+            device=torch.cuda.current_device(),
+        )
+        self.kda_recurrent_states = torch.empty(
+            (self.num_kda_layers, state_slot_count) + self.kda_recurrent_states_shape,
+            dtype=self.kda_recurrent_states_dtype,
+            device=torch.cuda.current_device(),
+        )
+        self.kda_conv_states[:, self.kda_dummy_state_idx].zero_()
+        self.kda_recurrent_states[:, self.kda_dummy_state_idx].zero_()
+
+        if (
+            self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            and not self._uses_torch_memory_saver
+        ):
+            assert self.unified_memory_level == 0
+            for name in ("kda_conv_states", "kda_recurrent_states"):
+                tensor = getattr(self, name)
+                self._offloadable_tensor_names.add(name)
+                self._offloadable_cpu_backups[name] = torch.empty_like(
+                    tensor, device="cpu"
+                ).pin_memory()
+
     def initialize_all_tensors(self) -> None:
         """Allocate all GPU state during initial construction."""
         # Mark allocated.
@@ -773,6 +845,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
+        if self.has_kda:
+            self.kda_metadata = MambaMetadata(
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                d_conv=self.kda_conv_states_shape[-1],
+            )
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -792,6 +870,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
+            self._allocate_kda_states()
+
+        self.recurrent_metadata = self.mamba_metadata or self.kda_metadata
 
         # Allocate Mamba prefix cache if configured
         self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
@@ -1052,6 +1133,24 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return (conv_state, ssm_state)
 
+    def kda_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Return the convolution and recurrent KDA buffers for one layer."""
+        assert self.has_kda, "The model does not have KDA inference states"
+        kda_layer_number = self.kda_layer_map[layer_number - 1]
+        return (
+            self.kda_conv_states[kda_layer_number],
+            self.kda_recurrent_states[kda_layer_number],
+        )
+
+    def _allocate_kda_slot(self, request_idx: int, request_id: int) -> None:
+        """Allocate and zero the KDA state slot for a newly admitted request."""
+        kda_idx = self.kda_metadata.allocate_slot()
+        if kda_idx is None:
+            raise ContextOverflowError(request_id, "No KDA state slots available")
+        self.kda_conv_states[:, kda_idx].zero_()
+        self.kda_recurrent_states[:, kda_idx].zero_()
+        self.kda_metadata.request_to_mamba_state_idx[request_idx] = kda_idx
+
     # =========================================================================
     # Mamba prefix cache infrastructure
     # =========================================================================
@@ -1212,13 +1311,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             attn_metadata.reset()
         self.active_attn_metadata = None
 
-        if self.is_hybrid_model:
-            self.mamba_metadata.reset_varlen_metadata()
+        if self.recurrent_metadata is not None:
+            self.recurrent_metadata.reset_varlen_metadata()
 
     def reset_mamba_state(self) -> None:
-        """Reset state used within Mamba layers."""
-        if self.is_hybrid_model:
-            self.mamba_metadata.reset()
+        """Reset state used within recurrent layers."""
+        if self.recurrent_metadata is not None:
+            self.recurrent_metadata.reset()
 
     def add_dummy_requests_parallel(
         self, requests: Sequence[DynamicInferenceRequest], *, count_as_prefill: bool = True
@@ -1353,6 +1452,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
+        if self.has_kda:
+            for logical_idx, request_idx in enumerate(range(start_request_idx, end_request_idx)):
+                self._allocate_kda_slot(request_idx, requests[logical_idx].request_id)
 
         self.active_token_count = token_end
         self.total_request_count = end_request_idx
@@ -1464,8 +1566,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.arange(T, device=self.token_to_block_idx.device) % tokens_per_request
         )
 
-        if self.is_hybrid_model:
-            # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
+        if self.is_hybrid_model or self.has_kda:
+            # 4. token_to_request_idx: needed by recurrent-layer metadata.
             self.token_to_request_idx[0:T] = torch.repeat_interleave(
                 torch.arange(
                     0,
@@ -1476,10 +1578,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tokens_per_request,
             )
 
+        if self.is_hybrid_model:
             # 5. Mamba state: allocate slots for dummy requests.
             self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
                 self.mamba_metadata.batch_allocate_slots(N)
             )
+        if self.has_kda:
+            kda_slots = self.kda_metadata.batch_allocate_slots(N)
+            self.kda_metadata.request_to_mamba_state_idx[0:N] = kda_slots
+            self.kda_conv_states[:, kda_slots].zero_()
+            self.kda_recurrent_states[:, kda_slots].zero_()
 
     def initialize_attention_state(
         self,
@@ -1520,7 +1628,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
             smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
-            strict=self.is_hybrid_model,
+            strict=self.is_hybrid_model or self.has_kda,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
         )
@@ -1637,6 +1745,21 @@ class DynamicInferenceContext(BaseInferenceContext):
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
                 intermediate_offsets_gpu=intermediate_offsets_gpu,
                 intermediate_counts_gpu=intermediate_counts_gpu,
+            )
+
+        if self.has_kda:
+            active_kda_indices_view = self.kda_metadata.request_to_mamba_state_idx[active_slice]
+            token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
+            cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
+                "cu_query_seq_lengths"
+            ]
+            self.kda_metadata.update(
+                active_kda_indices_view,
+                token_to_request_idx_view,
+                cu_seqlens,
+                batch_dimensions=attn_dimensions,
+                padded_batch_dimensions=self.padded_batch_dimensions,
+                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
             )
 
         if self.moe_enable_routing_replay:
@@ -2128,6 +2251,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     overall_required_blocks,
                 )
 
+        if self.has_kda and req.finished_chunk_token_count == 0:
+            self._allocate_kda_slot(current_id, req.request_id)
+
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
         self.total_request_count += 1
@@ -2157,9 +2283,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         for metadata_tensor in self.request_metadata.values():
             metadata_tensor[dst_idxs] = metadata_tensor[src_idxs]
 
-        if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
-                self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+        if self.recurrent_metadata is not None:
+            self.recurrent_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                self.recurrent_metadata.request_to_mamba_state_idx[src_idxs]
             )
 
     def _swap_book_keeping_tensors(
@@ -2189,8 +2315,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         for metadata_tensor in self.request_metadata.values():
             tensor_swap(metadata_tensor, src_idxs, dst_idxs)
 
-        if self.is_hybrid_model:
-            tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
+        if self.recurrent_metadata is not None:
+            tensor_swap(self.recurrent_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
     def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
         """
@@ -2236,9 +2362,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
 
-        # Free Mamba slots.
-        if self.is_hybrid_model:
-            self.mamba_metadata.free_slots(request_indexes)
+        # Free recurrent-state slots.
+        if self.recurrent_metadata is not None:
+            self.recurrent_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests
         if self.mamba_slot_allocator is not None:
@@ -2442,8 +2568,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count, self.total_request_count + evict_request_count
         )
         self.request_to_kv_block_ids[evict_slice] = -1
-        if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
+        if self.recurrent_metadata is not None:
+            self.recurrent_metadata.request_to_mamba_state_idx[evict_slice] = -1
 
         return evict_request_ids
 
@@ -2589,8 +2715,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
                 # Reset chunk ids for recently moved requests.
                 self.request_to_kv_block_ids[active_idxs_on_right] = -1
-                if self.is_hybrid_model:
-                    self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
+                if self.recurrent_metadata is not None:
+                    self.recurrent_metadata.request_to_mamba_state_idx[
+                        active_idxs_on_right
+                    ] = -1
 
         # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily

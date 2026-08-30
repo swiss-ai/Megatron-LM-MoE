@@ -27,8 +27,19 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-# persistent MoE buffers for rerun state machine
-_RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta')
+# Mutable router state accumulated during a forward pass.
+_RERUN_ROUTER_BUFFERS = (
+    'expert_bias',
+    'qb_beta',
+    'local_tokens_per_expert',
+    'global_tokens_per_expert',
+    'ga_steps',
+    'qb_histogram',
+    'qb_beta_accum',
+    'qb_beta_count',
+)
+_RERUN_ROUTER_SAMPLE_LISTS = ('mbs_expert_load_samples', 'seq_expert_load_samples')
+
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -280,15 +291,25 @@ class TopKRouter(Router):
     def get_router_rerun_state(self):
         """Snapshot the router state that a replayed iteration must start from."""
         return {
-            n: buf.detach().clone()
-            for n in _RERUN_ROUTER_BUFFERS
-            if (buf := getattr(self, n, None)) is not None
+            'buffers': {
+                name: buf.detach().clone()
+                for name in _RERUN_ROUTER_BUFFERS
+                if (buf := getattr(self, name, None)) is not None
+            },
+            # Forward only appends to these lists, so lengths are sufficient for rollback.
+            'sample_list_lengths': {
+                name: len(samples)
+                for name in _RERUN_ROUTER_SAMPLE_LISTS
+                if (samples := getattr(self, name, None)) is not None
+            },
         }
 
     def set_router_rerun_state(self, state):
-        """Restore the snapshot taken by get_rerun_state()."""
-        for n, saved in state.items():
-            getattr(self, n).copy_(saved)
+        """Restore the snapshot taken by get_router_rerun_state()."""
+        for name, saved in state['buffers'].items():
+            getattr(self, name).copy_(saved)
+        for name, saved_length in state['sample_list_lengths'].items():
+            del getattr(self, name)[saved_length:]
 
     def _maintain_float32_expert_bias(self):
         """

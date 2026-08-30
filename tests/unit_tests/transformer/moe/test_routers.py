@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import copy
 from typing import cast
 
 import pytest
@@ -158,6 +159,63 @@ class TestTop2Router:
             torch.testing.assert_close(scores_ref, scores_fused)
             # restore the config
             self.router.config.moe_router_fusion = False
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_rerun_restores_expert_load_tracking(self):
+        self.router = self.router.cuda()
+        self.router.train()
+        self.router.config.moe_router_violation_metrics = ['mbs', 'seq']
+        hidden_states = torch.randn(
+            (8, 2, self.router.config.hidden_size), device='cuda', dtype=torch.bfloat16
+        )
+
+        state = self.router.get_router_rerun_state()
+        self.router(hidden_states)
+        assert len(self.router.mbs_expert_load_samples) == 1
+        assert len(self.router.seq_expert_load_samples) == 1
+        assert self.router.local_tokens_per_expert.sum() > 0
+
+        self.router.set_router_rerun_state(state)
+        assert not self.router.mbs_expert_load_samples
+        assert not self.router.seq_expert_load_samples
+        torch.testing.assert_close(
+            self.router.local_tokens_per_expert,
+            torch.zeros_like(self.router.local_tokens_per_expert),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("method", ["histogram", "average"])
+    def test_rerun_restores_quantile_balancing_state(self, method):
+        config = copy.deepcopy(self.transformer_config)
+        config.moe_router_load_balancing_type = ["global_aux_loss", "quantile_balancing"]
+        config.moe_aux_loss_coeff = [0.1, 0.1]
+        config.moe_router_quantile_balancing_method = method
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=False
+        )
+        router = cast(Router, MoELayer(config, submodules.mlp.submodules).router).cuda()
+
+        state = router.get_router_rerun_state()
+        expected_names = {
+            'local_tokens_per_expert',
+            'global_tokens_per_expert',
+            'ga_steps',
+            'qb_beta',
+        }
+        if method == 'histogram':
+            expected_names.add('qb_histogram')
+        else:
+            expected_names.update(('qb_beta_accum', 'qb_beta_count'))
+        assert set(state['buffers']) == expected_names
+
+        for name in state['buffers']:
+            getattr(router, name).add_(1)
+        router.set_router_rerun_state(state)
+
+        for name, saved in state['buffers'].items():
+            torch.testing.assert_close(getattr(router, name), saved)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

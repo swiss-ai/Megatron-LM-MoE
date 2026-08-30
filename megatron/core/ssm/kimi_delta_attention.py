@@ -24,6 +24,8 @@ import inspect
 import logging
 import math
 import os
+import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional, Tuple, Union
@@ -34,8 +36,16 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import Tensor
 
+from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
+    tensor_get_slice_after,
+    tensor_masked_update,
+    tensor_merge,
+)
 from megatron.core.jit import jit_fuser
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     get_cuda_rng_tracker,
@@ -54,7 +64,7 @@ from megatron.core.ssm.gated_delta_net import (
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, is_using_quantization_scales
 from megatron.core import tensor_parallel
 
 try:
@@ -64,6 +74,16 @@ try:
 except ImportError:
     chunk_kda = None
     HAVE_KDA = False
+
+try:
+    from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+except ImportError:
+    fused_recurrent_kda_fwd = None
+
+try:
+    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
+except ImportError:
+    causal_conv1d_varlen_states = None
 
 try:
     from fla.modules import FusedRMSNormGated
@@ -161,6 +181,7 @@ def _fused_kda_gate_style() -> Optional[str]:
 
 _KDA_GATE_STYLE = _fused_kda_gate_style()
 
+# NOTE: This is for backwards compatibility, because many of these things were added in the newer version of FLA (like 0.52.0). But we should remove this and just say we use >=0.5.2
 _KDA_SUPPORTS_QK_L2NORM_IN_KERNEL = _chunk_kda_supports("use_qk_l2norm_in_kernel")
 _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
     "use_beta_sigmoid_in_kernel"
@@ -340,6 +361,13 @@ class KimiDeltaAttention(GatedDeltaNet):
             + output_gate_in_proj_dim
             + self.num_value_heads
         )
+        if self.config.fp8:
+            # KDA's fused input projection includes per-head beta terms, so its output
+            # width is not guaranteed to satisfy the alignment required by FP8 GEMMs (so for now, we disable FP8).
+            warnings.warn(
+                "KDA does not currently support FP8; running the KDA layer without FP8.",
+                stacklevel=2,
+            )
 
         # Rebuild in_proj with the new output dim. Uses the same submodule spec
         # as GDN; the parent's instance is replaced.
@@ -680,29 +708,10 @@ class KimiDeltaAttention(GatedDeltaNet):
             return self._gate_lower_bound * torch.sigmoid(decay_scale * (alpha.float() + bias))
         return -decay_scale * F.softplus(alpha.float() + bias)
 
-    def _in_proj_to_attn_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        batch: int,
-        seq_len: int,
-        packed_seq_params=None,
-        cu_seqlens=None,
-    ):
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        projected, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
-
+    def _expand_low_rank_inputs(self, projected):
+        """Split in_proj output and apply KDA's two second-stage projections."""
         num_v_heads_tp = self.num_value_heads // self.tp_size
         low_rank_local_tp = self.gate_low_rank_dim // self.tp_size
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-
-        # Q/K/V occupy one contiguous prefix and stay grouped for convolution.
-        nvtx_range_push(suffix="low_rank_proj")
         if self._full_rank_output_gate:
             # Output gate is full-rank and already sharded on value heads exactly
             # like V, so it needs no all-gather. Only the decay bottleneck does.
@@ -726,10 +735,6 @@ class KimiDeltaAttention(GatedDeltaNet):
                 [self.conv_dim_local_tp, 2 * low_rank_local_tp, num_v_heads_tp],
                 dim=-1,
             )
-            # Both bottlenecks are needed at full width, so gather them in one
-            # collective. The all-gather concatenates per-rank blocks, each
-            # [decay_shard | gate_shard], giving [d0 g0 d1 g1 ...]; the view
-            # below de-interleaves that back into the two full-width tensors.
             gathered = gather_from_tensor_model_parallel_region(
                 low_rank_pair, group=self.pg_collection.tp
             )
@@ -763,6 +768,59 @@ class KimiDeltaAttention(GatedDeltaNet):
         alpha, _ = self.decay_out_proj(decay_low_rank)
         if not self._full_rank_output_gate:
             gate, _ = self.gate_out_proj(gate_low_rank)
+        return qkv, gate, beta, alpha
+
+    def _prepare_g_and_beta(self, alpha, beta, A_log, dt_bias):
+        """Prepare raw or activated decay and beta inputs for a KDA kernel."""
+        g = (
+            alpha.reshape(*alpha.shape[:-1], -1, self.key_head_dim)
+            if self._use_fused_decay_gate
+            else self._activate_decay(alpha, A_log, dt_bias)
+        )
+        if not self._use_fused_beta_sigmoid:
+            beta = self._activate_beta(beta)
+        return g, beta.contiguous()
+
+    def _kda_kernel_options(self, A_log, dt_bias):
+        """Feature options shared by chunked and recurrent KDA kernels."""
+        kwargs = {
+            "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
+            "use_gate_in_kernel": self._use_fused_decay_gate,
+            "use_beta_sigmoid_in_kernel": self._use_fused_beta_sigmoid,
+        }
+        if self._use_fused_decay_gate:
+            kwargs["A_log"] = A_log
+            kwargs["dt_bias"] = dt_bias.reshape(-1)
+            if self._safe_gate:
+                kwargs["safe_gate"] = True
+                kwargs["lower_bound"] = self._gate_lower_bound
+        if self._use_fused_beta_sigmoid and _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
+            kwargs["allow_neg_eigval"] = self.config.linear_attention_allow_neg_eigval
+        return kwargs
+
+    def _in_proj_to_attn_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        packed_seq_params=None,
+        cu_seqlens=None,
+    ):
+        # Input projection
+        nvtx_range_push(suffix="in_proj")
+        projected, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+
+        # Q/K/V occupy one contiguous prefix and stay grouped for convolution.
+        nvtx_range_push(suffix="low_rank_proj")
+        qkv, gate, beta, alpha = self._expand_low_rank_inputs(projected)
+
         nvtx_range_pop(suffix="low_rank_proj")
 
         # Keep the logical outputs separate through CP. The CP helper already
@@ -860,6 +918,34 @@ class KimiDeltaAttention(GatedDeltaNet):
         inference_params=None,
         **kwargs,
     ):
+        """Run KDA without FP8, even when FP8 is enabled for the model."""
+        quantization_context = nullcontext()
+        if self.config.fp8:
+            from transformer_engine.pytorch import fp8_autocast
+
+            quantization_context = fp8_autocast(enabled=False)
+        with quantization_context:
+            return self._forward_impl(
+                hidden_states,
+                attention_mask,
+                inference_context,
+                packed_seq_params,
+                sequence_len_offset,
+                inference_params=inference_params,
+                **kwargs,
+            )
+
+    def _forward_impl(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        *,
+        inference_params=None,
+        **kwargs,
+    ):
         """KDA forward. Mirrors GDN.forward, but the alpha slot is wider
         (num_v_heads * key_head_dim vs num_v_heads). KDA has no DeltaProduct
         variant, so n_hh is forced to 1 and erase logic is skipped.
@@ -871,7 +957,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         seq_len = seq_len * self.sp_size * self.cp_size
 
         if inference_context is not None:
-            raise NotImplementedError("KDA does not support inference for now.")
+            if not self.training and inference_context.is_dynamic_batching():
+                return self._dynamic_inference(hidden_states, inference_context)
+            raise NotImplementedError("KDA inference is supported only by the dynamic engine.")
         assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
 
         # Cross-document masking. The conv and chunk_kda both run on the full
@@ -1035,41 +1123,22 @@ class KimiDeltaAttention(GatedDeltaNet):
         bookkeeping.
         """
         nvtx_range_push(suffix="g_and_beta")
-        g = (
-            alpha.reshape(*alpha.shape[:-1], -1, self.key_head_dim)
-            if self._use_fused_decay_gate
-            else self._activate_decay(alpha, A_log_local_cp, dt_bias_local_cp)
+        g, beta = self._prepare_g_and_beta(
+            alpha, beta, A_log_local_cp, dt_bias_local_cp
         )
-        if not self._use_fused_beta_sigmoid:
-            beta = self._activate_beta(beta)
-        beta = beta.contiguous()
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="chunk_kda")
-        kda_kwargs = {
-            "g": g,
-            "beta": beta,
-            "initial_state": initial_state_f32,
-            "output_final_state": need_final_state,
-            "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
-        }
+        kda_kwargs = self._kda_kernel_options(A_log_local_cp, dt_bias_local_cp)
+        kda_kwargs.update(
+            g=g,
+            beta=beta,
+            initial_state=initial_state_f32,
+            output_final_state=need_final_state,
+        )
         if cu_seqlens is not None:
             kda_kwargs["cu_seqlens"] = cu_seqlens
-        if self._use_fused_decay_gate:
-            kda_kwargs["use_gate_in_kernel"] = True
-            kda_kwargs["A_log"] = A_log_local_cp
-            kda_kwargs["dt_bias"] = dt_bias_local_cp.reshape(-1)
-            if self._safe_gate:
-                # Kimi-K3 safe decay computed inside chunk_kda:
-                # g = g_min * sigmoid(exp(A_log) * (alpha + dt_bias)).
-                kda_kwargs["safe_gate"] = True
-                kda_kwargs["lower_bound"] = self._gate_lower_bound
-        if self._use_fused_beta_sigmoid:
-            kda_kwargs["use_beta_sigmoid_in_kernel"] = True
-            if _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL:
-                kda_kwargs["allow_neg_eigval"] = (
-                    self.config.linear_attention_allow_neg_eigval
-                )
+
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query, key, value, **kda_kwargs
         )
@@ -1079,6 +1148,241 @@ class KimiDeltaAttention(GatedDeltaNet):
         norm_out = self._apply_gated_norm(core_attn_out, gate.contiguous())
         nvtx_range_pop(suffix="gated_norm")
         return norm_out, last_recurrent_state
+
+    def _split_dynamic_projection(self, projected: Tensor):
+        """Expand and reshape the current factorized KDA projection for inference."""
+        batch, seq_len, _ = projected.shape
+        qkv, gate, beta, alpha = self._expand_low_rank_inputs(projected)
+        gate = gate.reshape(batch, seq_len, self.num_v_heads_local_tp, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len, self.num_v_heads_local_tp)
+        return qkv, gate, beta, alpha
+
+    def _prepare_dynamic_kda(self, qkv, gate, beta, alpha):
+        """Prepare convolved projections and raw/fused gates for an inference kernel."""
+        batch, seq_len, _ = qkv.shape
+        query, key, value = self._prepare_qkv_for_kda(qkv, batch, seq_len)
+        g, beta = self._prepare_g_and_beta(alpha, beta, self.A_log, self.dt_bias)
+        return query, key, value, gate.contiguous(), g, beta
+
+    def _dynamic_inference_decode(
+        self,
+        projected: Tensor,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+        batch_indices: Tensor,
+        dummy_state_idx: int,
+    ) -> Tensor:
+        """Decode one token per request and update indexed KDA states in place."""
+        if fused_recurrent_kda_fwd is None:
+            raise ImportError(
+                "Dynamic KDA decode requires fla.ops.kda.fused_recurrent_kda_fwd."
+            )
+
+        qkv, gate, beta, alpha = self._split_dynamic_projection(projected)
+        safe_batch_indices = torch.where(
+            batch_indices >= 0,
+            batch_indices,
+            torch.full_like(batch_indices, dummy_state_idx),
+        )
+
+        qkv_dtype = qkv.dtype
+        conv_weight = self.conv1d.weight.squeeze(1).to(conv_state.dtype)
+        conv_bias = self.conv1d.bias if self.conv_bias else None
+        if conv_bias is not None:
+            conv_bias = conv_bias.to(conv_state.dtype)
+        qkv = causal_conv1d_update(
+            x=qkv.to(conv_state.dtype),
+            conv_state=conv_state,
+            weight=conv_weight,
+            bias=conv_bias,
+            silu_activation=self.activation,
+            conv_state_indices=safe_batch_indices,
+        ).to(qkv_dtype)
+
+        query, key, value, gate, g, beta = self._prepare_dynamic_kda(
+            qkv, gate, beta, alpha
+        )
+        core_attn_out, _ = fused_recurrent_kda_fwd(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=False,
+            inplace_final_state=True,
+            ssm_state_indices=safe_batch_indices,
+            **self._kda_kernel_options(self.A_log, self.dt_bias),
+        )
+        return self._apply_gated_norm(core_attn_out, gate).reshape(
+            projected.shape[0], projected.shape[1], -1
+        )
+
+    def _dynamic_inference_prefill(
+        self,
+        projected: Tensor,
+        context: DynamicInferenceContext,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+    ) -> Tensor:
+        """Run prompt tokens as one packed variable-length KDA prefill."""
+        metadata = context.kda_metadata
+        token_count = projected.shape[0]
+        batch_indices = metadata.batch_indices_prefill
+        cu_seqlens = metadata.cu_seqlens
+
+        qkv, gate, beta, alpha = self._split_dynamic_projection(projected.transpose(0, 1))
+
+        initial_conv_states = conv_state[batch_indices]
+        qkv_pre_conv = qkv.squeeze(0).contiguous()
+        qkv_conv_dtype = qkv_pre_conv.to(conv_state.dtype)
+        conv_weight = self.conv1d.weight.squeeze(1).to(conv_state.dtype).contiguous()
+        conv_bias = self.conv1d.bias if self.conv_bias else None
+        if conv_bias is None:
+            conv_bias = qkv_conv_dtype.new_zeros(qkv_conv_dtype.shape[-1])
+        else:
+            conv_bias = conv_bias.to(conv_state.dtype)
+
+        qkv = causal_conv1d_varlen_fn(
+            x=qkv_conv_dtype,
+            weight=conv_weight,
+            bias=conv_bias,
+            cu_seqlens=cu_seqlens,
+            initial_states=initial_conv_states[:, :, 1:],
+            activation=self.activation,
+            precomputed_seq_idx=metadata.conv_seq_idx[:token_count],
+            precomputed_seq_start=metadata.conv_seq_start[:token_count],
+        ).to(projected.dtype)
+        qkv = qkv.unsqueeze(0)
+
+        if causal_conv1d_varlen_states is None:
+            final_conv_states = self._extract_final_conv_states(
+                qkv_conv_dtype, cu_seqlens, conv_state.shape[-1]
+            )
+        else:
+            final_conv_states = causal_conv1d_varlen_states(
+                qkv_conv_dtype, cu_seqlens, state_len=conv_state.shape[-1]
+            )
+        final_conv_states = self._merge_short_conv_states(
+            initial_conv_states, final_conv_states, cu_seqlens
+        )
+        tensor_masked_update(conv_state, batch_indices, final_conv_states)
+
+        query, key, value, gate, g, beta = self._prepare_dynamic_kda(
+            qkv, gate, beta, alpha
+        )
+        initial_recurrent_state = recurrent_state[batch_indices]
+        core_attn_out, final_recurrent_state = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_recurrent_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            **self._kda_kernel_options(self.A_log, self.dt_bias),
+        )
+        tensor_masked_update(recurrent_state, batch_indices, final_recurrent_state)
+
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        return norm_out.reshape(1, token_count, -1).transpose(0, 1).contiguous()
+
+    @jit_fuser
+    def _extract_final_conv_states(self, inputs, cu_seqlens, state_len):
+        """Device-side fallback for packed final-state extraction."""
+        starts = cu_seqlens[:-1].long()
+        ends = cu_seqlens[1:].long()
+        offsets = torch.arange(-state_len, 0, device=inputs.device)
+        positions = ends.unsqueeze(1) + offsets.unsqueeze(0)
+        from_inputs = positions >= starts.unsqueeze(1)
+        input_states = inputs[positions.clamp_min(0)].permute(0, 2, 1)
+        return torch.where(from_inputs.unsqueeze(1), input_states, 0.0)
+
+    @jit_fuser
+    def _merge_short_conv_states(self, initial_states, final_states, cu_seqlens):
+        """Fill a short continuation's missing prefix from its prior state."""
+        lengths = cu_seqlens[1:].long() - cu_seqlens[:-1].long()
+        state_len = initial_states.shape[-1]
+        offsets = torch.arange(state_len, device=initial_states.device)
+        old_indices = (offsets.unsqueeze(0) + lengths.unsqueeze(1)).clamp(
+            max=state_len - 1
+        )
+        old_states = torch.gather(
+            initial_states,
+            2,
+            old_indices.unsqueeze(1).expand(-1, initial_states.shape[1], -1),
+        )
+        from_initial = offsets.unsqueeze(0) < (state_len - lengths).unsqueeze(1)
+        return torch.where(from_initial.unsqueeze(1), old_states, final_states)
+
+    def _dynamic_inference(
+        self, hidden_states: Tensor, context: DynamicInferenceContext
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Execute mixed dynamic batches with decode rows followed by packed prefill rows."""
+        conv_state, recurrent_state = context.kda_states_cache(self.layer_number)
+        padded_dims = context.padded_batch_dimensions
+        decode_req_count = padded_dims.decode_req_count
+        prefill_req_count = padded_dims.prefill_req_count
+
+        projected, _ = self.in_proj(hidden_states)
+        y_decode = None
+        y_prefill = None
+
+        if decode_req_count > 0:
+            y_decode = self._dynamic_inference_decode(
+                projected[:decode_req_count],
+                conv_state,
+                recurrent_state,
+                context.kda_metadata.batch_indices_decode,
+                context.kda_dummy_state_idx,
+            )
+
+        if prefill_req_count > 0:
+            if decode_req_count > 0:
+                projected_prefill = torch.empty_like(projected)
+                tensor_get_slice_after(
+                    projected,
+                    projected_prefill,
+                    context.kda_metadata.device_decode_prefill,
+                    check_bounds=False,
+                )
+            else:
+                projected_prefill = projected
+            y_prefill = self._dynamic_inference_prefill(
+                projected_prefill, context, conv_state, recurrent_state
+            )
+
+        if y_decode is not None and y_prefill is not None:
+            y = torch.empty(
+                (padded_dims.token_count, 1, y_prefill.shape[-1]),
+                dtype=y_prefill.dtype,
+                device=y_prefill.device,
+            )
+            tensor_merge(
+                y_decode,
+                y_prefill,
+                context.kda_metadata.device_decode_prefill,
+                output_tensor=y,
+            )
+        elif y_decode is not None:
+            y = y_decode
+        elif y_prefill is not None:
+            y = y_prefill
+        else:
+            raise RuntimeError("Dynamic KDA inference received an empty batch")
+
+        if is_using_quantization_scales(self.config):
+            y[context.padding_slice] = 0.0
+
+        return self.out_proj(y)
+
+    def kda_state_shapes_per_request(self) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        """Return convolution and recurrent state shapes for one inference request."""
+        return (
+            (self.conv_dim_local_tp, self.conv_kernel_dim),
+            (self.num_v_heads_local_tp, self.key_head_dim, self.value_head_dim),
+        )
 
     def backward_dw(self):
         """Execute deferred weight-gradient computation for all KDA linear projections."""

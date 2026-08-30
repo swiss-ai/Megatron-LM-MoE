@@ -563,18 +563,17 @@ def num_floating_point_operations(args, batch_size):
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
-            # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
                     0 if ((i + 1) % args.linear_attention_freq == 0)
-                    else 1 for i in range(num_layers)
+                    else 1 for i in range(args.num_layers)
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+                assert len(linear_attention_pattern) == args.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
+                    f"expected {args.num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
@@ -589,7 +588,10 @@ def num_floating_point_operations(args, batch_size):
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            # MTP layers reuse the last decoder layer's attention spec.
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if args.experimental_attention_variant == "gated_delta_net":
@@ -620,32 +622,40 @@ def num_floating_point_operations(args, batch_size):
                     )
                 )
             elif args.experimental_attention_variant == "kda":
-                # Kimi Delta Attention: vector channel-wise decay alpha in R^{d_k}, so
-                # alpha occupies qk_dim slots (instead of num_v_heads). Plus sigmoid
-                # output gate. FLOPs accounting follows GDN with the alpha slot resized.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
                 num_qk_heads = args.linear_num_key_heads
                 num_v_heads = args.linear_num_value_heads
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
+                alpha_dim = qk_head_dim * num_v_heads
+                low_rank_dim = v_head_dim
+                full_rank_output_gate = args.linear_attention_full_rank_output_gate
+                output_gate_in_proj_dim = v_dim if full_rank_output_gate else low_rank_dim
+                in_proj_dim = (
+                    2 * qk_dim
+                    + v_dim
+                    + low_rank_dim
+                    + output_gate_in_proj_dim
+                    + num_v_heads
+                )
                 linear_self_attn_term = (
                     forward_backward_expansion_factor
                     * fma_expansion_factor
                     * (
-                        ## in proj (qk*2 + v*2 + scalar beta + vector alpha=qk_dim)
-                        args.hidden_size
-                        * (2 * qk_dim + 2 * v_dim + num_v_heads + qk_dim)
-                        ## conv1d
-                        + args.linear_conv_kernel_dim
-                        * (2 * qk_dim + v_dim)
-                        ## kda chunkwise (KK^T, VK^T, S a + S b k k^T, SQ)
-                        + num_v_heads
-                        * (v_head_dim ** 2)
-                        * 4
-                        ## out proj
-                        + args.hidden_size
-                        * v_dim
+                        # Fused Q/K/V, decay bottleneck, output gate, and beta projection.
+                        args.hidden_size * in_proj_dim
+                        # Low-rank decay projection.
+                        + low_rank_dim * alpha_dim
+                        # The low-rank output gate has a second projection if it uses low rank,
+                        # the full-rank gate is already included directly in in_proj.
+                        + (0 if full_rank_output_gate else low_rank_dim * v_dim)
+                        # Depthwise Q/K/V convolution.
+                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        # KDA recurrent state has shape [d_k, d_v] per value head.
+                        + 4 * num_v_heads * qk_head_dim * v_head_dim
+                        # Output projection.
+                        + args.hidden_size * v_dim
                     )
                 )
             else:
