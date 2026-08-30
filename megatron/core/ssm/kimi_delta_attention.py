@@ -832,11 +832,14 @@ class KimiDeltaAttention(GatedDeltaNet):
         else:
             assert self.activation in ["silu", "swish"]
             qkv, backend = conv1d_input_for_backend(qkv, self._conv1d_backend)
+            conv_kwargs = {}
+            if cu_seqlens is not None and backend == "cuda":
+                conv_kwargs["seq_idx"] = self._seq_idx_for_cu_seqlens(cu_seqlens)
             qkv, _ = causal_conv1d(
                 x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
                 activation=self.activation, initial_state=None,
                 output_final_state=False, backend=backend,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_seqlens, **conv_kwargs,
             )
         nvtx_range_pop(suffix="conv1d")
 

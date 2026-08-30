@@ -7,6 +7,7 @@
 
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -118,6 +119,10 @@ class GatedDeltaNet(MegatronModule):
     GDN layer takes input with size [s, b, h]
     and returns output of the same size.
     """
+
+    # Shared by every layer (subclasses included): one entry per cu_seqlens object.
+    _cu_seqlens_int64_cache: deque = deque(maxlen=4)
+    _seq_idx_cache: deque = deque(maxlen=4)
 
     def __init__(
         self,
@@ -424,6 +429,30 @@ class GatedDeltaNet(MegatronModule):
                     ).uniform_(*self.A_init_range)
                     self.A_log.data.copy_(torch.log(A))
 
+    @classmethod
+    def _cu_seqlens_as_int64(cls, cu_seqlens: Tensor) -> Tensor:
+        """`cu_seqlens` as int64, reusing the same tensor object across layers."""
+        if cu_seqlens.dtype == torch.int64:
+            return cu_seqlens
+        for source, converted in cls._cu_seqlens_int64_cache:
+            if source is cu_seqlens:
+                return converted
+        converted = cu_seqlens.to(torch.int64)
+        cls._cu_seqlens_int64_cache.append((cu_seqlens, converted))
+        return converted
+
+    @classmethod
+    def _seq_idx_for_cu_seqlens(cls, cu_seqlens: Tensor) -> Tensor:
+        """Per-token document id the CUDA conv backend wants, shared across layers."""
+        for source, seq_idx in cls._seq_idx_cache:
+            if source is cu_seqlens:
+                return seq_idx
+        from fla.ops.utils import prepare_sequence_ids
+
+        seq_idx = prepare_sequence_ids(cu_seqlens).to(torch.int32).unsqueeze(0)
+        cls._seq_idx_cache.append((cu_seqlens, seq_idx))
+        return seq_idx
+
     def _resolve_packed_cu_seqlens(
         self,
         packed_seq_params: Optional[PackedSeqParams],
@@ -443,7 +472,7 @@ class GatedDeltaNet(MegatronModule):
             f"{type(self).__name__} packed-sequence support expects THD-format "
             f"packed_seq_params (got qkv_format={packed_seq_params.qkv_format!r})."
         )
-        cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
+        cu_seqlens = self._cu_seqlens_as_int64(packed_seq_params.cu_seqlens_q)
         if not self._packed_cu_seqlens_validated:
             validate_packed_cu_seqlens(
                 packed_seq_params, cu_seqlens, seq_len, batch, type(self).__name__
