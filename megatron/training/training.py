@@ -12,6 +12,10 @@ _STARTUP_TIMESTAMPS = {
     'pretrain_entry': None, # Set at top of pretrain()
 }
 
+# Accumulated throughput
+_ACC_TOKENS_PER_SEC_PER_GPU = 0
+_NUM_THROUGHPUT_SAMPLES = 0
+
 
 def set_startup_timestamps(program_start=None, main_entry=None):
     """Set startup timestamps from the entry script.
@@ -2425,6 +2429,11 @@ def training_log(
         tokens_per_iteration = args.global_batch_size * args.seq_length
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+        global _ACC_TOKENS_PER_SEC_PER_GPU
+        global _NUM_THROUGHPUT_SAMPLES
+        _ACC_TOKENS_PER_SEC_PER_GPU += tokens_per_sec_per_gpu
+        _NUM_THROUGHPUT_SAMPLES += 1
+        avg_tokens_per_sec_per_gpu = _ACC_TOKENS_PER_SEC_PER_GPU / _NUM_THROUGHPUT_SAMPLES
         iterations_remaining = max(args.train_iters - iteration, 0)
         eta_seconds = iterations_remaining * elapsed_time_per_iteration
         eta = str(timedelta(seconds=int(eta_seconds)))
@@ -2458,6 +2467,7 @@ def training_log(
         log_string += f' eta: {eta} |'
         if args.log_throughput:
             log_string += f' tokens per sec per GPU: {tokens_per_sec_per_gpu:.2f} |'
+            log_string += f' avg tokens per sec per GPU: {avg_tokens_per_sec_per_gpu:.2f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             log_string += f' MFU: {mfu:.2f}% |'
             if args.log_timers_to_tensorboard:
@@ -2468,7 +2478,8 @@ def training_log(
                     wandb_writer.log({'throughput': throughput}, iteration)
                     wandb_writer.log({
                         'iteration-time': elapsed_time_per_iteration,
-                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu
+                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
+                        'avg-tokens-per-sec-per-GPU': avg_tokens_per_sec_per_gpu
                     }, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
