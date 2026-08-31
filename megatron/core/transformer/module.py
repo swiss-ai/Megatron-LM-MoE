@@ -435,13 +435,13 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            dtype = torch.float16
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            dtype = torch.bfloat16
 
             def float16_convertor(val):
                 return val.bfloat16()
@@ -449,6 +449,12 @@ class Float16Module(MegatronModule):
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
 
+        def convert_module(val):
+            if getattr(val, 'is_kda_decay_parameter', False) or not val.is_floating_point():
+                return val
+            return val.to(dtype=dtype)
+
+        self.add_module('module', module._apply(convert_module))
         self.float16_convertor = float16_convertor
 
     def set_input_tensor(self, input_tensor):  # pylint: disable=missing-function-docstring
