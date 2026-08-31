@@ -766,8 +766,8 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "qkv", "mlp", "moe",
-    "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "qkv", "qkv_fine",
+    "linear_attn", "mlp", "moe", "shared_experts".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -781,11 +781,18 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant="kda" it is instead the linear-attention input projection,
     i.e. everything from in_proj through the q/k/v/gate/beta/alpha handed to the chunkwise
     kernel.
+    "qkv_fine": the same region as "qkv" but with the input projection left OUTSIDE the
+    checkpoint, so only the cheap tail (split, low-rank projections, conv1d, prepare) is
+    recomputed. This is KDA only.
+    "linear_attn": recompute the linear-attention (KDA/GDN) core -- the chunkwise kernel
+    and its gated output norm. Composes with "qkv"/"qkv_fine", which cover the producer of
+    the tensors it consumes.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", "mla_up_proj", and "qkv" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "moe_act", "layernorm", "mla_up_proj", "qkv", and "qkv_fine" use output-discarding
+    checkpointing, "core_attn", "linear_attn", "mlp", "moe", and "shared_experts" use
+    normal checkpointing.
     """
 
     ####################
@@ -2047,6 +2054,8 @@ class TransformerConfig(ModelParallelConfig):
                     "linear_attn",
                     "mla_up_proj",
                     "qkv",
+                    # "qkv" without the in_proj GEMM; KDA only, excludes "qkv".
+                    "qkv_fine",
                     "mlp",
                     "moe",
                     "shared_experts",
@@ -2067,6 +2076,21 @@ class TransformerConfig(ModelParallelConfig):
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
                 )
+
+            if "qkv_fine" in self.recompute_modules:
+                if "qkv" in self.recompute_modules:
+                    raise ValueError(
+                        "qkv and qkv_fine in recompute_modules are mutually exclusive: "
+                        "qkv_fine is the same region as qkv with the in_proj GEMM left "
+                        "outside the checkpoint, so enabling both would nest two "
+                        "checkpoints over the same operations. Pick one -- qkv frees "
+                        "more, qkv_fine costs much less."
+                    )
+                if self.experimental_attention_variant != "kda":
+                    raise ValueError(
+                        "qkv_fine in recompute_modules is only implemented for "
+                        "experimental_attention_variant='kda'; use qkv instead."
+                    )
 
             if "qkv" in self.recompute_modules:
                 if self.multi_latent_attention:

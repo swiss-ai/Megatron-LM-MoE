@@ -561,6 +561,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             self.config.recompute_granularity == 'selective'
             and "qkv" in self.config.recompute_modules
         )
+
+        self.recompute_qkv_fine = (
+            self.config.recompute_granularity == 'selective'
+            and self.config.recompute_modules is not None
+            and "qkv_fine" in self.config.recompute_modules
+        )
         self.qkv_checkpoint = None
 
 
@@ -693,6 +699,34 @@ class KimiDeltaAttention(GatedDeltaNet):
         projected, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
+        # `qkv_fine`: checkpoint past in_proj
+        if self.recompute_qkv_fine and self.training and torch.is_grad_enabled():
+            self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                fp8=self.config.fp8 or self.config.fp4
+            )
+            return self.qkv_checkpoint.checkpoint(
+                partial(
+                    self._post_proj_to_attn_inputs,
+                    batch=batch,
+                    seq_len=seq_len,
+                    packed_seq_params=packed_seq_params,
+                    cu_seqlens=cu_seqlens,
+                ),
+                projected,
+            )
+        return self._post_proj_to_attn_inputs(
+            projected, batch, seq_len, packed_seq_params, cu_seqlens
+        )
+
+    def _post_proj_to_attn_inputs(
+        self,
+        projected: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        packed_seq_params=None,
+        cu_seqlens=None,
+    ):
+        """In_proj output -> chunk_kda inputs; the region `qkv_fine` recomputes."""
         num_v_heads_tp = self.num_value_heads // self.tp_size
         low_rank_local_tp = self.gate_low_rank_dim // self.tp_size
         qkv_channels_split_sections = [
