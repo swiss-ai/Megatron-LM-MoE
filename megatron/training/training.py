@@ -13,8 +13,8 @@ _STARTUP_TIMESTAMPS = {
 }
 
 # Accumulated throughput
-_ACC_TOKENS_PER_SEC_PER_GPU = 0
-_NUM_THROUGHPUT_SAMPLES = 0
+_ACC_ELAPSED_TIME = 0.0
+_ACC_TOKENS = 0.0
 
 
 def set_startup_timestamps(program_start=None, main_entry=None):
@@ -2429,11 +2429,15 @@ def training_log(
         tokens_per_iteration = args.global_batch_size * args.seq_length
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
-        global _ACC_TOKENS_PER_SEC_PER_GPU
-        global _NUM_THROUGHPUT_SAMPLES
-        _ACC_TOKENS_PER_SEC_PER_GPU += tokens_per_sec_per_gpu
-        _NUM_THROUGHPUT_SAMPLES += 1
-        avg_tokens_per_sec_per_gpu = _ACC_TOKENS_PER_SEC_PER_GPU / _NUM_THROUGHPUT_SAMPLES
+        global _ACC_ELAPSED_TIME
+        global _ACC_TOKENS
+        if should_reset:
+            _ACC_ELAPSED_TIME += elapsed_time
+            _ACC_TOKENS += tokens_per_iteration * total_iterations
+        if _ACC_ELAPSED_TIME > 0:
+            avg_tokens_per_sec_per_gpu = _ACC_TOKENS / _ACC_ELAPSED_TIME / args.world_size
+        else:
+            avg_tokens_per_sec_per_gpu = tokens_per_sec_per_gpu
         iterations_remaining = max(args.train_iters - iteration, 0)
         eta_seconds = iterations_remaining * elapsed_time_per_iteration
         eta = str(timedelta(seconds=int(eta_seconds)))
