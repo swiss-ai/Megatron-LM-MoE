@@ -2433,7 +2433,7 @@ def training_log(
         global _ACC_TOKENS
         if should_reset:
             _ACC_ELAPSED_TIME += elapsed_time
-            _ACC_TOKENS += tokens_per_iteration
+            _ACC_TOKENS += tokens_per_iteration * total_iterations
         if _ACC_ELAPSED_TIME > 0:
             avg_tokens_per_sec_per_gpu = _ACC_TOKENS / _ACC_ELAPSED_TIME / args.world_size
         else:
