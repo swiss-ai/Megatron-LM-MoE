@@ -100,3 +100,21 @@ class TestFloat16Module:
         x = torch.ones((2, 2)).cuda()
         # inputs are converted to bf16 then outputs are converted to fp32
         assert bf16_module(x).dtype == torch.float32
+
+    @pytest.mark.parametrize('precision', [torch.float16, torch.bfloat16])
+    def test_kda_decay_parameter_stays_fp32(self, precision):
+        if precision == torch.bfloat16 and (not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8):
+            pytest.skip('bfloat16 is not supported on this device')
+        decay = torch.nn.Parameter(
+            torch.tensor([0.123456789, 12345.678], dtype=torch.float32, device='cuda')
+        )
+        decay.is_kda_decay_parameter = True
+        self.megatron_module.decay = decay
+        expected = decay.detach().clone()
+        self.transformer_config.fp16 = precision == torch.float16
+        self.transformer_config.bf16 = precision == torch.bfloat16
+
+        wrapped = Float16Module(self.transformer_config, self.megatron_module)
+
+        assert wrapped.module.decay.dtype == torch.float32
+        torch.testing.assert_close(wrapped.module.decay, expected, rtol=0, atol=0)

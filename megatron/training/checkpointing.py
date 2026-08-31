@@ -436,6 +436,13 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     """
     metadata = {}
 
+    if (
+        args.optimizer == "md_decoupling"
+        and getattr(args, "hypersphere_preserve_init", False)
+        and getattr(args, "md_normalize_update_to_weight_norm", False)
+    ):
+        metadata["md_fixed_weight_norms"] = True
+
     if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 

@@ -22,6 +22,34 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("linear_attention_beta_bias_init", -2.0),
+        ("linear_attention_beta_scale", 0.9),
+        ("linear_attention_use_decay", False),
+        ("linear_attention_v_norm", "l2norm"),
+    ],
+)
+def test_kda_rejects_unsupported_linear_attention_controls(option, value):
+    kwargs = {
+        "hidden_size": 128,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 64,
+        "linear_value_head_dim": 32,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 2,
+        "num_layers": 1,
+        "num_attention_heads": 2,
+        "experimental_attention_variant": "kda",
+        "linear_attention_freq": [1],
+        option: value,
+    }
+
+    with pytest.raises(AssertionError, match=option):
+        TransformerConfig(**kwargs)
+
+
 @pytest.mark.skipif(not HAVE_KDA, reason="The installed FLA does not provide KDA kernels.")
 @pytest.mark.internal
 class TestKimiDeltaAttentionReferenceParameterization:
@@ -100,6 +128,8 @@ class TestKimiDeltaAttentionReferenceParameterization:
         assert kda.dt_bias.shape == (kda.num_value_heads * kda.key_head_dim,)
         assert kda.A_log.dtype == torch.float32
         assert kda.dt_bias.dtype == torch.float32
+        assert kda.A_log.is_kda_decay_parameter
+        assert kda.dt_bias.is_kda_decay_parameter
         dt = F.softplus(kda.dt_bias)
         assert torch.all(dt >= 0.001)
         assert torch.all(dt <= 0.1)

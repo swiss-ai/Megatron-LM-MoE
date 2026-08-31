@@ -229,15 +229,11 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
-    # Optional sandwich norm: normalize each sublayer's output before the residual add
-    # (x = x + Norm(Sublayer(Norm(x)))). Applied uniformly to every layer in the hybrid
-    # block -- both the experimental-attention (e.g. KDA/GDN) sublayers and the interleaved
-    # standard-attention sublayers -- matching the standard gpt_layer_specs path. When
-    # sandwich_norm is off, these slots stay IdentityOp (the TransformerLayerSubmodules
-    # default) and the post-norm code paths in TransformerLayer are inert.
+    # Sandwich norm and KEEL share the post-attention/post-MLP norm slots; TransformerLayer
+    # chooses whether to apply them before or after the residual add.
     post_layer_norm = (
         backend.layer_norm(rms_norm=rms_norm, for_qk=False)
-        if config.sandwich_norm
+        if config.sandwich_norm or config.keel
         else IdentityOp
     )
     layer_specs = []
