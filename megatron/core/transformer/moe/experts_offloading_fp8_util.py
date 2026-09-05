@@ -347,14 +347,6 @@ class FP8ExpertsParameterManager:
     ) -> FP8ExpertsParameterManager:
         assert cls._instance is not None, "FP8ExpertsParameterManager instance is not created yet."
         return cls._instance
-    
-    @classmethod
-    def refresh(
-        cls,
-        bf16_weight: torch.Tensor,
-    ):
-        if cls._instance is not None:
-            cls._instance.refresh_fp8_weights(bf16_weight)
 
     @classmethod
     def reset_instance(
@@ -605,20 +597,6 @@ class FP8ExpertsParameterManager:
         packed_weights_t.copy_(dev_fp8_t, non_blocking=False)
 
         return packed
-
-    def refresh_fp8_weights(
-        self,
-        bf16_weight: torch.Tensor,
-    ):
-        wid = bf16_weight.data_ptr()
-
-        if wid in self._wid_to_bf16_weight_map:
-            # re-quantize the weight to fp8 and update the fp8 weight maps
-            fp8_weight, fp8_weight_scale, fp8_weight_t, fp8_weight_t_scale = self._quantize_weight(wid)
-            self._wid_to_fp8_weight_map[wid] = (fp8_weight, fp8_weight_scale, fp8_weight_t, fp8_weight_t_scale)
-        
-        # do nothing if the weight is not in the map yet, 
-        # as it will be quantized and added to the map when it is first accessed
 
     def reset(self):
         self._wid_to_bf16_weight_map.clear()
