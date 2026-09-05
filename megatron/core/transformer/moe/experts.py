@@ -1645,11 +1645,13 @@ class OffloadingExpertsMLP(MegatronModule):
                 self.weight2_list = list(torch.unbind(self.weight2, dim=0))
 
             fp8_parameter_manager = FP8ExpertsParameterManager.get_instance()
+            # The fused [E, m, n] parameters, not weight{1,2}_list: coarse-grained quantizes the
+            # whole layer in one H2D / one D2H rather than per expert.
             packed_w1, _, packed_w1_t, _ = fp8_parameter_manager.get_coarse_fp8_weights(
-                self.weight1_list
+                self.weight1
             )
             packed_w2, _, packed_w2_t, _ = fp8_parameter_manager.get_coarse_fp8_weights(
-                self.weight2_list
+                self.weight2
             )
             parameter_tensors = {
                 "w1": packed_w1,

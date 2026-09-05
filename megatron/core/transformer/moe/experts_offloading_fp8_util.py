@@ -81,6 +81,11 @@ class OffloadingFP8Config:
     pattern.
     """
 
+    # expert parallel
+    num_total_experts: int
+    expert_parallel_size: int
+    num_local_experts: int = field(init=False)
+
     # sizes
     hidden_size: int
     moe_latent_size: int
@@ -123,6 +128,15 @@ class OffloadingFP8Config:
     def __post_init__(self):
         object.__setattr__(
             self,
+            "num_local_experts",
+            self.num_total_experts // self.expert_parallel_size,
+        )
+        assert self.num_local_experts > 0, (
+            f"num_moe_experts={self.num_total_experts} is not divisible by "
+            f"expert_model_parallel_size={self.expert_parallel_size}"
+        )
+        object.__setattr__(
+            self,
             "input_hidden_size",
             self.moe_latent_size if self.moe_latent_size is not None else self.hidden_size,
         )
@@ -141,6 +155,8 @@ class OffloadingFP8Config:
     def from_transformer_config(cls, config: TransformerConfig) -> OffloadingFP8Config:
         """Construct from a full TransformerConfig."""
         return cls(
+            num_total_experts=config.num_moe_experts,
+            expert_parallel_size=config.expert_model_parallel_size,
             hidden_size=config.hidden_size,
             input_hidden_size=config.hidden_size,  # default to hidden_size if moe_latent_size is not set
             moe_latent_size=config.moe_latent_size,
@@ -331,14 +347,6 @@ class FP8ExpertsParameterManager:
     ) -> FP8ExpertsParameterManager:
         assert cls._instance is not None, "FP8ExpertsParameterManager instance is not created yet."
         return cls._instance
-    
-    @classmethod
-    def refresh(
-        cls,
-        bf16_weight: torch.Tensor,
-    ):
-        if cls._instance is not None:
-            cls._instance.refresh_fp8_weights(bf16_weight)
 
     @classmethod
     def reset_instance(
@@ -366,42 +374,30 @@ class FP8ExpertsParameterManager:
         
         # uid is the data pointer of the first local expert weight
         self._uid_to_fp8_weights_map = {}
-        self._uid_to_coarse_fp8_weights_map = {}
 
         # flag to indicate whether it is the first microbatch
         # which is used to determine whether to refresh the fp8 weights
         self._uid_to_is_first_microbatch: dict[int, bool] = {}
 
-        # pre-allocate quantization buffer for expert weights
-        self.expert_quantization_buffer: dict[int, torch.Tensor] = {}
-        self.expert_quantization_buffer[
-            config.fc1_out_size * config.input_hidden_size
-        ] = (
-            torch.empty(
-                config.fc1_out_size * config.input_hidden_size,
-                device=torch.cuda.current_device(),
-                dtype=torch.bfloat16
-            ),
-            torch.empty(
-                config.fc1_out_size * config.input_hidden_size,
-                device=torch.cuda.current_device(),
-                dtype=torch.float8_e4m3fn
-            )
-        )
-        self.expert_quantization_buffer[
-            config.moe_ffn_hidden_size * config.input_hidden_size
-        ] = (
-            torch.empty(
-                config.moe_ffn_hidden_size * config.input_hidden_size,
-                device=torch.cuda.current_device(),
-                dtype=torch.bfloat16
-            ),
-            torch.empty(
-                config.moe_ffn_hidden_size * config.input_hidden_size,
-                device=torch.cuda.current_device(),
-                dtype=torch.float8_e4m3fn
-            )
-        )
+        # pre-allocated quantization buffers. 
+        # fine-grained quantizes one expert at a time and keys the scratch by that expert's numel
+        # coarse-grained quantizes a whole layer's fused [E, m, n] weight in one shot
+        # and keys by (E, m, n).
+        self._fine_quantization_buffer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._coarse_quantization_buffer: dict[tuple, tuple[torch.Tensor, ...]] = {}
+        if not config.coarse_grained_reload:
+            for numel in (
+                config.fc1_out_size * config.input_hidden_size, # fc1
+                config.moe_ffn_hidden_size * config.input_hidden_size, # fc2
+            ):
+                self._fine_quantization_buffer[numel] = (
+                    torch.empty(
+                        numel, device=torch.cuda.current_device(), dtype=torch.bfloat16
+                    ),
+                    torch.empty(
+                        numel, device=torch.cuda.current_device(), dtype=torch.float8_e4m3fn
+                    ),
+                )
         self.config = config
 
         if self.config.moe_use_extra_fp8_param_storage:
@@ -409,12 +405,35 @@ class FP8ExpertsParameterManager:
             self._wid_to_extra_fp8_weight_storage: dict[int, torch.Tensor] = {}
             self._wid_to_extra_fp8_weight_storage_slices: dict[int, tuple[torch.Tensor]] = {}
 
+    @staticmethod
+    def _uid_of(bf16_weights) -> int:
+        if isinstance(bf16_weights, (list, tuple)):
+            return bf16_weights[0].data_ptr()
+        return bf16_weights.data_ptr()
+
     def get_fp8_weights(
         self,
-        bf16_weights: list[torch.nn.Parameter] | list[torch.Tensor],
+        bf16_weights: list[torch.nn.Parameter] | list[torch.Tensor] | torch.Tensor,
         transposed: bool = False,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]: # (fp8_weights, fp8_weight_scales)
-        uid = bf16_weights[0].data_ptr()
+        uid = self._uid_of(bf16_weights)
+
+        if self.config.coarse_grained_reload:
+            assert uid in self._uid_to_fp8_weights_map, (
+                "coarse-grained FP8 weights were requested before get_coarse_fp8_weights() "
+                "quantized them -- init_and_preload() must run first"
+            )
+            if self._uid_to_is_first_microbatch.get(uid, False):
+                self._quantize_coarse_weight(uid)
+                self._uid_to_is_first_microbatch[uid] = False
+            fp8_weights, fp8_weights_scales, fp8_weights_t, fp8_weights_t_scales = (
+                self._uid_to_fp8_weights_map[uid]
+            )
+            return (
+                (fp8_weights_t, fp8_weights_t_scales)
+                if transposed
+                else (fp8_weights, fp8_weights_scales)
+            )
 
         # when the weights are first accessed
         if uid not in self._uid_to_fp8_weights_map:
@@ -453,16 +472,12 @@ class FP8ExpertsParameterManager:
                 fp8_weight, _, fp8_weight_t, _ = self._wid_to_fp8_weight_map[wid]
                 self._wid_to_fp8_weight_map[wid] = (fp8_weight, fp8_weights_scales_list[eid], fp8_weight_t, fp8_weights_t_scales_list[eid])
             
-            if self.config.coarse_grained_reload:
-                fp8_weights_scales_stack_per_chunk = [fp8_weights_scales_stack]
-                fp8_weights_t_scales_stack_per_chunk = [fp8_weights_t_scales_stack]
-            else:
-                fp8_weights_scales_stack_per_chunk = list(
-                    torch.split(fp8_weights_scales_stack, self.config.moe_offloading_chunk_size)
-                )
-                fp8_weights_t_scales_stack_per_chunk = list(
-                    torch.split(fp8_weights_t_scales_stack, self.config.moe_offloading_chunk_size)
-                )
+            fp8_weights_scales_stack_per_chunk = list(
+                torch.split(fp8_weights_scales_stack, self.config.moe_offloading_chunk_size)
+            )
+            fp8_weights_t_scales_stack_per_chunk = list(
+                torch.split(fp8_weights_t_scales_stack, self.config.moe_offloading_chunk_size)
+            )
             self._uid_to_fp8_weights_map[uid] = \
                 (fp8_weights, fp8_weights_scales_stack_per_chunk, fp8_weights_t, fp8_weights_t_scales_stack_per_chunk)
             self._uid_to_is_first_microbatch[uid] = False
@@ -483,67 +498,112 @@ class FP8ExpertsParameterManager:
 
     def get_coarse_fp8_weights(
         self,
-        bf16_weights: list[torch.nn.Parameter] | list[torch.Tensor],
+        bf16_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, list[torch.Tensor]]:
-        """Return stable, contiguous pinned tensors for whole-layer FP8 reload."""
+        """Return stable, contiguous pinned tensors for whole-layer reload registration.
+        """
         assert self.config.coarse_grained_reload
-        uid = bf16_weights[0].data_ptr()
-        needs_repack = (
-            uid not in self._uid_to_fp8_weights_map
-            or self._uid_to_is_first_microbatch.get(uid, False)
+        assert isinstance(bf16_weights, torch.Tensor) and bf16_weights.dim() == 3, (
+            "coarse-grained FP8 expects the fused [E, m, n] expert parameter, got "
+            f"{type(bf16_weights).__name__}"
+        )
+        uid = self._uid_of(bf16_weights)
+
+        if uid not in self._uid_to_fp8_weights_map:
+            self._wid_to_bf16_weight_map[uid] = bf16_weights
+            self._quantize_coarse_weight(uid)
+        elif self._uid_to_is_first_microbatch.get(uid, False):
+            self._quantize_coarse_weight(uid)
+        self._uid_to_is_first_microbatch[uid] = False
+
+        return self._uid_to_fp8_weights_map[uid]
+
+    def _coarse_scratch(
+        self, num_experts: int, m: int, n: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Device scratch shared by every layer.
+        """
+        key = (num_experts, m, n)
+        scratch = self._coarse_quantization_buffer.get(key)
+        if scratch is None:
+            device = torch.cuda.current_device()
+            scratch = (
+                torch.empty((num_experts, m, n), device=device, dtype=torch.bfloat16),
+                torch.empty((num_experts, m, n), device=device, dtype=torch.float8_e4m3fn),
+                torch.empty((num_experts, n, m), device=device, dtype=torch.float8_e4m3fn),
+            )
+            self._coarse_quantization_buffer[key] = scratch
+        return scratch
+
+    def _quantize_coarse_weight(self, uid: int):
+        """Quantize a whole layer's fused expert weight with one H2D and one D2H per direction.
+
+        The fine-grained path pays a blocking H2D and two blocking D2H per *expert*; here the
+        whole layer is one H2D, two kernel launches and two D2H.  It also never writes fp8 back
+        into the bf16 parameter storage the way _quantize_weight does: the coarse consumer
+        reloads from the packed pinned tensors, so param.data stays pure bf16 and the DDP param
+        all-gather keeps clean bf16 semantics.
+        """
+        bf16_param = self._wid_to_bf16_weight_map[uid]
+        num_experts, m, n = bf16_param.shape
+        gran_k = 128
+        assert m % gran_k == 0 and n % gran_k == 0, (
+            f"coarse-grained FP8 needs expert dims divisible by {gran_k}, got ({m}, {n})"
         )
 
-        fp8_weights, fp8_weight_scales = self.get_fp8_weights(bf16_weights)
-        fp8_weights_t, fp8_weight_t_scales = self.get_fp8_weights(
-            bf16_weights, transposed=True
-        )
+        dev_bf16, dev_fp8, dev_fp8_t = self._coarse_scratch(num_experts, m, n)
 
-        packed = self._uid_to_coarse_fp8_weights_map.get(uid)
+        # Reuse the scale tensors across iterations
+        packed = self._uid_to_fp8_weights_map.get(uid)
         if packed is None:
+            device = torch.cuda.current_device()
+            sf = torch.empty(
+                (num_experts, m // gran_k, n // gran_k), device=device, dtype=torch.float32
+            )
+            sf_t = torch.empty(
+                (num_experts, n // gran_k, m // gran_k), device=device, dtype=torch.float32
+            )
             packed_weights = torch.empty(
-                (len(fp8_weights), *fp8_weights[0].shape),
-                dtype=fp8_weights[0].dtype,
-                device="cpu",
-                pin_memory=True,
+                (num_experts, m, n), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True
             )
             packed_weights_t = torch.empty(
-                (len(fp8_weights_t), *fp8_weights_t[0].shape),
-                dtype=fp8_weights_t[0].dtype,
-                device="cpu",
-                pin_memory=True,
+                (num_experts, n, m), dtype=torch.float8_e4m3fn, device="cpu", pin_memory=True
             )
-            packed = (packed_weights, packed_weights_t)
-            self._uid_to_coarse_fp8_weights_map[uid] = packed
-            needs_repack = True
+            # Scales are returned as a one-element per-chunk list, matching the fine-grained
+            # contract that consumers index as scales[0].
+            packed = (packed_weights, [sf], packed_weights_t, [sf_t])
+            self._uid_to_fp8_weights_map[uid] = packed
+        packed_weights, (sf,), packed_weights_t, (sf_t,) = packed
 
-        if needs_repack:
-            packed_weights, packed_weights_t = packed
-            for dst, src in zip(packed_weights, fp8_weights):
-                dst.copy_(src)
-            for dst, src in zip(packed_weights_t, fp8_weights_t):
-                dst.copy_(src)
+        # H2D
+        dev_bf16.copy_(bf16_param.data, non_blocking=True)
 
-        return packed[0], fp8_weight_scales, packed[1], fp8_weight_t_scales
-    
-    def refresh_fp8_weights(
-        self,
-        bf16_weight: torch.Tensor,
-    ):
-        wid = bf16_weight.data_ptr()
+        # quantization
+        per_block_cast_to_fp8_gpu(
+            dev_bf16.view(num_experts * m, n),
+            gran_k=gran_k,
+            x_fp8=dev_fp8.view(num_experts * m, n),
+            sf=sf.view(num_experts * (m // gran_k), n // gran_k),
+        )
+        per_block_cast_to_fp8_gpu(
+            dev_bf16.transpose(1, 2).reshape(num_experts * n, m),
+            gran_k=gran_k,
+            x_fp8=dev_fp8_t.view(num_experts * n, m),
+            sf=sf_t.view(num_experts * (n // gran_k), m // gran_k),
+        )
 
-        if wid in self._wid_to_bf16_weight_map:
-            # re-quantize the weight to fp8 and update the fp8 weight maps
-            fp8_weight, fp8_weight_scale, fp8_weight_t, fp8_weight_t_scale = self._quantize_weight(wid)
-            self._wid_to_fp8_weight_map[wid] = (fp8_weight, fp8_weight_scale, fp8_weight_t, fp8_weight_t_scale)
-        
-        # do nothing if the weight is not in the map yet, 
-        # as it will be quantized and added to the map when it is first accessed
+        # D2H
+        packed_weights.copy_(dev_fp8, non_blocking=True)
+        packed_weights_t.copy_(dev_fp8_t, non_blocking=False)
+
+        return packed
 
     def reset(self):
         self._wid_to_bf16_weight_map.clear()
+        self._wid_to_sliced_bf16_weight_map.clear()
         self._wid_to_fp8_weight_map.clear()
         self._uid_to_fp8_weights_map.clear()
-        self._uid_to_coarse_fp8_weights_map.clear()
+        self._uid_to_is_first_microbatch.clear()
 
     def set_is_first_microbatch(self):
         for uid in self._uid_to_is_first_microbatch:
@@ -553,6 +613,9 @@ class FP8ExpertsParameterManager:
         self, 
         wid: int,
     ):
+        """Quantize one expert weight. Fine-grained only -- coarse-grained goes through
+        _quantize_coarse_weight, which batches the whole layer."""
+        assert not self.config.coarse_grained_reload
         bf16_param = self._wid_to_bf16_weight_map[wid]
         bf16_param_slices = self._wid_to_sliced_bf16_weight_map[wid]
 
@@ -570,7 +633,7 @@ class FP8ExpertsParameterManager:
         param_numel = bf16_param.numel()
 
         # H2D
-        device_buffer = self.expert_quantization_buffer[param_numel][0].view(bf16_param.shape).to(torch.cuda.current_device())
+        device_buffer = self._fine_quantization_buffer[param_numel][0].view(bf16_param.shape).to(torch.cuda.current_device())
         device_buffer.copy_(
             bf16_param.data,
             non_blocking=False,
