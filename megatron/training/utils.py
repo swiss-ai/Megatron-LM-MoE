@@ -603,6 +603,12 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
+def _opt(data, name):
+    """data[name] on the GPU, or None when the sample does not carry it."""
+    v = data.get(name)
+    return None if v is None else v.cuda(non_blocking=True)
+
+
 def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
@@ -621,25 +627,13 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         assert data_iterator is not None
         data = next(data_iterator)
         batch = {
-            'tokens': data["tokens"].cuda(non_blocking=True),
-            'labels': data["labels"].cuda(non_blocking=True),
-            'loss_mask': data["loss_mask"].cuda(non_blocking=True),
-            'attention_mask': (
-                None
-                if "attention_mask" not in data
-                else data["attention_mask"].cuda(non_blocking=True)
-            ),
-            'position_ids': data["position_ids"].cuda(non_blocking=True),
-            'cu_seqlens': (
-                None
-                if "cu_seqlens" not in data
-                else data["cu_seqlens"].cuda(non_blocking=True)
-            ),
-            'max_seqlen': (
-                None
-                if "max_seqlen" not in data
-                else data["max_seqlen"].cuda(non_blocking=True)
-            ),
+            'tokens': _opt(data, "tokens"),
+            'labels': _opt(data, "labels"),
+            'loss_mask': _opt(data, "loss_mask"),
+            'attention_mask': _opt(data, "attention_mask"),
+            'position_ids': _opt(data, "position_ids"),
+            'cu_seqlens': _opt(data, "cu_seqlens"),
+            'max_seqlen': _opt(data, "max_seqlen"),
             'local_cp_size': (
                 None
                 if "local_cp_size" not in data

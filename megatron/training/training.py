@@ -199,6 +199,7 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
+from megatron.core.datasets.gpt_dataset import set_packed_metadata_only
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -1225,16 +1226,20 @@ def pretrain(
                 functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
             if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                 vp_stage_train_valid_test_dataset_provider.is_distributed = True
+            set_packed_metadata_only(_packed_metadata_only_for(vp_stage))
             iterators = build_train_valid_test_data_iterators(
                 vp_stage_train_valid_test_dataset_provider
             )
+            set_packed_metadata_only(False)
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
     else:
+        set_packed_metadata_only(_packed_metadata_only_for(None))
         train_data_iterator, valid_data_iterator, test_data_iterator = (
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
         )
+        set_packed_metadata_only(False)
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -3969,6 +3974,27 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
     return train_dataloader, valid_dataloaders, test_dataloader
+
+
+def _packed_metadata_only_for(vp_stage):
+    """True when this model chunk needs only cu_seqlens from the dataloader.
+
+    Set XDOC_PP_META_ONLY=0 to fall back to full dataloading.
+    """
+    if os.environ.get('XDOC_PP_META_ONLY', '1') == '0':
+        return False
+    args = get_args()
+    if args.sft or not getattr(args, 'dataloader_inter_document_masking', False):
+        return False
+    if args.pipeline_model_parallel_size == 1:
+        return False
+    from megatron.training.utils import is_first_or_last_pipeline_stage
+    if is_first_or_last_pipeline_stage(vp_stage):
+        return False
+    # MTP layers need the real tokens/labels regardless of stage.
+    if getattr(args, 'mtp_num_layers', None):
+        return False
+    return True
 
 
 def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):

@@ -359,6 +359,15 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             fix the tokenizer."
 
 
+_PACKED_METADATA_ONLY = False
+
+
+def set_packed_metadata_only(value: bool) -> None:
+    """Mark datasets built from here on as metadata-only."""
+    global _PACKED_METADATA_ONLY
+    _PACKED_METADATA_ONLY = value
+
+
 class GPTDataset(MegatronDataset):
     """The base GPT dataset
 
@@ -391,6 +400,13 @@ class GPTDataset(MegatronDataset):
         )
         # Goldfish drops need no cache opt-out: loss_mask is cloned out of the cache on
         # read (and cloned into it on store), so per-sample mutation cannot leak back.
+        # Only bfd exposes per-chunk lengths without reading the token store.
+        self._packed_metadata_only = bool(
+            _PACKED_METADATA_ONLY
+            and getattr(config, "inter_document_masking", False)
+            and getattr(config, "pretraining_packing_strategy", None) == "bfd"
+        )
+
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -536,6 +552,17 @@ class GPTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
+        if self._packed_metadata_only:
+            # Middle pipeline stage: get_batch keeps only cu_seqlens/max_seqlen,
+            # so skip the token reads, the mask/position-id build and goldfish.
+            cu_seqlens, max_seqlen = self._packed_cu_seqlens(
+                self._bfd_document_lengths(0 if idx is None else idx)
+            )
+            return {
+                "cu_seqlens": self._pad_cu_seqlens(cu_seqlens),
+                "max_seqlen": max_seqlen,
+            }
+
         if idx is None:
             # Batch padding sequence so the index does not matter
             text, _, document_lengths = self._query_document_sample_shuffle_indices(0)
@@ -617,26 +644,8 @@ class GPTDataset(MegatronDataset):
             # extra token is appended to the last document part (used to produce the
             # shifted labels), so subtract it before computing cu_seqlens, which should
             # index into the sequence_length-sized tokens tensor.
-            if self.config.add_extra_token_to_sequence:
-                document_lengths[-1] -= 1
-                if document_lengths[-1] == 0:
-                    document_lengths.pop()
-            # If the sample was padded (e.g. the last validation sample), fold the
-            # padding into the last document so cu_seqlens[-1] equals sequence_length.
-            shortfall = self.config.sequence_length - sum(document_lengths)
-            if shortfall > 0:
-                if document_lengths:
-                    document_lengths[-1] += shortfall
-                else:
-                    document_lengths.append(shortfall)
-            assert shortfall >= 0, (
-                f"packed sample is longer than sequence_length: "
-                f"{sum(document_lengths)} > {self.config.sequence_length}"
-            )
-            cu_seqlens = torch.tensor(numpy.cumsum([0] + document_lengths), dtype=torch.int32)
-
+            cu_seqlens, max_seqlen = self._packed_cu_seqlens(document_lengths)
             seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seqlens.max()
 
             # Reset position IDs per document.
             position_ids = torch.arange(
@@ -646,10 +655,7 @@ class GPTDataset(MegatronDataset):
             # Pad cu_seqlens to a fixed length so that default_collate can stack
             # samples with different numbers of documents. Trailing entries are
             # filled with sequence_length; the merge helper strips them later.
-            padded_cu_seqlens = torch.full(
-                (self.config.sequence_length + 1,), self.config.sequence_length, dtype=torch.int32
-            )
-            padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
+            padded_cu_seqlens = self._pad_cu_seqlens(cu_seqlens)
 
             return {
                 "tokens": tokens,
@@ -922,6 +928,60 @@ class GPTDataset(MegatronDataset):
         log_single_rank(logger, logging.INFO, f" > #tokens(incl. padding) in samples: {total_tokens_in_samples:>12,}")
         log_single_rank(logger, logging.INFO, f" > Average #chunks/sample:            {avg_docs_per_sample:>12.2f}")
         log_single_rank(logger, logging.INFO, f" > Packing efficiency:                {packing_efficiency:>11.2f}%")
+
+    def _packed_cu_seqlens(self, document_lengths):
+        """cu_seqlens and max_seqlen for one packed sample. Mutates the list.
+
+        Shared by the normal and metadata-only paths so they cannot drift apart.
+        """
+        if self.config.add_extra_token_to_sequence:
+            # The extra token rides on the last document part (it produces the
+            # shifted labels), so drop it before cu_seqlens, which must index the
+            # sequence_length-sized tokens tensor.
+            document_lengths[-1] -= 1
+            if document_lengths[-1] == 0:
+                document_lengths.pop()
+        # If the sample was padded (e.g. the last validation sample), fold the
+        # padding into the last document so cu_seqlens[-1] equals sequence_length.
+        shortfall = self.config.sequence_length - sum(document_lengths)
+        if shortfall > 0:
+            if document_lengths:
+                document_lengths[-1] += shortfall
+            else:
+                document_lengths.append(shortfall)
+        assert shortfall >= 0, (
+            f"packed sample is longer than sequence_length: "
+            f"{sum(document_lengths)} > {self.config.sequence_length}"
+        )
+        cu_seqlens = torch.tensor(numpy.cumsum([0] + document_lengths), dtype=torch.int32)
+        return cu_seqlens, (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+
+    def _pad_cu_seqlens(self, cu_seqlens):
+        """Pad cu_seqlens to a fixed length so default_collate can stack samples
+        with different document counts. Trailing entries are sequence_length; the
+        merge helper strips them later."""
+        padded = torch.full(
+            (self.config.sequence_length + 1,), self.config.sequence_length, dtype=torch.int32
+        )
+        padded[: cu_seqlens.numel()] = cu_seqlens
+        return padded
+
+    def _bfd_document_lengths(self, idx):
+        """Per-chunk token counts for a BFD sample, from the index alone.
+
+        Mirrors what _query_bfd_packed_sample derives from the materialized
+        parts: chunk_len, plus one for a synthesized EOD.
+        """
+        shuffled = int(self.shuffle_index[idx])
+        doc_index_beg = int(self.sample_index[shuffled][0])
+        doc_index_end = int(self.sample_index[shuffled + 1][0])
+        lengths = []
+        for i in range(doc_index_beg, doc_index_end):
+            virtual_id = int(self.document_index[i])
+            lengths.append(
+                int(self.chunk_map[virtual_id, 2]) + int(self.chunk_map[virtual_id, 3])
+            )
+        return lengths
 
     def _query_bfd_packed_sample(self, idx):
         """Load one BFD-packed sample: concatenate virtual chunks, synthesize EOD on
