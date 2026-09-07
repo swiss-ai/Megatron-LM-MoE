@@ -741,20 +741,20 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             return merge(parts)
 
         if is_merged_offload_expert:
-            experts = _split_experts(grad)
-            for i, expert in enumerate(experts):
-                experts[i] = self._orthogonalize_tensor(
-                    expert,
-                    tp_group,
-                    partition_dim,
-                    use_radius_scale,
-                    is_router=is_router,
-                )
+            assert grad.ndim == 3
+            experts = self._orthogonalize_tensor(
+                grad,
+                tp_group,
+                partition_dim,
+                use_radius_scale,
+                is_router=is_router,
+            )
             if self.normalize_update_to_weight_norm:
-                experts = self._normalize_muon_update_blocks(
-                    p, experts, norm_partition_dim
+                blocks = self._normalize_muon_update_blocks(
+                    p, list(experts.unbind(0)), norm_partition_dim
                 )
-            return _merge_experts(experts)
+                return _merge_experts(blocks)
+            return experts
 
 
         update = self._orthogonalize_tensor(
@@ -778,7 +778,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         return self.router_scale_mode if is_router else self.scale_mode
 
     def _orthogonalize_tensor(self, grad, tp_group, partition_dim, use_radius_scale: bool = False, is_router: bool = False):
-        assert grad.ndim == 2
+        assert grad.ndim == 2 or grad.ndim == 3
         size = [grad.size(-2), grad.size(-1)]
         if partition_dim is not None:
             # Use the global matrix shape for Muon scaling.
