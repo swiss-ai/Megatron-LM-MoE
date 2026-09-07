@@ -47,13 +47,27 @@ from megatron.core.transformer.module import param_is_not_shared
 
 
 def _calc_cpu_tensors_l2_norm_squared(tensors, chunk_numel=16 * 1024 * 1024):
-    """Calculate a squared L2 norm for CPU tensors without a full FP32 copy."""
-    norm_2 = torch.zeros((), dtype=torch.float64, device='cpu')
+    """Return the squared norm on CUDA, staging CPU weights in at most 32 MiB chunks.
+    """
+    if chunk_numel <= 0:
+        raise ValueError('chunk_numel must be positive')
+    norm_2 = torch.zeros((), dtype=torch.float64, device='cuda')
+    staging = None
     for tensor in tensors:
+        if tensor.device.type != 'cpu':
+            raise ValueError('Expected CPU tensors for the staged parameter norm')
         flat_tensor = tensor.detach().reshape(-1)
-        for start in range(0, flat_tensor.numel(), chunk_numel):
-            chunk = flat_tensor[start : start + chunk_numel]
-            chunk_norm = torch.linalg.vector_norm(chunk, ord=2, dtype=torch.float32)
+        if flat_tensor.numel() == 0:
+            continue
+        if staging is None:
+            staging = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=norm_2.device)
+        typed_staging = staging.view(tensor.dtype)
+        step = min(chunk_numel, typed_staging.numel())
+        for start in range(0, flat_tensor.numel(), step):
+            chunk = flat_tensor[start : start + step]
+            gpu_chunk = typed_staging[:chunk.numel()]
+            gpu_chunk.copy_(chunk, non_blocking=True)
+            chunk_norm = torch.linalg.vector_norm(gpu_chunk, ord=2, dtype=torch.float32)
             norm_2 += chunk_norm.double().square()
     return norm_2
 

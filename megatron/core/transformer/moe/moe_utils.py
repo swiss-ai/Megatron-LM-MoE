@@ -1318,6 +1318,20 @@ def clear_aux_losses_tracker() -> None:
         tracker[name]["values"].zero_()
 
 
+def _reduce_one_aux_loss(entry, pp_group, dp_group) -> None:
+    """Reduce a single tracker entry, the original one-collective-per-step path."""
+    values = entry["values"]
+    torch.distributed.all_reduce(values, group=pp_group)
+    if entry.get('reduce_group') is not None:
+        torch.distributed.all_reduce(values, group=entry.get('reduce_group'))
+        if not entry.get('reduce_group_has_dp', False):
+            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+    if entry.get('avg_group') is not None:
+        torch.distributed.all_reduce(
+            values, group=entry['avg_group'], op=torch.distributed.ReduceOp.AVG
+        )
+
+
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
 ) -> None:
@@ -1343,24 +1357,69 @@ def reduce_aux_losses_tracker_across_ranks(
         pp_group = pg_collection.pp
         dp_group = pg_collection.dp
 
-    for name in track_names:
-        values = tracker[name]["values"]
-        # TODO(Hepteract): delete the usage of the global parallel_state.
-        # Collect aux losses across PP.
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce aux losses across ranks.
-        if tracker[name].get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+    names = [name for name in track_names if name in tracker]
+    if not names:
+        return
+
+    # Every tracked metric is a torch.zeros(num_layers) on the same device (see
+    # save_to_aux_losses_tracker), so they can be stacked into one [n_metrics, num_layers]
+    # buffer and reduced together.
+    per_metric = [tracker[name]["values"] for name in names]
+    shape = per_metric[0].shape
+    if not all(v.shape == shape and v.device == per_metric[0].device for v in per_metric):
+        # Mismatched trackers cannot be stacked; fall back to reducing them one by one.
+        for name in names:
+            _reduce_one_aux_loss(tracker[name], pp_group, dp_group)
+        return
+
+    values = torch.stack(per_metric)
+
+    def _reduce_rows(rows, group, op):
+        """One collective over the selected rows, or over the whole buffer if it is all."""
+        if not rows:
+            return
+        if len(rows) == len(names):
+            torch.distributed.all_reduce(values, group=group, op=op)
+            return
+        gathered = values[rows].contiguous()
+        torch.distributed.all_reduce(gathered, group=group, op=op)
+        values[rows] = gathered
+
+    def _bucket(buckets, group, row):
+        """Append `row` to the bucket for `group`, keeping first-appearance order."""
+        for bucket_group, rows in buckets:
+            if bucket_group is group:
+                rows.append(row)
+                return
+        buckets.append((group, [row]))
+
+    # Bucket by the collective each metric still needs.  All ranks walk `names` in the same
+    # order and derive the same groups, so the buckets -- and therefore the order the
+    # collectives are issued in -- match across ranks.
+    reduce_buckets, avg_buckets, dp_rows = [], [], []
+    for row, name in enumerate(names):
+        entry = tracker[name]
+        reduce_group = entry.get('reduce_group')
+        if reduce_group is not None:
+            _bucket(reduce_buckets, reduce_group, row)
             # Need to conduct reduction across data parallel ranks. When the reduce_group
             # does not have 'dp' attribute, do it manually.
-            if not tracker[name].get('reduce_group_has_dp', False):
-                torch.distributed.all_reduce(
-                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
-                )
-        if tracker[name].get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+            if not entry.get('reduce_group_has_dp', False):
+                dp_rows.append(row)
+        avg_group = entry.get('avg_group')
+        if avg_group is not None:
+            _bucket(avg_buckets, avg_group, row)
+
+    # Same per-metric order: PP, then reduce_group, then DP, then avg_group
+    torch.distributed.all_reduce(values, group=pp_group)
+    for group, rows in reduce_buckets:
+        _reduce_rows(rows, group, torch.distributed.ReduceOp.SUM)
+    _reduce_rows(dp_rows, dp_group, torch.distributed.ReduceOp.AVG)
+    for group, rows in avg_buckets:
+        _reduce_rows(rows, group, torch.distributed.ReduceOp.AVG)
+
+    for row, name in enumerate(names):
+        tracker[name]["values"].copy_(values[row])
 
 
 def track_moe_metrics(
