@@ -2041,6 +2041,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    # some all reduce can be safely skipped because they are always True
+    skip_reduce_check = args.skip_reduce_check and \
+        (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
@@ -2057,10 +2061,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
+    if not skip_reduce_check:
+        update_successful = logical_and_across_model_parallel_group(update_successful)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    if not skip_reduce_check:
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
@@ -2214,7 +2220,8 @@ def training_log(
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    if not args.skip_reduce_check:
+        learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2511,6 +2518,7 @@ def training_log(
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
+            grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             log_string += f' grad norm: {grad_norm:.3f} |'
         if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'

@@ -40,6 +40,11 @@ class TrainingConfig:
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
+    skip_reduce_check: bool = False
+    """Skip model-parallel reductions of some 1-value tensors like learning rate/update success/gradient norm. 
+    Enable only when these values are consistent across model-parallel ranks and every rank has trainable parameters.
+    """
+
     train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
 
