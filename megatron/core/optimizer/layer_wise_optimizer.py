@@ -22,6 +22,9 @@ from .optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)
 
+_EXPERT_PARAM_GATHER_STAGING_BYTES = 512 * 1024 * 1024
+
+
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
@@ -232,7 +235,40 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 
+        def _shard_layout(shard):
+            """[(flat_start, flat_end, param), ...] for one rank's params, in order."""
+            layout, offset = [], 0
+            for p in shard:
+                layout.append((offset, offset + p.numel(), p))
+                offset += p.numel()
+            return layout
+
+        def _copy_chunk(layout, offset, numel, staging, into_staging):
+            """Move the flat range [offset, offset+numel) between `staging` and the params.
+
+            A chunk boundary falls wherever the byte budget puts it, so it generally cuts
+            across params; each param contributes the part of itself that overlaps.  Ranges
+            past the end of this rank's shard match no param and are skipped, which is what
+            makes the padding region harmless.
+            """
+            lo, hi = offset, offset + numel
+            for start, end, param in layout:
+                if end <= lo:
+                    continue
+                if start >= hi:
+                    break
+                a, b = max(start, lo), min(end, hi)
+                flat = param.data.view(-1)
+                if into_staging:
+                    staging[a - lo : b - lo].copy_(flat[a - start : b - start], non_blocking=True)
+                else:
+                    flat[a - start : b - start].copy_(staging[a - lo : b - lo], non_blocking=True)
+
         def _allgather_helper_experts_param(params_list, group):
+            """
+            All-gather expert parameters from all ranks, handling uneven shards and CPU-offloaded
+            NOTE (fuguan): there is a similar design in megatron.core.distributed.param_and_grad_buffer._all_gather_cpu_param_bucket
+            """
             rank = get_pg_rank(group)
             world_size = get_pg_size(group)
 
@@ -248,37 +284,45 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 _allgather_helper(params_list, group)
                 return
 
-            dest_device = torch.cuda.current_device()
+            device = torch.cuda.current_device()
             dtype = first_param.dtype
 
-            # Rank-by-rank broadcast through a single flat GPU scratch buffer
-            # to reduce peak GPU memory usage
-            for src_rank in range(world_size):
-                # the parameter shard holds by src_rank
-                shard = params_list[src_rank]
-                if len(shard) == 0:
-                    continue
-                flat_size = sum(p.numel() for p in shard)
-                buf = torch.empty(flat_size, device=dest_device, dtype=dtype)
+            layouts = [_shard_layout(shard) for shard in params_list]
+            sizes = [layout[-1][1] if layout else 0 for layout in layouts]
+            padded_numel = max(sizes)
+            if padded_numel == 0:
+                return
 
-                if src_rank == rank:
-                    offset = 0
-                    for p in shard:
-                        n = p.numel()
-                        buf[offset:offset + n].copy_(p.data.view(-1))
-                        offset += n
+            # all_gather_into_tensor needs same shape in all ranks, but the layer-wise
+            # assignment hands out whole params and so gives uneven shards.
+            max_chunk_numel = max(
+                1,
+                _EXPERT_PARAM_GATHER_STAGING_BYTES
+                // (first_param.element_size() * (world_size + 1)),
+            )
+            chunk_numel = min(padded_numel, max_chunk_numel)
+            send_buffer = torch.zeros(chunk_numel, dtype=dtype, device=device)
+            recv_buffer = torch.empty(chunk_numel * world_size, dtype=dtype, device=device)
 
-                src_global = torch.distributed.get_global_rank(group, src_rank)
-                torch.distributed.broadcast(buf, src=src_global, group=group)
+            for offset in range(0, padded_numel, chunk_numel):
+                numel = min(chunk_numel, padded_numel - offset)
+                send_view = send_buffer[:numel]
+                recv_view = recv_buffer[: numel * world_size]
 
-                if src_rank != rank:
-                    offset = 0
-                    for p in shard:
-                        n = p.numel()
-                        p.data.view(-1).copy_(buf[offset:offset + n])
-                        offset += n
+                # these can be async because they are on the same stream
+                _copy_chunk(layouts[rank], offset, numel, send_view, into_staging=True)
+                torch.distributed.all_gather_into_tensor(recv_view, send_view, group=group)
 
-                del buf
+                recv_per_rank = recv_view.view(world_size, numel)
+                for src_rank in range(world_size):
+                    if src_rank == rank:
+                        continue
+                    # D2H
+                    _copy_chunk(
+                        layouts[src_rank], offset, numel, recv_per_rank[src_rank],
+                        into_staging=False,
+                    )
+            torch.cuda.current_stream().synchronize()
 
         if self.pg_collection is None:
             return
