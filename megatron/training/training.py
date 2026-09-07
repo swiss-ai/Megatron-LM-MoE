@@ -1908,6 +1908,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    # NaN localization: inert unless NAN_DEBUG is set. Lazily registers fwd+bwd
+    # hooks that report the first module whose output/grad goes non-finite this
+    # step, and resets the per-step latch. See megatron/training/nan_debug.py.
+    from megatron.training.nan_debug import nan_debug_new_step
+    nan_debug_new_step(iteration if iteration is not None else -1, model)
+
     rerun_state_machine = get_rerun_state_machine()
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
