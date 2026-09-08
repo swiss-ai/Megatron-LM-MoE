@@ -2000,8 +2000,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # module hooks only see activation grads, so a NaN in a weight gradient
         # (e.g. the fp8-offloading wgrad GEMM) is invisible to them. Inert unless
         # NAN_DEBUG is set. Runs before prepare_grad_norm() consumes the grads.
-        from megatron.training.nan_debug import nan_debug_check_grads, nan_debug_sanitize_grads
+        from megatron.training.nan_debug import (
+            nan_debug_check_grads, nan_debug_check_grad_spikes, nan_debug_sanitize_grads,
+        )
         nan_debug_check_grads(model, iteration if iteration is not None else -1)
+        # On a finite grad-norm spike, report top params by grad-norm (NAN_DEBUG_SPIKE=1).
+        nan_debug_check_grad_spikes(model, iteration if iteration is not None else -1)
         # Optionally zero spurious non-finite grad elements (NAN_DEBUG_SANITIZE=1)
         # so they can't poison the grad-norm below. Runs AFTER the scan (so the
         # offender is still logged) and BEFORE prepare_grad_norm consumes grads.

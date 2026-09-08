@@ -970,6 +970,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 )
 
             stream_manager.launch_streams_wait_compute_streams()
+        # NaN localization (NAN_DEBUG=1): grad_s is the w2-dgrad fp8 GEMM output,
+        # upstream of SSSGLU bwd. Non-finite here => the dgrad GEMM is the source.
+        from megatron.training.nan_debug import nan_debug_check_tensor
+        nan_debug_check_tensor("grad_s (w2-dgrad fp8 GEMM output)", grad_s)
         if config.gated_polynorm_linear_unit:
             grad_a, grad_a1, grad_a2, grad_probs = fused_polynorm_glu_backward(
                 grad_s, a, a1, a2, inv, config.polynorm_eps, permuted_probs.unsqueeze(-1)
@@ -983,6 +987,11 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             return grad_a, grad_probs, None, None
         elif config.gated_sssglu_linear_unit:
             grad_a, grad_probs = sssglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))
+            # NaN localization (NAN_DEBUG=1): grad_a = SSSGLU bwd output = the w1-wgrad
+            # operand. Finite at grad_s but non-finite here => SSSGLU bwd (unexpected).
+            # Finite here but w1 main_grad NaN => the w1-wgrad fp8 GEMM manufactures it.
+            from megatron.training.nan_debug import nan_debug_check_tensor
+            nan_debug_check_tensor("grad_a (SSSGLU bwd = w1-wgrad operand)", grad_a)
             return grad_a, grad_probs, None, None
         else:
             grad_a, grad_probs = swiglu_backward(grad_s, a, permuted_probs.unsqueeze(-1))

@@ -54,6 +54,23 @@ try:
 except ValueError:
     _EVERY = 1
 
+# Finite grad-norm spike localizer (independent of NAN_DEBUG). On a spike, prints
+# the top params by grad-norm — the finite analog of the non-finite scan.
+_SPIKE = _flag("NAN_DEBUG_SPIKE")
+try:
+    _SPIKE_THRESH = float(os.environ.get("NAN_DEBUG_SPIKE_THRESH", "2.0"))
+except ValueError:
+    _SPIKE_THRESH = 2.0
+try:
+    _SPIKE_WINDOW = max(2, int(os.environ.get("NAN_DEBUG_SPIKE_WINDOW", "20")))
+except ValueError:
+    _SPIKE_WINDOW = 20
+try:
+    _SPIKE_TOPK = max(1, int(os.environ.get("NAN_DEBUG_SPIKE_TOPK", "5")))
+except ValueError:
+    _SPIKE_TOPK = 5
+_spike_hist: list = []
+
 _hooks_registered = False
 _reported_fwd = False
 _reported_bwd = False
@@ -205,6 +222,63 @@ def nan_debug_check_grads(model, iteration: int) -> None:
         )
 
 
+def _median(xs: list) -> float:
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def nan_debug_check_grad_spikes(model, iteration: int) -> None:
+    """On a grad-norm SPIKE, report the top-K parameters by grad-norm — the finite
+    analog of nan_debug_check_grads. Guarded by NAN_DEBUG_SPIKE.
+
+    A spike is: total-grad-norm > NAN_DEBUG_SPIKE_THRESH x the median of the last
+    NAN_DEBUG_SPIKE_WINDOW steps (defaults 2.0x / 20 — the 20 matches the rerun
+    machine's num_samples). On a spike it prints the params contributing most to
+    the norm, so you can see whether spikes come from the same weight/layer.
+
+    Grads are per-rank/local, so the total here won't equal the rerun machine's
+    global grad_norm — but the rank(s) holding the spiking param will show it in
+    their top-K. Cost: one norm per param on GPU + one host sync for the total.
+    Call after backward, before prepare_grad_norm().
+    """
+    if not _SPIKE:
+        return
+    if iteration % _EVERY != 0:
+        return
+    names = []
+    norms = []
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for ci, chunk in enumerate(chunks):
+        for name, p in chunk.named_parameters():
+            g = getattr(p, "main_grad", None)
+            if g is None:
+                g = p.grad
+            if isinstance(g, torch.Tensor) and g.is_floating_point():
+                names.append(f"chunk{ci}.{name}")
+                norms.append(g.detach().float().norm())
+    if not norms:
+        return
+    norms_t = torch.stack(norms)
+    total = norms_t.norm().item()  # one host sync
+    if len(_spike_hist) >= min(_SPIKE_WINDOW, 5):
+        med = _median(_spike_hist)
+        if med > 0 and total > _SPIKE_THRESH * med:
+            k = min(_SPIKE_TOPK, len(names))
+            topv, topi = torch.topk(norms_t, k)
+            top = ", ".join(
+                f"{names[i]}={v:.3e}" for i, v in zip(topi.tolist(), topv.tolist())
+            )
+            print(
+                f"[NAN-DEBUG] rank={_rank()} iter={iteration} SPIKE local_total_grad_norm={total:.3e} "
+                f"(>{_SPIKE_THRESH}x recent median {med:.3e}); top-{k} params by grad-norm: {top}",
+                flush=True,
+            )
+    _spike_hist.append(total)
+    if len(_spike_hist) > _SPIKE_WINDOW:
+        _spike_hist.pop(0)
+
+
 def nan_debug_sanitize_grads(model) -> None:
     """Zero non-finite elements in parameter gradients (grad + main_grad), in place.
 
@@ -232,6 +306,27 @@ def nan_debug_sanitize_grads(model) -> None:
 
 def sanitize_enabled() -> bool:
     return _SANITIZE
+
+
+def nan_debug_check_tensor(name: str, t) -> None:
+    """Check one named intermediate tensor for non-finite values (guarded by
+    NAN_DEBUG). Uses the iteration set by nan_debug_new_step. One host sync per
+    call — place it OUTSIDE per-chunk loops, on the full tensor. For localizing
+    NaNs born inside custom autograd Functions (e.g. the fp8-offloading backward),
+    which the module fwd/bwd hooks never see.
+    """
+    if not _ENABLED:
+        return
+    if _current_iter % _EVERY != 0:
+        return
+    if not isinstance(t, torch.Tensor) or not t.is_floating_point():
+        return
+    if not torch.isfinite(t).all():
+        print(
+            f"[NAN-DEBUG] rank={_rank()} iter={_current_iter} TENSOR non-finite in '{name}' | "
+            f"dtype={t.dtype} shape={tuple(t.shape)} {_stats(t)}",
+            flush=True,
+        )
 
 
 def enabled() -> bool:
