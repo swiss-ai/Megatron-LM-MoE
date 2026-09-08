@@ -1996,6 +1996,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
+        # NaN localization: scan PARAMETER gradients (wgrad) after backward — the
+        # module hooks only see activation grads, so a NaN in a weight gradient
+        # (e.g. the fp8-offloading wgrad GEMM) is invisible to them. Inert unless
+        # NAN_DEBUG is set. Runs before prepare_grad_norm() consumes the grads.
+        from megatron.training.nan_debug import nan_debug_check_grads
+        nan_debug_check_grads(model, iteration if iteration is not None else -1)
+
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:
             from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
             from functools import partial

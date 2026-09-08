@@ -165,5 +165,41 @@ def nan_debug_new_step(iteration: int, model=None) -> None:
     _active_step = (iteration % _EVERY == 0)
 
 
+def nan_debug_check_grads(model, iteration: int) -> None:
+    """Scan PARAMETER gradients for the first non-finite. Call after backward,
+    before the optimizer step.
+
+    The forward/backward module hooks only see activation gradients
+    (grad_input/grad_output) — they CANNOT see weight gradients (wgrad). A NaN
+    born in the wgrad (e.g. the fp8-offloading k-grouped wgrad GEMM) surfaces as
+    a NaN grad-norm and is invisible to those hooks. This scans p.grad and
+    p.main_grad and names the first offending parameter.
+    """
+    if not _ENABLED:
+        return
+    if iteration % _EVERY != 0:
+        return
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    n_bad_params = 0
+    first = None
+    for ci, chunk in enumerate(chunks):
+        for name, p in chunk.named_parameters():
+            for gname in ("grad", "main_grad"):
+                g = getattr(p, gname, None)
+                if isinstance(g, torch.Tensor) and g.is_floating_point() and not torch.isfinite(g).all():
+                    n_bad_params += 1
+                    if first is None:
+                        first = (f"chunk{ci}.{name}", gname, g)
+                    break  # don't double-count grad vs main_grad for one param
+    if first is not None:
+        name, gname, g = first
+        print(
+            f"[NAN-DEBUG] rank={_rank()} iter={iteration} GRAD first non-finite param "
+            f"'{name}'.{gname} ({n_bad_params} param-grads non-finite this rank) | "
+            f"dtype={g.dtype} shape={tuple(g.shape)} {_stats(g)}",
+            flush=True,
+        )
+
+
 def enabled() -> bool:
     return _ENABLED
