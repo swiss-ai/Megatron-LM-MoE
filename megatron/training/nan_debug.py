@@ -45,6 +45,10 @@ def _flag(name: str) -> bool:
 
 _ENABLED = _flag("NAN_DEBUG")
 _ANOMALY = _flag("NAN_DEBUG_ANOMALY")
+# Independent of NAN_DEBUG: a production fix, not diagnostics. Zeroes non-finite
+# grad elements so a rare spurious NaN (e.g. fp8-offloading wgrad GEMM on a
+# near-dead expert) can't poison the grad-norm and trigger reruns.
+_SANITIZE = _flag("NAN_DEBUG_SANITIZE")
 try:
     _EVERY = max(1, int(os.environ.get("NAN_DEBUG_EVERY", "1")))
 except ValueError:
@@ -199,6 +203,35 @@ def nan_debug_check_grads(model, iteration: int) -> None:
             f"dtype={g.dtype} shape={tuple(g.shape)} {_stats(g)}",
             flush=True,
         )
+
+
+def nan_debug_sanitize_grads(model) -> None:
+    """Zero non-finite elements in parameter gradients (grad + main_grad), in place.
+
+    Guarded by NAN_DEBUG_SANITIZE (independent of NAN_DEBUG — this is a fix, not a
+    diagnostic). Unconditional ``nan_to_num_`` (nan/inf -> 0): no isfinite check,
+    so no host sync, and a true no-op on finite grads. nan_to_num is element-wise,
+    so a real gradient keeps all its finite values — only the spurious element(s)
+    are zeroed. inf is mapped to 0 too (not to 3.4e38) so it can't re-inflate the
+    grad-norm. Call after backward, before prepare_grad_norm() / the optimizer.
+
+    Safe here because the target is a single ~0-magnitude artifact element from
+    the fp8-offloading wgrad GEMM on a near-dead expert; zeroing it has no training
+    impact. A genuine gradient spike would be handled by grad clipping, not this.
+    """
+    if not _SANITIZE:
+        return
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        for p in chunk.parameters():
+            for gname in ("grad", "main_grad"):
+                g = getattr(p, gname, None)
+                if isinstance(g, torch.Tensor) and g.is_floating_point():
+                    torch.nan_to_num_(g, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def sanitize_enabled() -> bool:
+    return _SANITIZE
 
 
 def enabled() -> bool:
