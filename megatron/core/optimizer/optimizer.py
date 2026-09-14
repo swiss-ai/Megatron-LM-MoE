@@ -41,6 +41,7 @@ from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
+    get_optim_param_to_id_map,
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
     optim_state_to_sharding_state,
@@ -705,14 +706,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.float16_groups = []
             self.fp32_from_float16_groups = []
             self.fp32_from_fp32_groups = []
+            self.model_params = []
 
             # For all the groups in the original optimizer:
             for param_group in self.optimizer.param_groups:
                 float16_params_this_group = []
                 fp32_params_this_group = []
                 fp32_from_float16_params_this_group = []
+                model_params_this_group = []
                 # For all the parameters in this group:
                 for i, param in enumerate(param_group['params']):
+                    model_params_this_group.append(param)
                     if param.requires_grad:
 
                         # float16 params:
@@ -757,6 +761,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 self.float16_groups.append(float16_params_this_group)
                 self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
                 self.fp32_from_fp32_groups.append(fp32_params_this_group)
+                self.model_params.append(model_params_this_group)
             self.is_stub_optimizer = False
         else:
             self.is_stub_optimizer = True
@@ -866,29 +871,31 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
+            if hasattr(self.optimizer, "init_sharded_state"):
+                self.optimizer.init_sharded_state(metadata or {})
 
         state_dict = self.state_dict()
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
-            model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
+            model_sharded_state_dict, chain.from_iterable(self.model_params)
         )
 
-        # Convert fp32_from_fp16_params
+        # Convert fp32_from_fp16_params. The optimizer groups may also contain native fp32
+        # parameters, so their ids are not necessarily contiguous with the fp16 parameters.
         assert len(state_dict['fp32_from_fp16_params']) == len(
             state_dict['optimizer']['param_groups']
         )
+        param_id_map = get_optim_param_to_id_map(self.get_parameters())
         state_dict['fp32_from_fp16_params'] = [
             [
                 make_sharded_optimizer_tensor(
-                    id_to_sharded_param_map[param_id],
-                    fp32_param,
+                    id_to_sharded_param_map[param_id_map[id(main_param)]],
+                    main_param,
                     prefix=f'optimizer.state.fp32_param',
                 )
-                for param_id, fp32_param in zip(state_group['params'], fp32_group)
+                for main_param in fp32_group
             ]
-            for fp32_group, state_group in zip(
-                state_dict['fp32_from_fp16_params'], state_dict['optimizer']['param_groups']
-            )
+            for fp32_group in state_dict['fp32_from_fp16_params']
         ]
 
         step = self._extract_common_per_param_step(state_dict['optimizer'])
@@ -961,8 +968,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 key_to_fp32[self._param_group_key(g)] for g in self.optimizer.param_groups
             ]
 
-        for current_group, saved_group in zip(self.fp32_from_float16_groups, saved_fp32_groups):
-            for current_param, saved_param in zip(current_group, saved_group):
+        for model_group, current_group, saved_group in zip(
+            self.float16_groups, self.fp32_from_float16_groups, saved_fp32_groups
+        ):
+            source_group = saved_group if len(saved_group) == len(current_group) else model_group
+            for current_param, saved_param in zip(current_group, source_group):
                 current_param.data.copy_(saved_param.data)
 
 
@@ -1096,6 +1106,8 @@ class FP32Optimizer(MegatronOptimizer):
     ):
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
+            if hasattr(self.optimizer, "init_sharded_state"):
+                self.optimizer.init_sharded_state(metadata or {})
 
         state_dict = self.state_dict()
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(

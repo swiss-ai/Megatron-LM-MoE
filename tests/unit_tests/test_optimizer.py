@@ -764,6 +764,65 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
         ), "Found 'optimizer.state.common_step=None' in sharded state dict."
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
+def test_optim_sharded_state_dict_mixed_model_dtypes():
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(8, 8, bias=True, dtype=torch.bfloat16, device='cuda')
+    native_fp32 = torch.nn.Parameter(torch.ones(8, dtype=torch.float32, device='cuda'))
+    native_fp32.is_kda_decay_parameter = True
+    model.native_fp32 = native_fp32
+    model.requires_grad_(True)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', bf16=True)
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    sharded_state_dict = optim.sharded_state_dict(
+        model.sharded_state_dict(),
+        metadata={'distrib_optim_sharding_type': 'fully_reshardable'},
+        is_loading=True,
+    )
+
+    optimizer_state = sharded_state_dict['optimizer']['state']
+    assert len([key for key in optimizer_state if isinstance(key, int)]) == 3
+
+    inner_optim = next(
+        optimizer for optimizer in optim.chained_optimizers if hasattr(optimizer, 'model_params')
+    )
+    group_idx = next(
+        i
+        for i, group in enumerate(inner_optim.model_params)
+        if any(param is native_fp32 for param in group)
+    )
+    assert len(inner_optim.fp32_from_float16_groups[group_idx]) == 1
+    model_half = inner_optim.float16_groups[group_idx][0]
+    model_half.data.fill_(2.5)
+    native_fp32.data.fill_(3.25)
+    old_state_dict = inner_optim.state_dict()
+    old_state_dict['fp32_from_fp16_params'] = [
+        list(group) for group in old_state_dict['fp32_from_fp16_params']
+    ]
+    old_state_dict['fp32_from_fp16_params'][group_idx] = [
+        torch.full_like(model_half, 7.0),
+        torch.full_like(native_fp32, 11.0),
+    ]
+    inner_optim.fp32_from_float16_groups[group_idx][0].data.zero_()
+
+    inner_optim.load_state_dict(old_state_dict)
+
+    torch.testing.assert_close(
+        inner_optim.fp32_from_float16_groups[group_idx][0], model_half.float()
+    )
+    torch.testing.assert_close(native_fp32, torch.full_like(native_fp32, 3.25))
+    Utils.destroy_model_parallel()
+
+
 def test_optimizer_reload_model_params():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))

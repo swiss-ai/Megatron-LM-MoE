@@ -254,6 +254,7 @@ def test_md_muon_normalizes_update_to_fixed_hypersphere_norm(
         raw_update / torch.linalg.vector_norm(raw_update),
     )
     assert optimizer._fixed_weight_norms[param][0].item() == pytest.approx(fixed_norm)
+    assert ("fixed_weight_norm_0" in optimizer.state[param]) is preserve_init
 
     # The target is cached; a subsequent call measures only the update, not the weight.
     norm_calls = 0
@@ -270,6 +271,28 @@ def test_md_muon_normalizes_update_to_fixed_hypersphere_norm(
     )[0]
     assert norm_calls == 1
     assert torch.linalg.vector_norm(second).item() == pytest.approx(fixed_norm, rel=1e-6)
+
+
+def test_md_fixed_weight_norm_survives_state_dict_load():
+    kwargs = dict(
+        lr=0.1,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+        use_orthogonal_updates=True,
+        normalize_update_to_weight_norm=True,
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+    )
+    param = torch.nn.Parameter(torch.tensor([[3.0, 4.0], [0.0, 12.0]]))
+    optimizer = MDDecoupling([param], **kwargs)
+    optimizer._cache_fixed_weight_norms(param, False, False, False, False)
+
+    resumed_param = torch.nn.Parameter(torch.ones_like(param))
+    resumed = MDDecoupling([resumed_param], **kwargs)
+    resumed.load_state_dict(optimizer.state_dict())
+    resumed._cache_fixed_weight_norms(resumed_param, False, False, False, False)
+
+    assert resumed._fixed_weight_norms[resumed_param][0].item() == pytest.approx(13.0)
 
 
 @requires_cuda_and_emerging
@@ -499,6 +522,9 @@ class _TinyMDDecouplingModel(torch.nn.Module):
         self.router = torch.nn.Linear(8, 4, bias=False, device=device)
         self.attn = torch.nn.Module()
         self.attn.linear_qkv = torch.nn.Linear(8, 24, bias=False, device=device)
+        self.attn.out_proj = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.attn.decay_out_proj = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.attn.gate_out_proj = torch.nn.Linear(8, 8, bias=False, device=device)
         self.mlp = torch.nn.Module()
         self.mlp.linear_fc2 = torch.nn.Linear(8, 8, bias=False, device=device)
         self.norm = torch.nn.LayerNorm(8, device=device)
@@ -696,6 +722,9 @@ def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
         assert not hasattr(untied_model.output_layer.weight, "is_md_embedding_parameter")
         assert untied_model.router.weight.is_router is True
         assert untied_model.attn.linear_qkv.weight.is_qkv is True
+        assert untied_model.attn.out_proj.weight.is_out_proj is True
+        assert not hasattr(untied_model.attn.decay_out_proj.weight, "is_out_proj")
+        assert not hasattr(untied_model.attn.gate_out_proj.weight, "is_out_proj")
         assert untied_model.mlp.linear_fc2.weight.is_out_proj is True
         assert (
             md_optimizer._resolve_gains_mode(untied_model.embedding.word_embeddings.weight)
@@ -920,6 +949,16 @@ def test_md_gain_projection_supports_dim0_split_factories():
     assert col_shards[0].global_offset == (0,)
     assert col_shards[0].replica_id == (0, 1, 0)
     torch.testing.assert_close(col_factory.merge_fn([col_shards[0].data]), col_gain)
+
+    fixed_factory = optimizer.build_sharded_optimizer_state(
+        model_factory,
+        torch.tensor(13.0),
+        "fixed_weight_norm_0",
+        "optimizer.state.fixed_weight_norm_0",
+    )
+    fixed_state = {"fixed_weight_norm_0": fixed_factory}
+    apply_factories(fixed_state)
+    assert [shard.data.item() for shard in nested_values(fixed_state)] == [13.0]
 
 
 def test_md_projected_row_gain_reshards(tmp_path_dist_ckpt):
@@ -1241,7 +1280,11 @@ def _md_sharded_optimizer(param):
             }
         ],
         lr=0.01,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
         hypersphere_gains_mode="rowcol",
+        use_orthogonal_updates=True,
+        normalize_update_to_weight_norm=True,
         pg_collection=None,
     )
     return FP32Optimizer(
@@ -1258,6 +1301,7 @@ def _linear_weight_sharded_state(param):
 def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):
     Utils.initialize_model_parallel(1, 1)
     try:
+        metadata = {"md_fixed_weight_norms": True}
         expected_gains = (
             ('row_gain', 2.0, (3,)),
             ('row_gain_m', 3.0, (3,)),
@@ -1271,10 +1315,12 @@ def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):
         megatron_optimizer.sharded_state_dict(
             _linear_weight_sharded_state(param),
             is_loading=True,
+            metadata=metadata,
         )
         optimizer = megatron_optimizer.optimizer
         for name, value, _ in expected_gains:
             optimizer.state[param][name].fill_(value)
+        optimizer.state[param]["fixed_weight_norm_0"].fill_(13.0)
 
         with TempNamedDir(tmp_path_dist_ckpt / 'md_gain_state_round_trip', sync=True) as ckpt_dir:
             save(
@@ -1288,6 +1334,7 @@ def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):
                 loaded_megatron_optimizer.sharded_state_dict(
                     _linear_weight_sharded_state(loaded_param),
                     is_loading=True,
+                    metadata=metadata,
                 ),
                 ckpt_dir,
             )
@@ -1296,6 +1343,7 @@ def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):
         loaded_state = loaded_megatron_optimizer.optimizer.state[loaded_param]
         for name, value, shape in expected_gains:
             torch.testing.assert_close(loaded_state[name], torch.full(shape, value))
+        torch.testing.assert_close(loaded_state["fixed_weight_norm_0"], torch.tensor(13.0))
     finally:
         Utils.destroy_model_parallel()
 

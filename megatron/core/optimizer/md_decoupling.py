@@ -96,6 +96,9 @@ _MD_GAIN_STATE_KINDS = {
     "flat_gain_m": "flat",
     "flat_gain_v": "flat",
 }
+_FIXED_WEIGHT_NORM_STATE = "fixed_weight_norm"
+_FIXED_WEIGHT_NORMS_METADATA = "md_fixed_weight_norms"
+
 
 def _normalize_embedding_mode(mode):
     return None if mode == "external" else mode
@@ -979,6 +982,49 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             return _split_experts(tensor), partition_dim
         return [tensor], partition_dim
 
+    def _restore_fixed_weight_norms(self, p: torch.Tensor) -> bool:
+        if p in self._fixed_weight_norms:
+            return True
+        norms = tuple(
+            value
+            for key, value in self.state[p].items()
+            if key.startswith(_FIXED_WEIGHT_NORM_STATE)
+        )
+        if not norms:
+            return False
+        if getattr(p, "merged_offload_expert", False):
+            norms = tuple(norm for expert_norms in zip(*norms) for norm in expert_norms)
+        self._fixed_weight_norms[p] = norms
+        return True
+
+    def _store_fixed_weight_norms(
+        self, p: torch.Tensor, norms: tuple[torch.Tensor, ...]
+    ) -> None:
+        norm_values = (
+            torch.stack(norms).view(p.size(0), -1).t()
+            if getattr(p, "merged_offload_expert", False)
+            else norms
+        )
+        for index, norm in enumerate(norm_values):
+            self.state[p][f"{_FIXED_WEIGHT_NORM_STATE}_{index}"] = norm
+
+    def init_sharded_state(self, metadata: dict) -> None:
+        """Add fixed-norm load placeholders only for checkpoints that contain them."""
+        if not metadata.get(_FIXED_WEIGHT_NORMS_METADATA):
+            return
+        for group in self.param_groups:
+            if not group.get("use_orthogonal_updates", False):
+                continue
+            for p in group["params"]:
+                blocks, _ = self._logical_blocks(
+                    p,
+                    p,
+                    self.is_qkv_fn(p),
+                    getattr(p, "merged_offload_expert", False),
+                )
+                empty = tuple(torch.empty((), dtype=torch.float32, device=p.device) for _ in blocks)
+                self._store_fixed_weight_norms(p, empty)
+
     def _cache_fixed_weight_norms(
         self,
         p: torch.Tensor,
@@ -988,7 +1034,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_merged_offload_expert: bool,
     ) -> None:
         """Measure each logical ``||W||_F`` once, before the first MuonMD decay/update."""
-        if p in self._fixed_weight_norms:
+        if self._restore_fixed_weight_norms(p):
             return
         if self._resolve_mode(is_embedding, is_router) is None:
             raise ValueError(
@@ -998,10 +1044,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         blocks, partition_dim = self._logical_blocks(
             p, p, is_qkv, is_merged_offload_expert
         )
-        self._fixed_weight_norms[p] = tuple(
+        fixed_norms = tuple(
             torch.sqrt(self._global_squared_norm(block, p, partition_dim))
             for block in blocks
         )
+        self._fixed_weight_norms[p] = fixed_norms
+        if self.hypersphere_preserve_init:
+            self._store_fixed_weight_norms(p, fixed_norms)
 
     def _normalize_muon_update_blocks(
         self,
@@ -1221,7 +1270,11 @@ class MDDecoupling(_MDDecouplingBase):
         prefix: str,
     ) -> ShardedTensor | ShardedTensorFactory | None:
         """Build reshardable torch_dist metadata for MD gain optimizer state."""
-        gain_kind = _MD_GAIN_STATE_KINDS.get(state_key)
+        gain_kind = (
+            "flat"
+            if state_key.startswith(_FIXED_WEIGHT_NORM_STATE)
+            else _MD_GAIN_STATE_KINDS.get(state_key)
+        )
         if gain_kind is None:
             return None
 
@@ -1931,9 +1984,13 @@ def get_megatron_mddecoupling_optimizer(
                 elif not getattr(param, "is_md_embedding_parameter", False):
                     param.is_md_output_parameter = True
             is_out_proj = (
-                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name or name.endswith('out_proj.weight') ))
-                or (is_merged_offload_expert and 'experts.weight2' in name)
-            )
+                len(param.shape) == 2
+                and (
+                    'linear_fc2' in name
+                    or 'linear_proj' in name
+                    or name.endswith('.out_proj.weight')
+                )
+            ) or (is_merged_offload_expert and 'experts.weight2' in name)
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
