@@ -2113,6 +2113,50 @@ def get_batch_on_this_cp_rank(
     return batch
 
 
+def pad_thd_batch_for_cp(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    sp_size: int = 1,
+    local_multiple: int = 1,
+):
+    """Pad every document of a packed batch to a multiple of ``2 * cp_size * sp_size``.
+
+    The per-document zigzag partition needs that divisibility and the dataloader's
+    document boundaries do not provide it. Padding goes at each document's causal
+    tail, so no real token can attend to it; it gets zero loss and is flagged in
+    ``padding_mask`` so MoE routing ignores it. The padded total is also rounded up
+    so that every rank holds a multiple of ``local_multiple`` tokens.
+
+    Returns the batch, the padded ``cu_seqlens`` and the padded ``max_seqlen``.
+    """
+    alignment = 2 * cp_size * sp_size
+    cu_seqlens_cpu = cu_seqlens.cpu()
+    lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    padded_lengths = (lengths + alignment - 1) // alignment * alignment
+    padded_lengths[-1] += -padded_lengths.sum() % (local_multiple * cp_size * sp_size)
+    padded_cu_seqlens_cpu = torch.cat(
+        (cu_seqlens_cpu[:1], padded_lengths.cumsum(0).to(cu_seqlens_cpu.dtype))
+    )
+    padded_cu_seqlens = padded_cu_seqlens_cpu.to(cu_seqlens.device)
+    padded_total = int(padded_cu_seqlens_cpu[-1])
+
+    positions = torch.arange(int(cu_seqlens_cpu[-1]), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    document = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+    destinations = (positions + (padded_cu_seqlens[:-1] - cu_seqlens[:-1])[document]).long()
+
+    padding_mask = torch.ones((1, padded_total), dtype=torch.bool, device=cu_seqlens.device)
+    if batch.get('padding_mask') is not None:
+        padding_mask.index_copy_(1, destinations, batch['padding_mask'])
+    else:
+        padding_mask.index_fill_(1, destinations, False)
+    batch['padding_mask'] = padding_mask
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        if batch.get(key) is not None:
+            batch[key] = batch[key].new_zeros((1, padded_total)).index_copy_(1, destinations, batch[key])
+    return batch, padded_cu_seqlens, padded_lengths.max().reshape(1)
+
+
 def get_thd_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     cu_seqlens: torch.Tensor,
@@ -2124,6 +2168,9 @@ def get_thd_batch_on_this_cp_rank(
     """Slice each sub-sample in a packed sample batch input along
     sequence dimension into multiple chunks, which are parallelized
     across GPUs in a context parallel group.
+
+    Middle pipeline stages carry no tokens, only the packed-sequence metadata and,
+    with BFD packing, the routing ``padding_mask``.
     """
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -2142,13 +2189,15 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
-        )
+        total_tokens = next((data.size(1) for data in batch.values() if data is not None), None)
+        if total_tokens is None:
+            total_tokens = int(cu_seqlens_padded[-1].item())
+        index = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
                 continue
-            batch[key] = data.index_select(1, index)
+            if data is not None:
+                batch[key] = data.index_select(1, index)
 
     return batch, packed_seq_params
 

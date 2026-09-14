@@ -1125,11 +1125,9 @@ def validate_args(args, defaults={}):
             '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
             'SFT packing already restricts attention to each packed sequence.'
         )
-        assert args.context_parallel_size == 1, (
-            '--dataloader-inter-document-masking does not support context parallelism '
-            'yet: document boundaries are not guaranteed to be divisible by '
-            '2 * context-parallel-size, which the THD CP partitioning requires.'
-        )
+        if args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1:
+            # Per-document CP padding makes the physical sequence length vary per microbatch.
+            args.variable_seq_lengths = True
         assert not args.hybrid_context_parallel, (
             '--dataloader-inter-document-masking does not support hybrid context '
             'parallelism yet.'
