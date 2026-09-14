@@ -158,6 +158,56 @@ class _LayerwiseAllGatherHandle:
         self.handles = None
 
 
+
+_CPU_PARAM_GATHER_STAGING_BYTES = 128 * 1024 * 1024
+_cpu_grad_reduce_stream: Optional[torch.cuda.Stream] = None
+
+
+def _get_cpu_grad_reduce_stream() -> torch.cuda.Stream:
+    """The single stream used to reduce host-resident grad buckets.
+    """
+    global _cpu_grad_reduce_stream
+    if _cpu_grad_reduce_stream is None:
+        _cpu_grad_reduce_stream = torch.cuda.Stream()
+    return _cpu_grad_reduce_stream
+
+
+class _CpuBucketReduceHandle:
+    """Handle for an in-flight reduce of host-resident grad buckets.
+
+    Instead of a torch.distributed work object, this handle wraps a CUDA event
+    which is recorded after the reduce and D2H.
+    """
+
+    def __init__(self, event: torch.cuda.Event, buffers: List[torch.Tensor]):
+        self.event = event
+        self.buffers = buffers
+
+    def wait(self):
+        """Block the host until the reduce and D2H have completed."""
+        if self.event is None:
+            return
+        self.event.synchronize()
+        self.event = None
+        for buf in self.buffers:
+            buf.untyped_storage().resize_(0)
+        self.buffers = []
+
+
+class _CompositeGradReduceHandle:
+    """Waits a coalescing manager and any host-resident bucket reduces as one handle.
+    """
+
+    def __init__(self, handles):
+        self.handles = [h for h in handles if h is not None]
+
+    def wait(self):
+        """Wait every underlying handle, in dispatch order."""
+        for handle in self.handles:
+            handle.wait()
+        self.handles = []
+
+
 class _ParamAndGradBucketGroup:
     """
     Put multiple buckets into a group so that their communications can be aggregated together.
@@ -182,6 +232,13 @@ class _ParamAndGradBucketGroup:
     ):
         self.buckets = buckets
         self.ddp_config = ddp_config
+        self.any_cpu_grad_buckets = any(bucket.grad_data.device.type == "cpu" for bucket in buckets)
+        self.all_cpu_grad_buckets = all(bucket.grad_data.device.type == "cpu" for bucket in buckets)
+
+        # If any bucket in the group has host-resident grads, all buckets must have host-resident grads.
+        if self.any_cpu_grad_buckets:
+            assert self.all_cpu_grad_buckets
+        self.cpu_grad_buckets = [bucket for bucket in buckets if bucket.grad_data.device.type == "cpu"]
 
         # overlap_param_gather covers the layer-wise optimizer case, which sets
         # overlap_param_gather=True without use_distributed_optimizer.
@@ -294,6 +351,32 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
 
+    @staticmethod
+    def _bucket_grad_norm(grad_data: torch.Tensor, num_chunks: int = 8) -> torch.Tensor:
+        """L2 norm of a bucket's grads, computed on the device even when they are host-resident.
+        """
+        if grad_data.device.type != "cpu":
+            return grad_data.norm(p=2)
+
+        flat = grad_data.view(-1)
+        numel = flat.numel()
+        if numel == 0:
+            return torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
+
+        chunk = max(1, (numel + num_chunks - 1) // num_chunks)
+        device = torch.cuda.current_device()
+        staging = torch.empty(min(chunk, numel), dtype=flat.dtype, device=device)
+        sum_of_squares = torch.zeros((), dtype=torch.float32, device=device)
+        for off in range(0, numel, chunk):
+            n = min(chunk, numel - off)
+            view = staging[:n]
+            # grad_data is pinned, so the copy can be async: the norm below runs on the
+            # same stream and is therefore ordered behind it.
+            view.copy_(flat[off : off + n], non_blocking=True)
+            chunk_norm = torch.linalg.vector_norm(view, ord=2, dtype=torch.float32)
+            sum_of_squares += chunk_norm * chunk_norm
+        return sum_of_squares.sqrt()
+
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel
@@ -301,7 +384,7 @@ class _ParamAndGradBucketGroup:
         """
         rerun_state_machine = get_rerun_state_machine()
         for i in range(len(self.buckets)):
-            grad_norm = self.buckets[i].grad_data.norm(p=2)
+            grad_norm = self._bucket_grad_norm(self.buckets[i].grad_data)
             # check for NaN, Inf and unexpectedly large grads
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(
@@ -331,6 +414,62 @@ class _ParamAndGradBucketGroup:
                     tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
                     fatal=False,
                 )
+
+    def _all_gather_cpu_param_bucket(
+        self, bucket: _ParamAndGradBucket, local_data_view: torch.Tensor
+    ):
+        """All-gather one host-resident bucket's params, staging through the device.
+        """
+        shard_numel = local_data_view.numel()
+        if shard_numel == 0:
+            return
+
+        world_size = self.intra_distributed_optimizer_instance_size
+        local_rank = self.intra_distributed_optimizer_instance_rank
+        dtype = bucket.param_data.dtype
+        device = torch.cuda.current_device()
+
+        # Each pass stages one shard chunk plus the gathered result for all ranks.
+        max_chunk_numel = max(
+            1,
+            _CPU_PARAM_GATHER_STAGING_BYTES
+            // (bucket.param_data.element_size() * (world_size + 1)),
+        )
+        chunk_numel = min(shard_numel, max_chunk_numel)
+
+        send_buffer = torch.empty(chunk_numel, dtype=dtype, device=device)
+        recv_buffer = torch.empty(chunk_numel * world_size, dtype=dtype, device=device)
+
+        flat_param_data = bucket.param_data.view(-1)
+        flat_local_shard = local_data_view.view(-1)
+
+        for offset in range(0, shard_numel, chunk_numel):
+            numel = min(chunk_numel, shard_numel - offset)
+            send_view = send_buffer[:numel]
+            recv_view = recv_buffer[: numel * world_size]
+
+            # param_data is pinned, so the copies can be async: the collective and the
+            # next chunk's staging run on this same stream and are ordered behind them.
+            send_view.copy_(flat_local_shard[offset : offset + numel], non_blocking=True)
+            torch.distributed.all_gather_into_tensor(
+                recv_view, send_view, group=self.intra_distributed_optimizer_instance_group
+            )
+
+            # Rank r's shard occupies [r * shard_numel, (r + 1) * shard_numel) in the bucket.
+            recv_per_rank = recv_view.view(world_size, numel)
+            for rank in range(world_size):
+                if rank == local_rank:
+                    # local_data_view is a view into param_data, so this range already holds
+                    # exactly what was sent -- copying it back would be a no-op round trip.
+                    continue
+                dst = rank * shard_numel + offset
+                flat_param_data[dst : dst + numel].copy_(recv_per_rank[rank], non_blocking=True)
+
+        # One host sync for the whole bucket rather than one per copy.  Consumers read
+        # param_data from the host and from the offload H2D stream, neither of which is
+        # ordered against this stream; it also keeps the staging buffers alive until the
+        # copies land.
+        torch.cuda.current_stream().synchronize()
 
     def start_param_sync(self, force_sync: bool = False):
         """
@@ -463,73 +602,21 @@ class _ParamAndGradBucketGroup:
                             async_op=async_op,
                         )
             
-            # handle CPU buckets outside the coalescing manager   
-            # NOTE: when overlap is disabled, to aoivd large GPU memory consumption we take
-            # a chunked all-gather approach for CPU buckets. 
-            # When overlap is enabled, As all device hold the buckets
-            # in the same order, it should be safe to launch sync all-gather by order
-            if self.ddp_config.overlap_grad_reduce:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]              
-                    if bucket.param_data.device == torch.device("cpu"):
-                        gpu_param = torch.empty_like(bucket.param_data, device=torch.cuda.current_device())
-                        gpu_local = local_data_view.to(torch.cuda.current_device(), non_blocking=False)
-                        torch.distributed.all_gather_into_tensor(
-                            gpu_param, 
-                            gpu_local, 
-                            group=self.intra_distributed_optimizer_instance_group
-                        )  # sync
-                        bucket.param_data.copy_(gpu_param, non_blocking=False)
-                        gpu_param.data.storage().resize_(0)
-                        gpu_local.data.storage().resize_(0)
-                        del gpu_param, gpu_local
-            else:
-                for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
-                        )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]                                                                                                                                                                
-                    if bucket.param_data.device == torch.device("cpu"):
-                        world = self.intra_distributed_optimizer_instance_size
-                        shard_numel = local_data_view.numel()
-                        # chunk = 1/8 of the per-rank shard -> 8 iterations, ~8x lower peak GPU memory usage
-                        num_chunks = 8
-                        chunk_shard = (shard_numel + num_chunks - 1) // num_chunks
-                        device = torch.cuda.current_device()
-                        dtype = bucket.param_data.dtype
-
-                        gs_buf = torch.empty(chunk_shard, dtype=dtype, device=device)
-                        gf_buf = torch.empty(chunk_shard * world, dtype=dtype, device=device) 
-
-                        flat_cpu = bucket.param_data.view(-1)
-                        local_flat = local_data_view.contiguous().view(-1)
-
-                        for off in range(0, shard_numel, chunk_shard):
-                            n = min(chunk_shard, shard_numel - off)
-                            gs = gs_buf[:n]
-                            gf = gf_buf[: n * world]
-                            gs.copy_(local_flat[off : off + n], non_blocking=False)
-                            torch.distributed.all_gather_into_tensor(
-                                gf,
-                                gs,
-                                group=self.intra_distributed_optimizer_instance_group,
-                            )  # sync
-                            gf_view = gf.view(world, n)
-                            for r in range(world):
-                                dst = r * shard_numel + off
-                                flat_cpu[dst : dst + n].copy_(gf_view[r], non_blocking=False)
-                        gs_buf.data.storage().resize_(0)
-                        gf_buf.data.storage().resize_(0)
-                        del gs_buf, gf_buf
+            # Handle CPU buckets outside the coalescing manager: NCCL cannot take a host
+            # pointer, so each rank's shard is staged through the device. Every rank walks
+            # buckets in the same order and _all_gather_cpu_param_bucket walks chunks in the
+            # same order with the same shard size, so the collectives line up.
+            for idx, bucket in enumerate(self.buckets):
+                if bucket.param_data.device != torch.device("cpu"):
+                    continue
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]
+                self._all_gather_cpu_param_bucket(bucket, local_data_view)
 
             if async_op:
                 self.param_gather_handle = cm
@@ -649,7 +736,7 @@ class _ParamAndGradBucketGroup:
         ), "Should not have multiple communication calls outstanding at once"
 
         # guarantee the main grad is fully synchronized
-        if any(bucket.grad_data.device.type == "cpu" for bucket in self.buckets):
+        if self.all_cpu_grad_buckets:
             MoEOffloadManager.synchronize()
 
         # Copy accumulated .main_grad into communication buffer before collective if
@@ -744,9 +831,13 @@ class _ParamAndGradBucketGroup:
                     )
 
         # perform reduce of cpu grad outside the coalescing manager
-        for bucket in self.buckets:
-            if bucket.grad_data.device.type == "cpu":
-                self._reduce_cpu_bucket(bucket, reduce_op, communication_group, force_all_reduce)
+        cpu_reduce_handles = []
+        for bucket in self.cpu_grad_buckets:
+            handle = self._start_reduce_cpu_bucket(
+                bucket, reduce_op, communication_group, force_all_reduce, async_op=async_op
+            )
+            if handle is not None:
+                cpu_reduce_handles.append(handle)
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -788,6 +879,10 @@ class _ParamAndGradBucketGroup:
                 self.grad_reduce_handle = grad_reduce_handle
             else:
                 self.grad_reduce_handle = cm
+            if cpu_reduce_handles:
+                self.grad_reduce_handle = _CompositeGradReduceHandle(
+                    [self.grad_reduce_handle] + cpu_reduce_handles
+                )
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
@@ -796,19 +891,22 @@ class _ParamAndGradBucketGroup:
             # None.
             self.grad_reduce_handle = None
 
-    def _reduce_cpu_bucket(
+    def _start_reduce_cpu_bucket(
         self,
         bucket: _ParamAndGradBucket,
         reduce_op: torch.distributed.ReduceOp,
         communication_group: torch.distributed.ProcessGroup,
         force_all_reduce: bool,
+        async_op: bool,
         num_chunks: int = 8,
-    ):
+    ) -> Optional["_CpuBucketReduceHandle"]:
         """
         Reduce a bucket whose .grad_data lives in pinned host memory (MoE main-grad offload).
 
-        The collectives are synchronous: the copy-back needs the result anyway, so there is nothing
-        to overlap with, and the caller iterates buckets in an order that is identical on all ranks.
+        Dispatched on the shared CPU grad-reduce stream so the staging copies and collectives
+        overlap the rest of the backward pass; returns a handle the caller waits in
+        finish_grad_sync.  With async_op=False the reduce is still issued on that stream but
+        waited before returning, preserving the old synchronous behaviour.
 
         Args:
             bucket: bucket whose .grad_data is a pinned host tensor.
@@ -826,7 +924,7 @@ class _ParamAndGradBucketGroup:
 
         flat_cpu = bucket.grad_data.view(-1)
         if flat_cpu.numel() == 0:
-            return
+            return None
 
         # Without a reduce-scatter every rank keeps the whole buffer, i.e. a single shard.
         use_reduce_scatter = self.ddp_config.use_distributed_optimizer and not force_all_reduce
@@ -838,38 +936,53 @@ class _ParamAndGradBucketGroup:
         device = torch.cuda.current_device()
         dtype = flat_cpu.dtype
         scaling_factor = bucket.gradient_scaling_factor
-        gpu_full = torch.empty(chunk_shard * world, dtype=dtype, device=device)
-        gpu_shard = None
-        if use_reduce_scatter:
-            gpu_shard = torch.empty(chunk_shard, dtype=dtype, device=device)
+        reduce_stream = _get_cpu_grad_reduce_stream()
+        # The wgrads that produced this buffer were written back on the offload D2H stream,
+        # which start_grad_sync has already waited on the host, and anything else feeding
+        # grad_data ran on the compute stream.
+        reduce_stream.wait_stream(torch.cuda.current_stream())
 
-        for off in range(0, shard_numel, chunk_shard):
-            n = min(chunk_shard, shard_numel - off)
-            full = gpu_full[: n * world]
-            full_view = full.view(world, n)
-            for r in range(world):
-                src = r * shard_numel + off
-                # grad_data is pinned, so these can be async: the collective runs on the same
-                # stream and is therefore ordered behind them, and nothing rewrites the source.
-                full_view[r].copy_(flat_cpu[src : src + n], non_blocking=True)
-            if scaling_factor != 1.0:
-                full *= scaling_factor
-
+        with torch.cuda.stream(reduce_stream):
+            # Allocated inside the stream context so the caching allocator binds these blocks
+            # to reduce_stream; a block allocated on the compute stream and used here would
+            # need record_stream() to stay safe once it is freed.
+            gpu_full = torch.empty(chunk_shard * world, dtype=dtype, device=device)
+            gpu_shard = None
             if use_reduce_scatter:
-                out = gpu_shard[:n]
-                dist_reduce_scatter_func(out, full, op=reduce_op, group=communication_group)
-            else:
-                torch.distributed.all_reduce(full, op=reduce_op, group=communication_group)
-                out = full
+                gpu_shard = torch.empty(chunk_shard, dtype=dtype, device=device)
 
-            dst = local_rank * shard_numel + off
-            flat_cpu[dst : dst + n].copy_(out, non_blocking=True)
+            for off in range(0, shard_numel, chunk_shard):
+                n = min(chunk_shard, shard_numel - off)
+                full = gpu_full[: n * world]
+                full_view = full.view(world, n)
+                for r in range(world):
+                    src = r * shard_numel + off
+                    # grad_data is pinned, so these can be async: the collective runs on the
+                    # same stream and is therefore ordered behind them, and nothing rewrites
+                    # the source.
+                    full_view[r].copy_(flat_cpu[src : src + n], non_blocking=True)
+                if scaling_factor != 1.0:
+                    full *= scaling_factor
 
-        # drain all the async operations
-        torch.cuda.current_stream().synchronize()
-        gpu_full.untyped_storage().resize_(0)
-        if gpu_shard is not None:
-            gpu_shard.untyped_storage().resize_(0)
+                if use_reduce_scatter:
+                    out = gpu_shard[:n]
+                    dist_reduce_scatter_func(out, full, op=reduce_op, group=communication_group)
+                else:
+                    torch.distributed.all_reduce(full, op=reduce_op, group=communication_group)
+                    out = full
+
+                dst = local_rank * shard_numel + off
+                flat_cpu[dst : dst + n].copy_(out, non_blocking=True)
+
+            done = torch.cuda.Event()
+            done.record(reduce_stream)
+
+        buffers = [gpu_full] + ([gpu_shard] if gpu_shard is not None else [])
+        handle = _CpuBucketReduceHandle(done, buffers)
+        if not async_op:
+            handle.wait()
+            return None
+        return handle
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """

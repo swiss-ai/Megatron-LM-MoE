@@ -811,6 +811,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             for model_param, main_param in zip(model_group, main_group):
                 # .main_grad may be host-resident (moe_offload_main_grad) 
                 # while main_param is kept on the device
+                # NOTE (fuguan): the main_param.grad is not dereferenced
+                # after the optimizer step so the GPU memory is not freed until the next 
+                # optimizer.zero_grad(set_to_none=True)
                 if hasattr(model_param, 'main_grad'):
                     main_param.grad = model_param.main_grad.to(
                         device=main_param.device, dtype=torch.float32, non_blocking=True
