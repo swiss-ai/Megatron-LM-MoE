@@ -456,6 +456,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.residual_output_scaling and not self.keel:
             self.residual_output_scale = 1.0 / math.sqrt(2 * self.config.num_layers)
 
+        if self.config.smelt_loop_layers:
+            start = self.config.smelt_loop_start
+            if start == -1:
+                start = (self.config.num_layers - self.config.smelt_loop_layers) // 2
+            if start <= self.layer_number - 1 < start + self.config.smelt_loop_layers:
+                # Scale both attention and MLP updates after the optional sandwich norm.
+                self.residual_output_scale = (
+                    1.0 if self.residual_output_scale is None else self.residual_output_scale
+                ) * 0.5
+
         # Optionally zero-init the post-attention sandwich-norm gain so the attention sublayer
         # contributes nothing at init (x = x + 0 * Norm(Attn(Norm(x))) = x); the network then starts
         # as a pure stack of MLP/MoE blocks, which can help the MoE router settle. Only the

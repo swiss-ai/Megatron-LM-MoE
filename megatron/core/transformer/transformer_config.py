@@ -346,6 +346,12 @@ class TransformerConfig(ModelParallelConfig):
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
+    smelt_loop_layers: int = 0
+    """Number of physical layers in the twice-executed SMELT span; zero disables looping."""
+
+    smelt_loop_start: int = -1
+    """Zero-based first physical loop layer; -1 centers the span (extra outside layer in suffix)."""
+
     sandwich_norm: bool = False
     """If True, apply an extra `normalization`-type norm to each sublayer's output before it is
     added back to the residual stream (a.k.a. sandwich norm / post-norm), so that each layer
@@ -1431,6 +1437,31 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        from megatron.core.transformer.smelt import smelt_layer_order
+
+        if self.smelt_loop_layers or self.smelt_loop_start != -1:
+            smelt_layer_order(self.num_layers, self.smelt_loop_start, self.smelt_loop_layers)
+        if self.smelt_loop_layers:
+            unsupported = {
+                "pipeline parallelism": self.pipeline_model_parallel_size != 1,
+                "virtual pipeline parallelism": self.virtual_pipeline_model_parallel_size is not None,
+                "activation recomputation": self.recompute_granularity is not None,
+                "CUDA graphs": self.cuda_graph_impl != "none" or self.enable_cuda_graph,
+                "quantization": self.fp8 or self.fp4,
+                "CPU offloading": self.cpu_offloading,
+                "fine-grained offloading": self.fine_grained_activation_offloading,
+                "external CUDA graphs": self.external_cuda_graph,
+                "expert offloading": self.moe_use_offloading_experts,
+                "MoE communication overlap": self.overlap_moe_expert_parallel_comm,
+                "MTP": self.mtp_num_layers,
+                "carried linear-attention state": self.linear_attention_carry_state,
+                "KEEL": self.keel,
+                "fused inference residuals": self.inference_fuse_tp_communication,
+            }
+            for feature, enabled in unsupported.items():
+                if enabled:
+                    raise ValueError(f"SMELT does not yet support {feature}")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

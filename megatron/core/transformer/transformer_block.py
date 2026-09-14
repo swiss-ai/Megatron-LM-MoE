@@ -710,6 +710,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if self.config.smelt_loop_layers and inference_context is not None:
+            raise ValueError("SMELT cached inference needs separate state per visit; use full-sequence evaluation")
+        if self.config.smelt_loop_layers and extract_layer_indices:
+            raise ValueError("SMELT intermediate extraction needs explicit visit indices")
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
@@ -802,7 +806,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
-                for l_no, layer in enumerate(self.layers):
+                from megatron.core.transformer.smelt import smelt_layer_order
+
+                layer_order = smelt_layer_order(
+                    len(self.layers), self.config.smelt_loop_start, self.config.smelt_loop_layers
+                ) if self.config.smelt_loop_layers else range(len(self.layers))
+                for l_no in layer_order:
+                    layer = self.layers[l_no]
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:

@@ -160,6 +160,8 @@ def check_checkpoint_args(checkpoint_args):
         assert checkpoint_value == args_value, error_message
 
     _compare('num_layers')
+    _compare('smelt_loop_layers', default=0)
+    _compare('smelt_loop_start', default=-1)
     _compare('hidden_size')
     _compare('num_attention_heads')
     _compare('add_position_embedding', default=True)
@@ -1521,6 +1523,9 @@ def load_args_from_checkpoint(
 
     # Model args.
     _set_arg('num_layers')
+    # Old checkpoints are unlooped, even if a caller supplied SMELT flags.
+    args.smelt_loop_layers = getattr(checkpoint_args, 'smelt_loop_layers', 0)
+    args.smelt_loop_start = getattr(checkpoint_args, 'smelt_loop_start', -1)
     _set_arg('hidden_size')
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')

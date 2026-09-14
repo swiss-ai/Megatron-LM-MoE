@@ -416,6 +416,12 @@ def num_floating_point_operations(args, batch_size):
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
+        from megatron.core.transformer.smelt import smelt_layer_order
+
+        execution_order = smelt_layer_order(
+            args.num_layers, getattr(args, 'smelt_loop_start', -1),
+            getattr(args, 'smelt_loop_layers', 0),
+        )
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
         # Group Query Attention.
         if not args.group_query_attention:
@@ -423,7 +429,7 @@ def num_floating_point_operations(args, batch_size):
         # MoE.
         if args.num_experts is None:
             # Every Transformer MLP is dense.
-            num_dense_layers = args.num_layers
+            num_dense_layers = len(execution_order)
             num_moe_layers = 0
             num_experts_routed_to = 0
             last_layer_is_moe = 0
@@ -442,8 +448,8 @@ def num_floating_point_operations(args, batch_size):
                 f"expected {args.num_layers}, "
                 f"current moe layer pattern: {args.moe_layer_freq}"
             )
-            num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
-            num_dense_layers = args.num_layers - num_moe_layers
+            num_moe_layers = sum(moe_layer_pattern[i] for i in execution_order)
+            num_dense_layers = len(execution_order) - num_moe_layers
             num_experts_routed_to = args.moe_router_topk
             last_layer_is_moe = moe_layer_pattern[-1]
 
@@ -593,8 +599,11 @@ def num_floating_point_operations(args, batch_size):
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
-            num_standard_attention_layers = num_layers - num_linear_attention_layers
+            num_linear_attention_layers = sum(linear_attention_pattern[i] for i in execution_order)
+            num_standard_attention_layers = len(execution_order) - num_linear_attention_layers
+            if mtp_num_layers:
+                num_linear_attention_layers += sum(linear_attention_pattern[args.num_layers:])
+                num_standard_attention_layers += mtp_num_layers - sum(linear_attention_pattern[args.num_layers:])
 
             if args.experimental_attention_variant == "gated_delta_net":
                 # Calculate the FLOPs for the gated delta net attention.
@@ -637,9 +646,12 @@ def num_floating_point_operations(args, batch_size):
                     forward_backward_expansion_factor
                     * fma_expansion_factor
                     * (
-                        ## in proj (qk*2 + v*2 + scalar beta + vector alpha=qk_dim)
+                        ## First-stage Q/K/V + decay/output-gate bottlenecks + beta.
                         args.hidden_size
-                        * (2 * qk_dim + 2 * v_dim + num_v_heads + qk_dim)
+                        * (2 * qk_dim + v_dim + v_head_dim + num_v_heads
+                           + (v_dim if args.linear_attention_full_rank_output_gate else v_head_dim))
+                        + v_head_dim * (num_v_heads * qk_head_dim)
+                        + (0 if args.linear_attention_full_rank_output_gate else v_head_dim * v_dim)
                         ## conv1d
                         + args.linear_conv_kernel_dim
                         * (2 * qk_dim + v_dim)
@@ -660,7 +672,7 @@ def num_floating_point_operations(args, batch_size):
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
-            num_standard_attention_layers = num_layers
+            num_standard_attention_layers = len(execution_order) + mtp_num_layers
 
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
