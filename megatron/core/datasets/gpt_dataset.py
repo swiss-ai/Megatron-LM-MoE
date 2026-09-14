@@ -960,36 +960,38 @@ class GPTDataset(MegatronDataset):
         target_length = self.config.sequence_length + self.config.add_extra_token_to_sequence
         eod_token_id = self.config.tokenizer.eod
 
+        # Read every chunk's chunk_map row in one fancy-indexed access. Reading them
+        # one scalar at a time costs a document_index lookup plus four mmap reads per
+        # chunk, which dominates __getitem__ once bins hold many short documents
+        # (~80 chunks/sample on the chonk stage-1 mix).
+        rows = numpy.asarray(
+            self.chunk_map[numpy.asarray(self.document_index[doc_index_beg:doc_index_end])]
+        )
+        eod = numpy.array([eod_token_id], dtype=numpy.int64)
+        get = self.dataset.get
+
         sample_parts = []
-        document_ids = []
-        for i in range(doc_index_beg, doc_index_end):
-            virtual_id = int(self.document_index[i])
-            real_doc_id = int(self.chunk_map[virtual_id, 0])
-            chunk_start = int(self.chunk_map[virtual_id, 1])
-            chunk_len   = int(self.chunk_map[virtual_id, 2])
-            append_eod  = int(self.chunk_map[virtual_id, 3])
-
-            data = self.dataset.get(real_doc_id, offset=chunk_start, length=chunk_len)
-            if append_eod:
-                data = numpy.concatenate([data, numpy.array([eod_token_id], dtype=data.dtype)])
-            sample_parts.append(data)
-            document_ids.append(real_doc_id)
-
-        length = sum(map(len, sample_parts))
-
         # Each chunk (a whole document, or one split of an oversized document, which
-        # already carries its own EOD -- see append_eod above) is its own cu_seqlens
-        # segment for inter_document_masking.
-        document_lengths = [len(p) for p in sample_parts]
+        # carries its own EOD -- see append_eod) is its own cu_seqlens segment for
+        # inter_document_masking. The synthesized EOD is appended as its own part and
+        # concatenated once at the end, rather than re-allocating every chunk.
+        document_lengths = []
+        for real_doc_id, chunk_start, chunk_len, append_eod in rows.tolist():
+            data = get(real_doc_id, offset=chunk_start, length=chunk_len)
+            sample_parts.append(data)
+            if append_eod:
+                sample_parts.append(eod)
+            document_lengths.append(len(data) + append_eod)
 
+        length = sum(document_lengths)
         if length < target_length:
             sample_parts.append(
-                [self._pad_token_id] * (target_length - length)
+                numpy.full(target_length - length, self._pad_token_id, dtype=numpy.int64)
             )
 
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
-            numpy.array(document_ids, dtype=numpy.int64),
+            rows[:, 0].astype(numpy.int64),
             document_lengths,
         )
     def _build_document_sample_shuffle_indices(
