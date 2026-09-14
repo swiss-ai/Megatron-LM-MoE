@@ -8,7 +8,11 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KDAInferenceStateConfig,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -95,6 +99,9 @@ class StaticInferenceEngine(AbstractEngine):
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(
             self.inference_wrapped_model.model
         )
+        kda_inference_state_config = KDAInferenceStateConfig.from_model(
+            self.inference_wrapped_model.model
+        )
 
         try:
             if not legacy:
@@ -104,6 +111,7 @@ class StaticInferenceEngine(AbstractEngine):
                         max_sequence_length=original_context.max_sequence_length,
                         buffer_size_gb=buffer_size_gb,
                         mamba_inference_state_config=mamba_inference_state_config,
+                        kda_inference_state_config=kda_inference_state_config,
                         max_requests=max_batch_size,
                         num_cuda_graphs=1,
                         block_size_tokens=256,

@@ -10,6 +10,7 @@ from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core.inference.config import (
     InferenceConfig,
+    KDAInferenceStateConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
@@ -304,6 +305,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         conv_states_dtype=args.mamba_inference_conv_states_dtype,
         ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
     )
+    kda_inference_state_config = KDAInferenceStateConfig.from_model(model)
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
     # Get inference logging configuration from args
@@ -346,6 +348,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
+        kda_inference_state_config=kda_inference_state_config,
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         materialize_only_last_token_logits=(not args.return_log_probs and args.num_speculative_tokens == 0),
