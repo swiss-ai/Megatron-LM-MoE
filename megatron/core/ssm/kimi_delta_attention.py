@@ -179,6 +179,7 @@ _KDA_SUPPORTS_FUSED_BETA_SIGMOID = _chunk_kda_supports(
     "use_beta_sigmoid_in_kernel"
 )
 _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL = _chunk_kda_supports("allow_neg_eigval")
+_KDA_SUPPORTS_CU_SEQLENS_CPU = _chunk_kda_supports("cu_seqlens_cpu")
 
 # Needs both an implementation (only builds with a fused gate name the flag) and
 # a way in for A_log, which FLA 0.5.x takes through **kwargs -- so A_log is
@@ -1119,6 +1120,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         }
         if cu_seqlens is not None:
             kda_kwargs["cu_seqlens"] = cu_seqlens
+            if _KDA_SUPPORTS_CU_SEQLENS_CPU:
+                # Lets FLA build its chunk index without a device sync.
+                kda_kwargs["cu_seqlens_cpu"] = self._cu_seqlens_cpu_for(cu_seqlens)
         if self._use_fused_decay_gate:
             kda_kwargs["use_gate_in_kernel"] = True
             kda_kwargs["A_log"] = A_log_local_cp

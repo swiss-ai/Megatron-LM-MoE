@@ -123,6 +123,7 @@ class GatedDeltaNet(MegatronModule):
     # Shared by every layer (subclasses included): one entry per cu_seqlens object.
     _cu_seqlens_int64_cache: deque = deque(maxlen=4)
     _seq_idx_cache: deque = deque(maxlen=4)
+    _cu_seqlens_cpu_cache: deque = deque(maxlen=4)
 
     def __init__(
         self,
@@ -440,6 +441,24 @@ class GatedDeltaNet(MegatronModule):
         converted = cu_seqlens.to(torch.int64)
         cls._cu_seqlens_int64_cache.append((cu_seqlens, converted))
         return converted
+
+    @classmethod
+    def _cu_seqlens_cpu_for(cls, cu_seqlens: Tensor) -> Tensor:
+        """Host-side copy of `cu_seqlens`, reusing the same tensor across layers.
+
+        The FLA kernels derive their chunk index from `cu_seqlens`; from a CUDA
+        tensor that costs a device sync per call (see `_segmented_arange` in
+        fla/ops/utils/index.py), which they let callers avoid by passing
+        `cu_seqlens_cpu`. One copy per microbatch is shared by every KDA layer.
+        """
+        if cu_seqlens.device.type == "cpu":
+            return cu_seqlens
+        for source, host in cls._cu_seqlens_cpu_cache:
+            if source is cu_seqlens:
+                return host
+        host = cu_seqlens.detach().to("cpu", non_blocking=False)
+        cls._cu_seqlens_cpu_cache.append((cu_seqlens, host))
+        return host
 
     @classmethod
     def _seq_idx_for_cu_seqlens(cls, cu_seqlens: Tensor) -> Tensor:
