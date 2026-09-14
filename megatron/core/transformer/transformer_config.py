@@ -559,6 +559,12 @@ class TransformerConfig(ModelParallelConfig):
     SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
     gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
 
+    linear_attention_cp_impl: Literal['a2a', 'kcp'] = 'a2a'
+    """Context-parallel scheme of the linear-attention layers. 'a2a' turns the sequence shard
+    into a head shard with an all-to-all around the kernel, so the per-TP-rank head counts must
+    divide the CP size. 'kcp' (KDA only) keeps tokens sharded and merges the per-rank recurrent
+    states through fla.ops.cp, with no head-count constraint."""
+
     linear_attention_full_rank_output_gate: bool = False
     """If True, the KDA output gate is a full-rank projection (hidden -> v_dim) fused into in_proj
     and sharded on value heads, instead of the reference low-rank bottleneck (hidden ->
@@ -1560,24 +1566,29 @@ class TransformerConfig(ModelParallelConfig):
                 self.linear_num_value_heads % self.tensor_model_parallel_size == 0
             ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
 
-            # Check context parallelism compatibility. GDN/KDA's CP all-to-all
+            # Check context parallelism compatibility. The a2a scheme
             # (megatron/core/ssm/gated_delta_net.py) shards Q/K/V/gate/beta/alpha
             # along the head dimension across CP ranks, so the per-TP-rank head
             # counts must themselves divide evenly across CP ranks.
-            assert (
-                self.linear_num_key_heads // self.tensor_model_parallel_size
-            ) % self.context_parallel_size == 0, (
-                "linear_num_key_heads // tensor_model_parallel_size "
-                f"({self.linear_num_key_heads // self.tensor_model_parallel_size}) must be a "
-                f"multiple of context_parallel_size ({self.context_parallel_size})."
-            )
-            assert (
-                self.linear_num_value_heads // self.tensor_model_parallel_size
-            ) % self.context_parallel_size == 0, (
-                "linear_num_value_heads // tensor_model_parallel_size "
-                f"({self.linear_num_value_heads // self.tensor_model_parallel_size}) must be a "
-                f"multiple of context_parallel_size ({self.context_parallel_size})."
-            )
+            if self.linear_attention_cp_impl == 'kcp':
+                assert (
+                    self.experimental_attention_variant == 'kda'
+                ), "linear_attention_cp_impl='kcp' is only implemented for KDA."
+            else:
+                assert (
+                    self.linear_num_key_heads // self.tensor_model_parallel_size
+                ) % self.context_parallel_size == 0, (
+                    "linear_num_key_heads // tensor_model_parallel_size "
+                    f"({self.linear_num_key_heads // self.tensor_model_parallel_size}) must be a "
+                    f"multiple of context_parallel_size ({self.context_parallel_size})."
+                )
+                assert (
+                    self.linear_num_value_heads // self.tensor_model_parallel_size
+                ) % self.context_parallel_size == 0, (
+                    "linear_num_value_heads // tensor_model_parallel_size "
+                    f"({self.linear_num_value_heads // self.tensor_model_parallel_size}) must be "
+                    f"a multiple of context_parallel_size ({self.context_parallel_size})."
+                )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

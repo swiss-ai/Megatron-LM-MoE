@@ -20,6 +20,7 @@
 # Megatron's distributed conventions.
 
 import copy
+from collections import deque
 import inspect
 import logging
 import math
@@ -54,6 +55,7 @@ from megatron.core.ssm.gated_delta_net import (
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
+from megatron.core.ssm.cp_relayout import build_relayout_plan, relayout
 from megatron.core.utils import deprecate_inference_params
 from megatron.core import tensor_parallel
 
@@ -208,6 +210,15 @@ def _fused_kda_gate_supports_lower_bound() -> bool:
 
 
 _KDA_FUSED_GATE_SUPPORTS_LOWER_BOUND = _fused_kda_gate_supports_lower_bound()
+
+# fla.ops.cp: token-sharded context parallelism for the delta rule (KCP).
+try:
+    from fla.ops.cp import build_cp_context
+
+    HAVE_FLA_CP = _chunk_kda_supports("cp_context")
+except ImportError:
+    build_cp_context = None
+    HAVE_FLA_CP = False
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +478,14 @@ class KimiDeltaAttention(GatedDeltaNet):
         # installed FLA cannot. No clamp and no forced un-fusing.
         self._safe_gate = self.config.linear_attention_safe_output_gate
         self._gate_lower_bound = self.config.linear_attention_safe_output_gate_lower_bound
+        self._kcp = self.config.linear_attention_cp_impl == 'kcp'
+        if self._kcp and not HAVE_FLA_CP:
+            raise RuntimeError(
+                "linear_attention_cp_impl='kcp' needs a flash-linear-attention with fla.ops.cp."
+            )
+        # KCP shards tokens and keeps every head local; the a2a scheme splits heads over CP.
+        self.cp_shard = 1 if self._kcp else self.cp_size
+        self._kcp_unpacked = None
         if self._safe_gate and self._use_fused_decay_gate and not _KDA_SUPPORTS_SAFE_GATE_IN_KERNEL:
             logger.warning(
                 "linear_attention_safe_output_gate is on but the installed "
@@ -702,6 +721,49 @@ class KimiDeltaAttention(GatedDeltaNet):
         g = self._activate_decay_torch(alpha, A_log_local_cp, dt_bias_local_cp)
         return g if self._decay_dtype is None else g.to(self._decay_dtype)
 
+    def _local_cp(self, param, split_sections=None):
+        """This rank's head slice of a parameter under a2a CP; the whole parameter under KCP."""
+        if self._kcp:
+            return param
+        return get_parameter_local_cp(
+            param, dim=0, cp_group=self.pg_collection.cp, split_sections=split_sections
+        )
+
+    # Shared by every layer: one relayout plan and FLA CP context per cu_seqlens object.
+    _kcp_cache: deque = deque(maxlen=4)
+
+    def _kcp_layout(self, hidden_states, packed_seq_params, seq_len, batch):
+        """Relayout plan and FLA CP context for this batch, built on the host once per batch."""
+        device = hidden_states.device
+        total = seq_len * self.sp_size * self.cp_size
+        if packed_seq_params is None:
+            key = (seq_len, batch, device)
+            if self._kcp_unpacked is not None and self._kcp_unpacked[0] == key:
+                return self._kcp_unpacked[1:]
+            cu_seqlens_cpu = torch.arange(batch + 1, dtype=torch.int64) * total
+            cu_seqlens = cu_seqlens_cpu.to(device)
+        else:
+            cu_seqlens = self._resolve_packed_cu_seqlens(packed_seq_params, total, batch)
+            for source, plan, cp_context in self._kcp_cache:
+                if source is cu_seqlens:
+                    return plan, cp_context
+            cu_seqlens_cpu = self._cu_seqlens_cpu_for(cu_seqlens)
+        cp_group, tp_group = self.pg_collection.cp, self.pg_collection.tp
+        group = self.pg_collection.tp_cp if self.sp_size > 1 else cp_group
+        assert group.rank() == cp_group.rank() * self.sp_size + (tp_group.rank() if self.sp_size > 1 else 0)
+        plan = build_relayout_plan(cu_seqlens_cpu, self.cp_size, self.sp_size, batch, group, device)
+        cp_context = build_cp_context(
+            cu_seqlens,
+            group=cp_group,
+            conv1d_kernel_size=self.conv_kernel_dim,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+        )
+        if packed_seq_params is None:
+            self._kcp_unpacked = (key, plan, cp_context)
+        else:
+            self._kcp_cache.append((cu_seqlens, plan, cp_context))
+        return plan, cp_context
+
     @jit_fuser
     def _activate_decay_torch(self, alpha, A_log_local_cp, dt_bias_local_cp):
         """Torch fallback for `_activate_decay`; `alpha` already [b, s, h, d_k]."""
@@ -721,6 +783,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         seq_len: int,
         packed_seq_params=None,
         cu_seqlens=None,
+        cp_context=None,
     ):
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -739,11 +802,12 @@ class KimiDeltaAttention(GatedDeltaNet):
                     seq_len=seq_len,
                     packed_seq_params=packed_seq_params,
                     cu_seqlens=cu_seqlens,
+                    cp_context=cp_context,
                 ),
                 projected,
             )
         return self._post_proj_to_attn_inputs(
-            projected, batch, seq_len, packed_seq_params, cu_seqlens
+            projected, batch, seq_len, packed_seq_params, cu_seqlens, cp_context
         )
 
     def _post_proj_to_attn_inputs(
@@ -753,6 +817,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         seq_len: int,
         packed_seq_params=None,
         cu_seqlens=None,
+        cp_context=None,
     ):
         """In_proj output -> chunk_kda inputs; the region `qkv_fine` recomputes."""
         num_v_heads_tp = self.num_value_heads // self.tp_size
@@ -829,36 +894,38 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Keep the logical outputs separate through CP. The CP helper already
         # communicates split sections independently, so packing qkv/gate/beta/
-        # alpha into a temporary qkvzba tensor only adds a full-size copy.
-        qkv = tensor_a2a_cp2hp(
-            qkv,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-            packed_seq_params=packed_seq_params,
-        )
-        gate = tensor_a2a_cp2hp(
-            gate,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            packed_seq_params=packed_seq_params,
-        )
-        beta = tensor_a2a_cp2hp(
-            beta,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            packed_seq_params=packed_seq_params,
-        )
-        alpha = tensor_a2a_cp2hp(
-            alpha,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            packed_seq_params=packed_seq_params,
-        )
+        # alpha into a temporary qkvzba tensor only adds a full-size copy. KCP
+        # already holds a contiguous token slice with every head, so it skips this.
+        if not self._kcp:
+            qkv = tensor_a2a_cp2hp(
+                qkv,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+                packed_seq_params=packed_seq_params,
+            )
+            gate = tensor_a2a_cp2hp(
+                gate,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+            )
+            beta = tensor_a2a_cp2hp(
+                beta,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+            )
+            alpha = tensor_a2a_cp2hp(
+                alpha,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+            )
 
         # Transpose separately: s b x --> b s x.
         qkv = qkv.transpose(0, 1)
@@ -871,23 +938,25 @@ class KimiDeltaAttention(GatedDeltaNet):
         # Convolution on qkv (Q, K, V all per-token for KDA — no DeltaProduct).
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight, dim=0, cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
+        conv1d_weight = self._local_cp(self.conv1d.weight, qkv_channels_split_sections)
         conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias, dim=0, cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
-            ) if self.conv_bias else None
+            self._local_cp(self.conv1d.bias, qkv_channels_split_sections)
+            if self.conv_bias else None
         )
-        if self.config.deterministic_mode:
+        if cp_context is not None:
+            # FLA exchanges the (kernel - 1)-token halo across the CP boundary and
+            # takes the local cu_seqlens from the context.
+            qkv, _ = causal_conv1d(
+                x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
+                activation=self.activation, cp_context=cp_context,
+            )
+        elif self.config.deterministic_mode:
             qkv = qkv.transpose(1, 2).contiguous()
             conv_out = F.conv1d(
                 input=qkv, weight=conv1d_weight, bias=conv1d_bias,
                 stride=self.conv1d.stride, padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // self.cp_shard,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)
@@ -932,17 +1001,29 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
-
         if inference_context is not None:
             raise NotImplementedError("KDA does not support inference for now.")
         assert self.n_hh == 1, "KDA does not have a DeltaProduct (n_householder>1) variant."
 
-        # Cross-document masking. The conv and chunk_kda both run on the full
-        # sequence (SP undone by in_proj's all-gather, CP by the cp2hp all-to-all),
-        # so the dataloader's global cu_seqlens is what both kernels want.
-        cu_seqlens = self._resolve_packed_cu_seqlens(packed_seq_params, seq_len, batch)
+        input_shape = hidden_states.shape
+        seq_len, batch, _ = input_shape
+        plan = cp_context = None
+        if self._kcp and self.cp_size > 1:
+            if self.initial_state_param is not None or self._carry_enabled:
+                raise NotImplementedError("KCP does not support a recurrent initial state.")
+            # Every rank takes one contiguous slice of the packed sequence, batch folded
+            # in; the kernels then run on the local slice and FLA merges the per-rank
+            # recurrent states.
+            plan, cp_context = self._kcp_layout(hidden_states, packed_seq_params, seq_len, batch)
+            hidden_states = relayout(hidden_states.reshape(-1, 1, input_shape[-1]), plan)
+            seq_len, batch = hidden_states.shape[:2]
+            cu_seqlens = cp_context.cu_seqlens
+        seq_len = seq_len * self.sp_size * self.cp_shard
+        if cp_context is None:
+            # Cross-document masking. The conv and chunk_kda both run on the full
+            # sequence (SP undone by in_proj's all-gather, CP by the cp2hp all-to-all),
+            # so the dataloader's global cu_seqlens is what both kernels want.
+            cu_seqlens = self._resolve_packed_cu_seqlens(packed_seq_params, seq_len, batch)
         if cu_seqlens is not None:
             if self.config.deterministic_mode:
                 raise NotImplementedError(
@@ -973,27 +1054,24 @@ class KimiDeltaAttention(GatedDeltaNet):
                     seq_len=seq_len,
                     packed_seq_params=packed_seq_params,
                     cu_seqlens=cu_seqlens,
+                    cp_context=cp_context,
                 ),
                 hidden_states,
             )
         else:
             query, key, value, gate, beta, alpha = self._in_proj_to_attn_inputs(
-                hidden_states, batch, seq_len, packed_seq_params, cu_seqlens
+                hidden_states, batch, seq_len, packed_seq_params, cu_seqlens, cp_context
             )
 
         # FLA computes the vector decay from raw alpha, A_log, and dt_bias inside
         # chunk_kda. Newer FLA versions can also fuse beta.float().sigmoid().
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(
-            self.A_log, dim=0, cp_group=self.pg_collection.cp
-        )
+        A_log_local_cp = self._local_cp(self.A_log)
         # Stored flat but CP-sharded per head: view as [h, d_k] to slice, then
         # flatten straight back -- every consumer wants it flat, and 0.4's
         # autograd Function rejects a [h, d_k] grad.
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias.view(self.num_v_heads_local_tp, self.key_head_dim),
-            dim=0,
-            cp_group=self.pg_collection.cp,
+        dt_bias_local_cp = self._local_cp(
+            self.dt_bias.view(self.num_v_heads_local_tp, self.key_head_dim)
         ).reshape(-1)
         nvtx_range_pop(suffix="g_and_beta")
 
@@ -1017,7 +1095,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             initial_state = None
 
         log_state_stats = os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1"
-        need_final_state = self._carry_enabled or log_state_stats
+        need_final_state = (self._carry_enabled or log_state_stats) and cp_context is None
 
         # chunk_kda requires initial_state in float32 (asserted inside FLA).
         initial_state_f32 = initial_state.float() if initial_state is not None else None
@@ -1027,7 +1105,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         # state must escape, since the bookkeeping below must not run twice.
         core_args = (query, key, value, gate, beta, alpha,
                      A_log_local_cp, dt_bias_local_cp,
-                     initial_state_f32, need_final_state, cu_seqlens)
+                     initial_state_f32, need_final_state, cu_seqlens, cp_context)
         if self._recompute_core and torch.is_grad_enabled() and not need_final_state:
             norm_out, last_recurrent_state = torch.utils.checkpoint.checkpoint(
                 self._kda_core, *core_args, use_reentrant=False,
@@ -1077,21 +1155,24 @@ class KimiDeltaAttention(GatedDeltaNet):
         # Transpose back to sbhd, CP a2a HP→CP, output projection.
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
-        norm_out = tensor_a2a_hp2cp(
-            norm_out,
-            seq_dim=0,
-            head_dim=-1,
-            cp_group=self.pg_collection.cp,
-            packed_seq_params=packed_seq_params,
-        )
+        if not self._kcp:
+            norm_out = tensor_a2a_hp2cp(
+                norm_out,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+            )
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+        if plan is not None:
+            out = relayout(out, plan, inverse=True).view(input_shape)
         return out, out_bias
 
     def _kda_core(self, query, key, value, gate, beta, alpha,
                   A_log_local_cp, dt_bias_local_cp,
-                  initial_state_f32, need_final_state, cu_seqlens=None):
+                  initial_state_f32, need_final_state, cu_seqlens=None, cp_context=None):
         """chunk_kda -> gated norm: the region that frees what the kernel saves.
 
         Kept self-contained so it can be handed to `torch.utils.checkpoint`
@@ -1118,7 +1199,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             "output_final_state": need_final_state,
             "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
         }
-        if cu_seqlens is not None:
+        if cp_context is not None:
+            kda_kwargs["cp_context"] = cp_context
+        elif cu_seqlens is not None:
             kda_kwargs["cu_seqlens"] = cu_seqlens
             if _KDA_SUPPORTS_CU_SEQLENS_CPU:
                 # Lets FLA build its chunk index without a device sync.
@@ -1184,7 +1267,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         """
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [2 * self.qk_dim_local_tp // self.cp_shard, self.v_dim_local_tp // self.cp_shard],
             dim=-1,
         )
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
@@ -1199,7 +1282,7 @@ class KimiDeltaAttention(GatedDeltaNet):
 
                 query_key = l2norm(query_key)
 
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_shard
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         if self.num_value_heads // self.num_key_heads > 1:

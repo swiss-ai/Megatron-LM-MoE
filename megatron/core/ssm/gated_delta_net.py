@@ -177,6 +177,8 @@ class GatedDeltaNet(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.cp_size = self.pg_collection.cp.size()
+        # Degree by which heads are split over CP: cp_size for a2a, 1 for KCP.
+        self.cp_shard = self.cp_size
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -531,7 +533,7 @@ class GatedDeltaNet(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        seq_len = seq_len * self.sp_size * self.cp_shard
 
         if inference_context is not None:
             assert (
@@ -593,10 +595,10 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp + n_hh * self.qk_dim_local_tp + n_hh * self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                n_hh * num_v_heads_tp // self.cp_size,
-                num_v_heads_tp // self.cp_size,
+                (self.qk_dim_local_tp + n_hh * self.qk_dim_local_tp + n_hh * self.v_dim_local_tp) // self.cp_shard,
+                self.v_dim_local_tp // self.cp_shard,
+                n_hh * num_v_heads_tp // self.cp_shard,
+                num_v_heads_tp // self.cp_shard,
             ],
             dim=-1,
         )
@@ -641,7 +643,7 @@ class GatedDeltaNet(MegatronModule):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // self.cp_shard,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
@@ -663,13 +665,13 @@ class GatedDeltaNet(MegatronModule):
         # K and V into the seq dim, normalize Q and K independently, and GQA-expand.
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         if n_hh > 1:
-            qk_local = self.qk_dim_local_tp // self.cp_size
-            v_local = self.v_dim_local_tp // self.cp_size
+            qk_local = self.qk_dim_local_tp // self.cp_shard
+            v_local = self.v_dim_local_tp // self.cp_shard
             q_part, k_part, v_part = torch.split(
                 qkv, [qk_local, n_hh * qk_local, n_hh * v_local], dim=-1,
             )
-            num_qk_heads_local = self.num_key_heads // self.tp_size // self.cp_size
-            num_v_heads_local = self.num_value_heads // self.tp_size // self.cp_size
+            num_qk_heads_local = self.num_key_heads // self.tp_size // self.cp_shard
+            num_v_heads_local = self.num_value_heads // self.tp_size // self.cp_shard
             # Q stays per-token: [b, s, qk_local] -> [b, s, num_qk_heads_local, key_head_dim]
             query = q_part.reshape(batch, seq_len, num_qk_heads_local, self.key_head_dim).contiguous()
             # K_n: [b, s, n*qk_local] -> [b, s, n, num_qk_heads_local, d_k] -> [b, s*n, num_qk_heads_local, d_k]
@@ -875,7 +877,7 @@ class GatedDeltaNet(MegatronModule):
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [2 * self.qk_dim_local_tp // self.cp_shard, self.v_dim_local_tp // self.cp_shard],
             dim=-1,
         )
 
@@ -896,7 +898,7 @@ class GatedDeltaNet(MegatronModule):
             value = l2norm(value.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_shard
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
