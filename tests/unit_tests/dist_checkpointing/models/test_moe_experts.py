@@ -20,7 +20,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLPSubmodules,
+    OffloadingExpertsMLP,
+    SequentialMLP,
+    TEGroupedMLP,
+)
 from megatron.core.transformer.moe.moe_layer import MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.spec_utils import get_submodules
@@ -85,9 +90,15 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         model = SequentialMLP(
             num_local_experts, transformer_config, experts_submodules, pg_collection
         )
+    elif expert_type == 'offloading':
+        transformer_config.gradient_accumulation_fusion = True
+        transformer_config.moe_use_offloading_experts = True
+        transformer_config.moe_offloading_num_chunks = 1
+        model = OffloadingExpertsMLP(num_local_experts, transformer_config, pg_collection)
     else:
         raise ValueError(
-            'expert_type can only be one of ["sequential", "te_sequential", "te_grouped"]'
+            'expert_type can only be one of '
+            '["sequential", "te_sequential", "te_grouped", "offloading"]'
         )
     return model
 
@@ -98,10 +109,19 @@ if is_te_min_version("1.7.0.dev0"):
     expert_type.append('te_sequential')
     src_dest_expert_type.append(('sequential', 'te_sequential'))
     src_dest_expert_type.append(('te_sequential', 'sequential'))
+legacy_offloading_dest_type = ['sequential']
+canonical_offloading_pairs = [
+    ('sequential', 'offloading'),
+    ('offloading', 'sequential'),
+]
 if is_te_min_version("1.9.0.dev0"):
     expert_type.append('te_grouped')
     src_dest_expert_type.append(('te_sequential', 'te_grouped'))
     src_dest_expert_type.append(('te_grouped', 'te_sequential'))
+    legacy_offloading_dest_type.append('te_grouped')
+    canonical_offloading_pairs.extend(
+        [('te_grouped', 'offloading'), ('offloading', 'te_grouped')]
+    )
 
 
 class TestExpertLayerReconfiguration:
@@ -110,6 +130,84 @@ class TestExpertLayerReconfiguration:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("src_type,dest_type", canonical_offloading_pairs)
+    @pytest.mark.parametrize("use_glu", [False, True])
+    @pytest.mark.parametrize("singleton_local_shards", [False, True])
+    def test_offloading_checkpoint_uses_canonical_expert_schema(
+        self, tmp_path_dist_ckpt, src_type, dest_type, use_glu, singleton_local_shards
+    ):
+        metadata = {
+            'singleton_local_shards': singleton_local_shards,
+            'moe_expert_checkpoint_schema': 'sequential',
+            'moe_expert_checkpoint_has_te_extra_state': False,
+        }
+        Utils.initialize_model_parallel(1, 1)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_canonical_offloading') as ckpt_dir:
+            source = initialize_expert_layer(1, use_glu, expert_type=src_type)
+            save(source.sharded_state_dict(metadata=metadata), ckpt_dir)
+            expected = load_plain_tensors(ckpt_dir)
+            assert any('linear_fc1.weight' in key for key in expected)
+            assert not any('experts.weight1' in key for key in expected)
+            Utils.destroy_model_parallel()
+
+            if "dp_cp_group" in metadata:
+                del metadata["dp_cp_group"]
+            Utils.initialize_model_parallel(1, 1)
+            destination = initialize_expert_layer(2, use_glu, expert_type=dest_type)
+            loaded = load(destination.sharded_state_dict(metadata=metadata), ckpt_dir)
+            destination.load_state_dict(loaded, strict=False)
+
+            roundtrip_dir = ckpt_dir / 'roundtrip'
+            roundtrip_dir.mkdir()
+            save(destination.sharded_state_dict(metadata=metadata), roundtrip_dir)
+            actual = load_plain_tensors(roundtrip_dir)
+            diffs = diff(expected, actual)
+            assert not any(map(bool, diffs)), diffs
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dest_type", legacy_offloading_dest_type)
+    @pytest.mark.parametrize("use_glu", [False, True])
+    @pytest.mark.parametrize("singleton_local_shards", [False, True])
+    def test_legacy_offloading_checkpoint_loads_into_canonical_experts(
+        self, tmp_path_dist_ckpt, dest_type, use_glu, singleton_local_shards
+    ):
+        metadata = {
+            'singleton_local_shards': singleton_local_shards,
+            'moe_expert_checkpoint_schema': 'legacy_offloading',
+            'moe_expert_checkpoint_has_te_extra_state': False,
+        }
+        Utils.initialize_model_parallel(1, 1)
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_legacy_offloading') as ckpt_dir:
+            source = initialize_expert_layer(1, use_glu, expert_type='offloading')
+            expected_fc1 = [
+                getattr(source, f'weight1_expert_{i}').detach().t().contiguous()
+                for i in range(source.num_local_experts)
+            ]
+            expected_fc2 = [
+                getattr(source, f'weight2_expert_{i}').detach().t().contiguous()
+                for i in range(source.num_local_experts)
+            ]
+            save(source.sharded_state_dict(metadata=metadata), ckpt_dir)
+            Utils.destroy_model_parallel()
+
+            if "dp_cp_group" in metadata:
+                del metadata["dp_cp_group"]
+            Utils.initialize_model_parallel(1, 1)
+            destination = initialize_expert_layer(2, use_glu, expert_type=dest_type)
+            loaded = load(destination.sharded_state_dict(metadata=metadata), ckpt_dir)
+            destination.load_state_dict(loaded, strict=False)
+
+            for i in range(destination.num_local_experts):
+                if dest_type == 'te_grouped':
+                    actual_fc1 = getattr(destination.linear_fc1, f'weight{i}')
+                    actual_fc2 = getattr(destination.linear_fc2, f'weight{i}')
+                else:
+                    actual_fc1 = destination.local_experts[i].linear_fc1.weight
+                    actual_fc2 = destination.local_experts[i].linear_fc2.weight
+                assert torch.equal(actual_fc1.cpu(), expected_fc1[i].cpu())
+                assert torch.equal(actual_fc2.cpu(), expected_fc2[i].cpu())
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -262,8 +360,14 @@ class TestExpertLayerReconfiguration:
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         metadata = {'singleton_local_shards': singleton_local_shards}
+        if 'offloading' in (src_module, dest_module):
+            metadata['moe_expert_checkpoint_schema'] = 'sequential'
+            metadata['moe_expert_checkpoint_has_te_extra_state'] = False
         # Save checkpoint A
-        Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
+        src_parallel_kwargs = {'expert_model_parallel_size': src_exp}
+        if src_module == 'offloading':
+            src_parallel_kwargs['expert_tensor_parallel_size'] = 1
+        Utils.initialize_model_parallel(src_tp, src_pp, **src_parallel_kwargs)
         with (
             TempNamedDir(
                 tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_A'
@@ -283,7 +387,10 @@ class TestExpertLayerReconfiguration:
             if "dp_cp_group" in metadata.keys():
                 del metadata["dp_cp_group"]
 
-            Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
+            dest_parallel_kwargs = {'expert_model_parallel_size': dest_exp}
+            if dest_module == 'offloading':
+                dest_parallel_kwargs['expert_tensor_parallel_size'] = 1
+            Utils.initialize_model_parallel(dest_tp, dest_pp, **dest_parallel_kwargs)
             model_B = initialize_expert_layer(1, use_glu, expert_type=dest_module)
             load_strategy = None
             state_dict = load(
@@ -304,6 +411,29 @@ class TestExpertLayerReconfiguration:
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
             Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(Utils.world_size < 4, reason="EP/ETP resharding test requires four ranks")
+    @pytest.mark.parametrize(
+        "src_module,dest_module,src_ep,dest_ep",
+        [
+            ('offloading', 'sequential', 1, 2),
+            ('sequential', 'offloading', 2, 1),
+        ],
+    )
+    def test_offloading_checkpoint_reshards_across_ep_and_expert_tp(
+        self, tmp_path_dist_ckpt, src_module, dest_module, src_ep, dest_ep
+    ):
+        """Reshard between offloading ETP=1 and Sequential ETP=TP=2."""
+        self.test_sequential_grouped_mlp_interchangeable(
+            tmp_path_dist_ckpt,
+            src_tp_pp_exp=(2, 1, src_ep),
+            dest_tp_pp_exp=(2, 1, dest_ep),
+            use_glu=True,
+            src_module=src_module,
+            dest_module=dest_module,
+            singleton_local_shards=False,
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

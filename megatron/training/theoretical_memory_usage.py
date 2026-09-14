@@ -65,6 +65,16 @@ def compute_weight_and_optimizer_memory(args, verbose=False, config=None):
     # RMSNorm does not have bias, but LayerNorm has.
     norm_size = 1 if args.normalization == "RMSNorm" else 2
 
+    standard_self_attn_term = (
+        2
+        * args.hidden_size
+        * args.hidden_size
+        * (
+            (1 + (args.num_query_groups / args.num_attention_heads))
+            * query_projection_to_hidden_size_ratio
+        )
+    )
+    mtp_self_attn_term = standard_self_attn_term
     if args.multi_latent_attention:
         assert not args.group_query_attention
         if args.q_lora_rank is None:
@@ -84,20 +94,70 @@ def compute_weight_and_optimizer_memory(args, verbose=False, config=None):
             ## o proj
             + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
         )
-    else:
-        self_attn_term = (
-            2
-            * args.hidden_size
-            * args.hidden_size
-            * (
-                # Attention.
-                (
-                    (1 + (args.num_query_groups / args.num_attention_heads))
-                    * query_projection_to_hidden_size_ratio
-                )
-            )
+        mtp_self_attn_term = self_attn_term
+    elif config.experimental_attention_variant == "kda":
+        # NOTE: this is just an estimation based on the parameters, so it will probably be somewhat far of the real memory usage.
+        qk_head_dim = config.linear_key_head_dim
+        v_head_dim = config.linear_value_head_dim
+        num_qk_heads = config.linear_num_key_heads
+        num_v_heads = config.linear_num_value_heads
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        alpha_dim = qk_head_dim * num_v_heads
+        low_rank_dim = v_head_dim
+        output_gate_in_proj_dim = (
+            v_dim if config.linear_attention_full_rank_output_gate else low_rank_dim
         )
+        in_proj_dim = (
+            2 * qk_dim
+            + v_dim
+            + low_rank_dim
+            + output_gate_in_proj_dim
+            + num_v_heads
+        )
+        kda_self_attn_term = (
+            # Projection and convolution weights.
+            args.hidden_size * in_proj_dim
+            + low_rank_dim * alpha_dim
+            + (
+                0
+                if config.linear_attention_full_rank_output_gate
+                else low_rank_dim * v_dim + v_dim  # gate_out_proj weight and bias
+            )
+            + config.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+            + args.hidden_size * v_dim
+            # Decay parameters and output norm.
+            + alpha_dim
+            + num_v_heads
+            + norm_size * v_head_dim
+        )
+        if config.linear_attention_qk_norm == "rmsnorm":
+            kda_self_attn_term += qk_head_dim
+        if config.linear_attention_beta_bias_init != 0.0:
+            kda_self_attn_term += num_v_heads
+        if config.linear_attention_learnable_initial_state:
+            kda_self_attn_term += num_v_heads * qk_head_dim * v_head_dim
 
+        if isinstance(config.linear_attention_freq, int):
+            linear_attention_pattern = [
+                (i + 1) % config.linear_attention_freq != 0 for i in range(args.num_layers)
+            ]
+        else:
+            linear_attention_pattern = config.linear_attention_freq
+            assert len(linear_attention_pattern) == args.num_layers
+        num_kda_layers = sum(linear_attention_pattern)
+        num_standard_attention_layers = args.num_layers - num_kda_layers
+        self_attn_term = (
+            num_kda_layers * kda_self_attn_term
+            + num_standard_attention_layers * standard_self_attn_term
+        ) / args.num_layers
+        mtp_self_attn_term = (
+            kda_self_attn_term
+            if linear_attention_pattern[-1]
+            else standard_self_attn_term
+        )
+    else:
+        self_attn_term = standard_self_attn_term
     num_parameters_in_transformer_layer_dense = (
         2
         * args.hidden_size
@@ -159,6 +219,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False, config=None):
     num_parameters_in_mtp_block = (
         num_parameters_in_transformer_layer_dense * mtp_num_dense_layers
         + num_parameters_in_transformer_layer_moe * mtp_num_moe_layers
+        + (mtp_self_attn_term - self_attn_term) * (args.mtp_num_layers or 0)
     )
     num_total_parameters = (
         num_parameters_in_transformer_block

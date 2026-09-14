@@ -452,6 +452,12 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
+    if getattr(args, 'moe_use_offloading_experts', False):
+        # OffloadingExpertsMLP now serializes weights in the canonical Sequential/TE schema.
+        # The marker distinguishes these checkpoints from older offloading checkpoints, whose
+        # args also enable offloading but whose tensor keys are experts.weight1/weight2.
+        metadata['moe_expert_checkpoint_schema'] = 'sequential'
+        metadata['moe_expert_checkpoint_has_te_extra_state'] = False
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1812,6 +1818,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Ensure we have a dict before updating to avoid NoneType AttributeError.
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
+        if (
+            getattr(ckpt_args, 'moe_use_offloading_experts', False)
+            and 'moe_expert_checkpoint_schema' not in sharded_sd_metadata
+        ):
+            # Pre-canonical offloading checkpoints used experts.weight1/weight2 in [in, out]
+            # orientation. Expert modules consume this marker to request that schema and
+            # transpose it into their runtime layout.
+            sharded_sd_metadata['moe_expert_checkpoint_schema'] = 'legacy_offloading'
+            sharded_sd_metadata['moe_expert_checkpoint_has_te_extra_state'] = False
         sharded_sd_metadata["dp_cp_group"] = dp_cp_group
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
