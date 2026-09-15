@@ -679,6 +679,15 @@ def num_floating_point_operations(args, batch_size):
             + standard_self_attn_term * num_standard_attention_layers
         )
 
+        # Router logits use every expert, even though the FFN executes only top-k.
+        router_expert_evaluations = (args.num_experts or 0) * num_moe_layers
+        if getattr(args, 'moe_tie_adjacent_experts', False):
+            from megatron.core.transformer.moe.adjacent_experts import adjacent_expert_pairs
+
+            router_expert_evaluations += args.num_experts * 2 * len(
+                adjacent_expert_pairs(args.num_layers, args.moe_layer_freq)
+            )
+
         total_floating_point_operations = (
             batch_size
             * args.seq_length
@@ -713,6 +722,7 @@ def num_floating_point_operations(args, batch_size):
                 )
                 # Self Attention
                 + self_attn_term
+                + 6 * args.hidden_size * router_expert_evaluations
                 # MTP norms and proj
                 + forward_backward_expansion_factor
                 * fma_expansion_factor

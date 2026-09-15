@@ -1189,6 +1189,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             name_to_param = {}
             for model_chunk in self.model_chunks:
                 _name_to_param = dict(model_chunk.named_parameters())
+                if getattr(model_chunk.config, 'moe_tie_adjacent_experts', False):
+                    # EP offsets differ between doubled pairs and unpaired tails.
+                    by_expert_count = {}
+                    for name, parameter in _name_to_param.items():
+                        count = model_chunk.config.num_moe_experts
+                        if '.experts.' in name:
+                            owner_path = name.split('.experts.', 1)[0]
+                            count = model_chunk.get_submodule(owner_path).config.num_moe_experts
+                        by_expert_count.setdefault(count, {})[name] = parameter
+                    _name_to_param = {}
+                    for count, parameters in by_expert_count.items():
+                        _name_to_param.update(handle_experts_in_state_dict(parameters, count))
                 common_keys = name_to_param.keys() & _name_to_param.keys()
                 if common_keys:
                     raise ValueError(
@@ -1197,7 +1209,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                 name_to_param.update(_name_to_param)
             num_experts = self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
-            name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
+            if not self.model_chunks or not getattr(
+                self.model_chunks[0].config, 'moe_tie_adjacent_experts', False
+            ):
+                name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
             param in self.param_to_name

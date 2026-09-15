@@ -346,6 +346,11 @@ class TransformerConfig(ModelParallelConfig):
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
+    moe_tie_adjacent_experts: bool = False
+    """Double and share routed expert pools within adjacent MoE pairs; keep top-k fixed.
+    num_moe_experts describes the unpaired baseline pool. Odd tails stay unpaired.
+    """
+
     smelt_loop_layers: int = 0
     """Number of physical layers in the twice-executed SMELT span; zero disables looping."""
 
@@ -1437,6 +1442,28 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        if self.moe_tie_adjacent_experts:
+            from megatron.core.transformer.moe.adjacent_experts import adjacent_expert_pairs
+
+            if not self.num_moe_experts or not adjacent_expert_pairs(self.num_layers, self.moe_layer_freq):
+                raise ValueError('Adjacent expert tying requires adjacent MoE layers')
+            unsupported = {
+                'SMELT looping': self.smelt_loop_layers,
+                'pipeline parallelism': self.pipeline_model_parallel_size != 1,
+                'virtual pipeline parallelism': self.virtual_pipeline_model_parallel_size is not None,
+                'heterogeneous block specs': self.heterogeneous_block_specs,
+                'recomputation': self.recompute_granularity is not None or self.moe_layer_recompute,
+                'quantization': self.fp8 or self.fp4,
+                'CUDA graphs': self.cuda_graph_impl != 'none' or self.enable_cuda_graph or self.external_cuda_graph,
+                'offloading': self.cpu_offloading or self.fine_grained_activation_offloading or self.moe_use_offloading_experts,
+                'MoE communication overlap': self.overlap_moe_expert_parallel_comm,
+                'MTP': self.mtp_num_layers,
+                'optimized inference': self.transformer_impl == 'inference_optimized',
+            }
+            for feature, enabled in unsupported.items():
+                if enabled:
+                    raise ValueError(f'Adjacent expert tying does not yet support {feature}')
 
         from megatron.core.transformer.smelt import smelt_layer_order
 

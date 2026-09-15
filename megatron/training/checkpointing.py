@@ -160,6 +160,7 @@ def check_checkpoint_args(checkpoint_args):
         assert checkpoint_value == args_value, error_message
 
     _compare('num_layers')
+    _compare('moe_tie_adjacent_experts', default=False)
     _compare('smelt_loop_layers', default=0)
     _compare('smelt_loop_start', default=-1)
     _compare('hidden_size')
@@ -1522,6 +1523,7 @@ def load_args_from_checkpoint(
             print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
     # Model args.
+    args.moe_tie_adjacent_experts = getattr(checkpoint_args, 'moe_tie_adjacent_experts', False)
     _set_arg('num_layers')
     # Old checkpoints are unlooped, even if a caller supplied SMELT flags.
     args.smelt_loop_layers = getattr(checkpoint_args, 'smelt_loop_layers', 0)

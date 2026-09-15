@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from functools import partial
+from functools import partial, wraps
+from types import SimpleNamespace
 from typing import Callable, List, Optional, Union
 
 import torch
@@ -307,6 +308,29 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.expert_load_sample_count.zero_()
 
 
+def _by_expert_pool_size(function):
+    """Run router collectives in deterministic, equal-width groups.
+
+    Adjacent pairs have doubled pools while odd tails retain the baseline pool.
+    Never pad counts: dummy experts would change quantiles and load metrics.
+    These functions only consume the model's router-module iterator.
+    """
+    @wraps(function)
+    def grouped(model, config, *args, **kwargs):
+        if not getattr(config, 'moe_tie_adjacent_experts', False):
+            return function(model, config, *args, **kwargs)
+        groups = {}
+        for chunk in model:
+            for module in get_attr_wrapped_model(chunk, 'modules')():
+                if hasattr(module, 'topk') and hasattr(module, 'layer_number'):
+                    groups.setdefault(module.config.num_moe_experts, []).append(module)
+        for width in sorted(groups):
+            view = SimpleNamespace(modules=lambda: iter(groups[width]))
+            function([view], config, *args, **kwargs)
+    return grouped
+
+
+@_by_expert_pool_size
 def _log_microbatch_router_metrics(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -450,6 +474,7 @@ def _log_microbatch_router_metrics(
             offset += sample_count
 
 
+@_by_expert_pool_size
 def _log_global_router_metrics(model: List[torch.nn.Module], config: TransformerConfig):
     """Log global-batch MoE routing metrics for all MoE routers."""
     router_modules = []
@@ -510,6 +535,7 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
                 )
 
 
+@_by_expert_pool_size
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
     """
     Update the expert bias of the router for a global batch.
@@ -539,6 +565,7 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
+@_by_expert_pool_size
 def _update_router_qb_beta(
     model: List[torch.nn.Module],
     config: TransformerConfig,

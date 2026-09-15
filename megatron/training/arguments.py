@@ -870,6 +870,10 @@ def validate_args(args, defaults={}):
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
+    if getattr(args, 'moe_tie_adjacent_experts', False):
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError('Adjacent expert tying currently requires standard Megatron DDP')
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'

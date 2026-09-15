@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
+import copy
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Set, Union, cast
@@ -338,6 +339,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             else:
                 layer_config = self.config
 
+            if self.config.moe_tie_adjacent_experts:
+                from megatron.core.transformer.moe.adjacent_experts import adjacent_expert_pairs
+
+                pairs = adjacent_expert_pairs(self.config.num_layers, self.config.moe_layer_freq)
+                if any(global_layer_number - 1 in pair for pair in pairs):
+                    layer_config = copy.copy(layer_config)
+                    layer_config.num_moe_experts = 2 * self.config.num_moe_experts
+
             # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
             if layer_config.fp8:
                 quantization_context = get_fp8_context(
@@ -369,6 +378,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
+        if self.config.moe_tie_adjacent_experts:
+            from megatron.core.transformer.moe.adjacent_experts import (
+                adjacent_expert_pairs, tie_adjacent_experts,
+            )
+
+            tie_adjacent_experts(
+                self.layers, adjacent_expert_pairs(self.config.num_layers, self.config.moe_layer_freq)
+            )
+
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.has_final_layernorm_in_this_stage():
@@ -914,6 +932,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             non_homogeneous_layers = True
 
         if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
+        if self.config.moe_tie_adjacent_experts:
+            # The unpaired tail has a smaller expert pool. Keep physical-layer keys.
             non_homogeneous_layers = True
 
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
