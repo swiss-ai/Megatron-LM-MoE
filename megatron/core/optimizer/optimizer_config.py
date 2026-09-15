@@ -336,6 +336,12 @@ class OptimizerConfig:
     """Absolute LR for the (untied) output LM-head params under md_decoupling. When unset, the
     output layer uses the base --lr."""
 
+    router_lr: Optional[float] = None
+    """Absolute LR for MoE router weights under md_decoupling. When set, routers use this LR
+    instead of --matrix-lr (Muon routers) or --lr (Adam routers) and are excluded from the
+    matrix-LR group. When unset, the existing router LR behavior applies. (md_decoupling only;
+    the plain muon/dist_muon path keeps routers on --matrix-lr.)"""
+
     min_lr_mode: str = 'relative'
     """How per-group min_lr is set for any group with a custom max_lr. 'relative' (default):
     every group decays by the same fraction (config.min_lr / config.lr). 'absolute': every group
@@ -346,9 +352,13 @@ class OptimizerConfig:
     muon_lr_factor * lr. Default 1.0 (matrices track the base --lr)."""
 
     hypersphere_mode: Optional[str] = 'flat'
-    """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
-    'row'/'col'/'flat'/'embed'/'none'. Applied post-step to project the weight onto the L2 sphere.
-    None = off."""
+    """Hypersphere normalization mode for ordinary matrices. One of
+    'row'/'col'/'flat'/'embed'/'none'. ``embed`` selects row normalization for input projections
+    and column normalization for output projections. None = off."""
+
+    hypersphere_family_modes: Tuple[Tuple[str, str], ...] = ()
+    """Per-family hypersphere mode overrides as (family, mode) pairs. Modes are
+    'row'/'col'/'flat'/'none'; unlisted families follow hypersphere_mode."""
 
     hypersphere_embedding_mode: Optional[str] = 'row'
     """Hypersphere mode override for embedding + LM head. One of

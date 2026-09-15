@@ -185,8 +185,10 @@ from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig,
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
 from megatron.core.optimizer.muon_logging import (
+    collect_captured_muon_norms,
     collect_md_gain_stats,
     collect_muon_stats,
+    set_muon_norm_logging,
 )
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -1926,6 +1928,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
+    muon_log_interval = args.muon_log_interval or args.log_interval
+    set_muon_norm_logging(
+        args.optimizer == "md_decoupling"
+        and args.log_muon_grad_norms
+        and (iteration + 1) % muon_log_interval == 0,
+        sparsity_thresholds=args.muon_sparsity_thresholds,
+        tensor_kinds=args.muon_log_tensor_kinds,
+        tensor_stats=args.muon_log_tensor_stats,
+        layer_count=args.num_layers,
+    )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -3444,22 +3456,37 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if args.log_muon_gains or args.log_muon_sparsity or args.log_muon_param_rms:
+        if (
+            args.log_muon_gains
+            or args.log_muon_sparsity
+            or args.log_muon_param_rms
+            or args.log_muon_grad_norms
+        ):
             muon_log_interval = args.muon_log_interval or args.log_interval
             if iteration % muon_log_interval == 0:
-                stats_collector = (
-                    collect_md_gain_stats
-                    if args.optimizer == "md_decoupling"
-                    else collect_muon_stats
+                md_gain_stats = (
+                    collect_captured_muon_norms()
+                    if args.optimizer == "md_decoupling" and args.log_muon_grad_norms
+                    else {}
                 )
-                md_gain_stats = stats_collector(
-                    optimizer,
-                    per_layer=args.log_muon_per_layer,
-                    sparsity_thresholds=args.muon_sparsity_thresholds,
-                    log_gains=args.log_muon_gains,
-                    log_sparsity=args.log_muon_sparsity,
-                    log_param_rms=args.log_muon_param_rms,
-                )
+                if args.log_muon_gains or args.log_muon_sparsity or args.log_muon_param_rms:
+                    stats_collector = (
+                        collect_md_gain_stats
+                        if args.optimizer == "md_decoupling"
+                        else collect_muon_stats
+                    )
+                    md_gain_stats.update(
+                        stats_collector(
+                            optimizer,
+                            per_layer=args.log_muon_per_layer,
+                            sparsity_thresholds=args.muon_sparsity_thresholds,
+                            log_gains=args.log_muon_gains,
+                            log_sparsity=args.log_muon_sparsity,
+                            log_param_rms=args.log_muon_param_rms,
+                            gain_stats=args.muon_log_gain_stats,
+                            param_stats=args.muon_log_param_stats,
+                        )
+                    )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

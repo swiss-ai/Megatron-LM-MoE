@@ -1,13 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# NOTE: should we remove this copyright notice? as it is from EPFL this implementation and not from NVIDIA (even though we derive things from the Muon implementation from NVIDIA)
 
 """MDDecoupling optimizer (magnitude-direction decoupling).
 
 Decouples a 2D weight into a *direction* (hypersphere-normalized weight) and a *magnitude*
 (learnable per-axis gains), with an optional Muon-style orthogonalized update on the direction:
 
-  - Direction: post-step L2-sphere projection of the weight (modes: row, col, flat, embed),
-    optionally per-class for embedding/output and router weights.
+  - Direction: post-step L2-sphere projection of the weight (row, flat, or output-channel),
+    optionally overridden by parameter family, embedding/output, or router policy.
   - Magnitude: optional learnable per-axis gains as a fused reparameterization
     (p = normalized_w * phi(gains)); ``gain_parametrization`` selects phi ∈ {direct, softplus}.
   - Update: AdamW by default, or Muon orthogonalized updates (``use_orthogonal_updates``).
@@ -42,7 +41,11 @@ from . import (
     get_standard_config_overrides,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .muon_logging import _gain_log_family
+from .muon_logging import (
+    _gain_log_family,
+    capture_muon_update_block_norms,
+    capture_muon_update_norms,
+)
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -56,33 +59,43 @@ try:
     from emerging_optimizers.orthogonalized_optimizers import (
         get_muon_scale_factor as _emerging_get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers import muon_utils as _muon_utils
+
+    newton_schulz_tp = _muon_utils.newton_schulz_tp
+    # Three-dimensional dispatch landed with batched_newton_schulz_step. Use the
+    # helper as a capability marker while calling the public newton_schulz entry point.
+    _batched_newton_schulz = (
+        _muon_utils.newton_schulz
+        if callable(getattr(_muon_utils, "batched_newton_schulz_step", None))
+        else None
+    )
 except ImportError:
     emerging_optimizers = None
+    _batched_newton_schulz = None
 
 
 logger = logging.getLogger(__name__)
+# Private PyTorch API; retain the scalar fallback below.
+_FOREACH_ADD_ = getattr(torch, "_foreach_add_", None)
+_HYPERSPHERE_FAMILIES = {
+    "attention-in",
+    "attention-out",
+    "dense-mlp-in",
+    "dense-mlp-out",
+    "expert-in",
+    "expert-out",
+    "moe-latent-in",
+    "moe-latent-out",
+    "unclassified",
+}
+_HYPERSPHERE_MODES = {"row", "col", "flat", "none"}
 
 
+@torch._dynamo.config.patch(recompile_limit=16)
 @torch.compile(dynamic=True)
-def _local_squared_norm(tensor: torch.Tensor) -> torch.Tensor:
-    """Return a local FP32 squared Frobenius norm in a compiled graph."""
-    return tensor.float().square().sum()
-
-
-@torch.compile(dynamic=True)
-def _scale_update_to_fixed_norm(
-    update: torch.Tensor,
-    update_squared_norm: torch.Tensor,
-    fixed_weight_norm: torch.Tensor,
-) -> torch.Tensor:
-    """Scale an update to a fixed norm, mapping a zero update to zero."""
-    scale = torch.where(
-        update_squared_norm > 0,
-        fixed_weight_norm / torch.sqrt(update_squared_norm),
-        torch.zeros_like(update_squared_norm),
-    )
-    return update * scale
+def _local_squared_norm(tensor: torch.Tensor, dim=None, keepdim: bool = False) -> torch.Tensor:
+    """Return a local FP32 squared norm in a compiled graph."""
+    return tensor.float().square().sum(dim=dim, keepdim=keepdim)
 
 
 _MD_GAIN_STATE_KINDS = {
@@ -96,6 +109,7 @@ _MD_GAIN_STATE_KINDS = {
     "flat_gain_m": "flat",
     "flat_gain_v": "flat",
 }
+
 
 def _normalize_embedding_mode(mode):
     return None if mode == "external" else mode
@@ -115,25 +129,15 @@ def _glu_fc1_split_dim(name: str, p: torch.Tensor, gated_linear_unit: bool) -> O
 
 
 def _split_glu_fc1(x: torch.Tensor, split_dim: int):
-    """Split a fused GLU FC1 tensor and return its logical matrices plus a merge function."""
+    """Return writable views of the logical matrices in a fused GLU FC1 tensor."""
     if x.size(split_dim) % 2 != 0:
         raise ValueError(
             f"Fused GLU FC1 dimension {split_dim} must be even, got shape {tuple(x.shape)}"
         )
     if x.ndim == 2:
-        return (
-            list(torch.chunk(x, 2, dim=split_dim)),
-            lambda parts: torch.cat(parts, dim=split_dim),
-        )
+        return list(torch.chunk(x, 2, dim=split_dim))
     if x.ndim == 3 and split_dim == 1:
-        parts = [part for expert in x.unbind(0) for part in torch.chunk(expert, 2, dim=0)]
-        return (
-            parts,
-            lambda parts: torch.stack(
-                [torch.cat(parts[i:i + 2], dim=0) for i in range(0, len(parts), 2)],
-                dim=0,
-            ),
-        )
+        return [part for expert in x.unbind(0) for part in torch.chunk(expert, 2, dim=0)]
     raise ValueError(
         f"Unsupported fused GLU FC1 layout: shape {tuple(x.shape)}, split dim {split_dim}"
     )
@@ -172,17 +176,16 @@ def _projected_metadata_signature(
         prefix,
         tuple(model_shard.global_shape[axis] for axis in global_axes),
         tuple(model_shard.global_offset[axis] for axis in global_axes),
-        None
-        if model_shard.axis_fragmentations is None
-        else tuple(model_shard.axis_fragmentations[axis] for axis in global_axes),
+        (
+            None
+            if model_shard.axis_fragmentations is None
+            else tuple(model_shard.axis_fragmentations[axis] for axis in global_axes)
+        ),
     )
 
 
 def _build_md_gain_factory(
-    model_factory: ShardedTensorFactory,
-    gain: torch.Tensor,
-    gain_kind: str,
-    key: str,
+    model_factory: ShardedTensorFactory, gain: torch.Tensor, gain_kind: str, key: str
 ) -> ShardedTensorFactory:
     """Build a gain-specific factory from a model parameter factory.
 
@@ -193,9 +196,7 @@ def _build_md_gain_factory(
     """
     model_ndim = model_factory.data.ndim
     if model_ndim not in (2, 3):
-        raise ValueError(
-            f'Unsupported {model_ndim}D factory-backed parameter for MD gain {key}'
-        )
+        raise ValueError(f'Unsupported {model_ndim}D factory-backed parameter for MD gain {key}')
 
     @torch.no_grad()
     def build_fn(runtime_key, data, replica_id, flattened_range):
@@ -203,11 +204,8 @@ def _build_md_gain_factory(
             raise ValueError(f'Flattened factory-backed MD gains are not supported for {key}')
 
         template_state = model_factory.build_fn(
-            runtime_key,
-            model_factory.data,
-            replica_id,
-            model_factory.flattened_range,
-        ) # original model factory build_fn to get the template state for the gain
+            runtime_key, model_factory.data, replica_id, model_factory.flattened_range
+        )  # original model factory build_fn to get the template state for the gain
         template_shards = list(nested_values(template_state))
         if not template_shards or not all(
             isinstance(shard, ShardedTensor) for shard in template_shards
@@ -234,9 +232,7 @@ def _build_md_gain_factory(
                     data[expert_idx],
                     template.key,
                     retained_leaf_axes,
-                    allow_shape_mismatch=(
-                        template.allow_shape_mismatch and gain_kind == "row"
-                    ),
+                    allow_shape_mismatch=(template.allow_shape_mismatch and gain_kind == "row"),
                 )
                 for expert_idx, template in enumerate(template_shards)
             ]
@@ -244,7 +240,7 @@ def _build_md_gain_factory(
         if not all(shard.data.ndim == 2 for shard in template_shards):
             raise ValueError(f'Expected 2D leaves from model factory for {key}')
 
-         # Row gains: one projected shard for each dim-0 W/V leaf. Example: weight [8, 4] (w: [4, 4], v: [4, 4]) then row gain [8] splits into [4] and [4].
+        # Row gains: one projected shard for each dim-0 W/V leaf. Example: weight [8, 4] (w: [4, 4], v: [4, 4]) then row gain [8] splits into [4] and [4].
         if gain_kind == "row":
             gain_shards = []
             row_offset = 0
@@ -293,13 +289,7 @@ def _build_md_gain_factory(
             raise ValueError(f'Expected one loaded {gain_kind} gain shard for {key}')
         return loaded_shards[0]
 
-    return ShardedTensorFactory(
-        key,
-        gain,
-        build_fn,
-        merge_fn,
-        model_factory.replica_id,
-    )
+    return ShardedTensorFactory(key, gain, build_fn, merge_fn, model_factory.replica_id)
 
 
 class _MDDecouplingBase(torch.optim.Optimizer):
@@ -316,8 +306,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
         hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
-        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none", "external"]] = None,
+        hypersphere_embedding_mode: Optional[
+            Literal["row", "col", "flat", "embed", "none", "external"]
+        ] = None,
         hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
+        hypersphere_family_modes: Optional[Dict[str, str]] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
         hypersphere_tangential_grad: bool = False,
@@ -370,13 +363,21 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.hypersphere_mode = hypersphere_mode
         self.hypersphere_embedding_mode = _normalize_embedding_mode(hypersphere_embedding_mode)
         self.hypersphere_router_mode = hypersphere_router_mode
+        self.hypersphere_family_modes = dict(hypersphere_family_modes or {})
+        unknown_families = self.hypersphere_family_modes.keys() - _HYPERSPHERE_FAMILIES
+        unknown_modes = set(self.hypersphere_family_modes.values()) - _HYPERSPHERE_MODES
+        if unknown_families or unknown_modes:
+            raise ValueError(
+                "Invalid hypersphere family modes: "
+                f"unknown families={sorted(unknown_families)}, modes={sorted(unknown_modes)}"
+            )
         self.hypersphere_eps = hypersphere_eps
         self.hypersphere_tangential_grad = hypersphere_tangential_grad
         self.hypersphere_preserve_init = hypersphere_preserve_init
         if hypersphere_scale_out_proj_init:
-            assert num_layers is not None and num_layers > 0, (
-                "hypersphere_scale_out_proj_init=True requires num_layers"
-            )
+            assert (
+                num_layers is not None and num_layers > 0
+            ), "hypersphere_scale_out_proj_init=True requires num_layers"
             self.out_proj_radius_scale = 1.0 / math.sqrt(2 * num_layers)
         else:
             self.out_proj_radius_scale = 1.0
@@ -401,9 +402,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         )
         self.qkv_down_proj_split_shapes = qkv_down_proj_split_shapes
         self.split_mla_per_head = split_mla_per_head
-        self.is_q_up_proj_fn = (
-            is_q_up_proj_fn if is_q_up_proj_fn is not None else (lambda p: False)
-        )
+        self.is_q_up_proj_fn = is_q_up_proj_fn if is_q_up_proj_fn is not None else (lambda p: False)
         self.q_up_proj_head_dim = q_up_proj_head_dim
 
         self.coefficient_type = coefficient_type
@@ -443,26 +442,37 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         for _i, _g in enumerate(self.param_groups):
             _g['lr_mult'] = float(_i + 1)
 
-        # Normalize parameters at init so the first forward sees on-sphere weights. When
-        # hypersphere_preserve_init=True we skip this so the model's init magnitude survives into
-        # training (gains absorb the magnitude downstream in MDDecoupling._maybe_init_gain_state).
-        if (not self.hypersphere_preserve_init
-                and (self.hypersphere_mode is not None
-                     or self.hypersphere_embedding_mode is not None
-                     or self.hypersphere_router_mode is not None)):
+        # Normalize parameters at init so the first forward sees on-sphere weights. Preserve-init
+        # skips projection; its bare block radii are cached at the first optimizer step, after
+        # gains have been divided out.
+        if not self.hypersphere_preserve_init and (
+            self.hypersphere_mode is not None
+            or self.hypersphere_embedding_mode is not None
+            or self.hypersphere_router_mode is not None
+            or any(mode != "none" for mode in self.hypersphere_family_modes.values())
+        ):
             with torch.no_grad():
                 for group in self.param_groups:
                     for p in group["params"]:
-                        if p.ndim != 2 and not (len(p.shape) == 3 and getattr(p, "merged_offload_expert", False)):
+                        if p.ndim != 2 and not (
+                            p.ndim == 3 and getattr(p, "merged_offload_expert", False)
+                        ):
                             continue
                         is_qkv = self.is_qkv_fn(p)
                         is_out_proj = getattr(p, "is_out_proj", False)
                         is_embedding = getattr(p, "is_embedding_or_output_parameter", False)
                         is_router = getattr(p, "is_router", False)
                         is_merged_offload_expert = getattr(p, "merged_offload_expert", False)
-                        self._normalize(p, p, is_qkv=is_qkv, is_out_proj=is_out_proj,
-                                        is_embedding=is_embedding, is_router=is_router,
-                                        is_merged_offload_expert=is_merged_offload_expert)
+
+                        self._normalize(
+                            p,
+                            p,
+                            is_qkv=is_qkv,
+                            is_out_proj=is_out_proj,
+                            is_embedding=is_embedding,
+                            is_router=is_router,
+                            is_merged_offload_expert=is_merged_offload_expert,
+                        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -498,101 +508,191 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_embedding = getattr(p, "is_embedding_or_output_parameter", False)
         is_router = getattr(p, "is_router", False)
         is_merged_offload_expert = getattr(p, "merged_offload_expert", False)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
+        will_normalize = (
+            p.ndim == 2 or (p.ndim == 3 and is_merged_offload_expert)
+        ) and mode is not None
 
-        if group["use_orthogonal_updates"] and self.normalize_update_to_weight_norm:
-            # Cache before decoupled weight decay so preserve-init captures the actual first-step
-            # weight norm and ordinary hypersphere mode captures its projected fixed radius.
-            self._cache_fixed_weight_norms(
-                p,
-                is_qkv,
-                is_embedding,
-                is_router,
-                is_merged_offload_expert,
+        self._cache_preserved_frobenius_norms(p, is_qkv, is_merged_offload_expert, will_normalize)
+        weight_blocks, weight_merge, partition_dim = self._logical_blocks(
+            p, p, is_qkv, is_merged_offload_expert
+        )
+        target_frobenius_norms = None
+        if will_normalize or (
+            group["use_orthogonal_updates"] and self.normalize_update_to_weight_norm
+        ):
+            target_frobenius_norms = self._target_logical_frobenius_norms(
+                p, weight_blocks, partition_dim, is_out_proj, is_embedding, is_router
             )
+
         # A hypersphere-normalized matrix is projected back onto its fixed-radius sphere at the
         # end of this step (see the post-step normalization below), which discards any global
         # rescaling of `p`. Weight decay on such a param does NOT decay it — it only re-weights
         # the direction update to an effective lr/(1 - wd*lr). Skip WD for those: magnitude is
-        # carried by the gains (decayed via gains_weight_decay) and the non-normalized params are
-        # decayed by the chained Adam. `_will_normalize` mirrors the guard on the post-step
-        # normalization so the two stay in lockstep.
-        _will_normalize = (
-            (p.ndim == 2 or (p.ndim == 3 and is_merged_offload_expert))
-            and self._resolve_mode(is_embedding, is_router) is not None
-        )
+        # carried by the gains (decayed via gains_weight_decay), while non-normalized parameters
+        # retain ordinary decoupled weight decay. `will_normalize` mirrors the post-step guard.
 
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
         if self.hypersphere_tangential_grad:
             self._project_tangent_inplace(
-                p, grad, is_qkv=is_qkv, is_out_proj=is_out_proj,
-                is_embedding=is_embedding, is_router=is_router,
+                p,
+                grad,
+                is_qkv=is_qkv,
+                is_out_proj=is_out_proj,
+                is_embedding=is_embedding,
+                is_router=is_router,
                 is_merged_offload_expert=is_merged_offload_expert,
             )
 
         if group["use_orthogonal_updates"]:  # Muon branch.
-            assert emerging_optimizers is not None, (
-                "emerging_optimizers package required for --use-orthogonal-updates"
-            )
-            if not _will_normalize:
-                self._apply_weight_decay_inplace(p, group)
+            assert (
+                emerging_optimizers is not None
+            ), "emerging_optimizers package required for --use-orthogonal-updates"
+            if not will_normalize and group["weight_decay"] != 0:
+                p.add_(p, alpha=-group["weight_decay"] * group["lr"])
+
+            # Momentum
             exp_avg.lerp_(grad, 1 - momentum_beta)
             if self.use_nesterov:
                 grad = grad.lerp(exp_avg, momentum_beta)
             else:
                 grad = exp_avg
-            use_radius_scale = self._use_radius_scale(
-                self._resolve_mode(is_embedding, is_router), is_router
-            )
+
+            # Whether this param's Muon update gets the radius-mode rescale. 'init' only moves
+            # the flat-mode sphere, so only flat-mode params are rescaled. 'fan_in' moves the
+            # sphere for row mode too (its update factor is mode-independent — see
+            # _fan_in_update_scale), so every on-sphere param is rescaled, EXCEPT routers: they
+            # keep router_scale_mode (default "none" → 1.0), which already lands their update on
+            # the sqrt(num_experts) fan-in radius whenever num_experts <= hidden.
+            if self.hypersphere_radius_mode == "fan_in":
+                use_radius_scale = mode is not None and not is_router
+            else:
+                use_radius_scale = mode == "flat"
+
             with emerging_optimizers.utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                update = self._orthogonalize_param(
-                    p,
-                    grad,
-                    is_qkv=is_qkv,
-                    use_radius_scale=use_radius_scale,
-                    is_merged_offload_expert=is_merged_offload_expert,
-                    is_router=is_router,
+                update_blocks, update_partition_dim, update_batch = (
+                    self._orthogonalize_param_blocks(
+                        p, grad, is_qkv=is_qkv, is_merged_offload_expert=is_merged_offload_expert
+                    )
                 )
-            # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
-            # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
-            # target radius 1/sqrt(2L) the bare update needs the same shrink factor. Fixed-norm
-            # updates are already normalized per logical block, which supersedes this scale.
-            radius_scale = self._resolve_radius_scale(is_out_proj)
-            if radius_scale != 1.0 and not self.normalize_update_to_weight_norm:
-                update = update * radius_scale
+            capture_muon_update_block_norms(p, update_blocks, 1.0, kind="orthogonal-updates")
+            if self.normalize_update_to_weight_norm:
+                self._normalize_logical_blocks(
+                    p,
+                    update_blocks,
+                    update_partition_dim,
+                    is_out_proj,
+                    is_embedding,
+                    is_router,
+                    mode_override="flat",
+                    target_frobenius_norms=target_frobenius_norms,
+                    batch=update_batch,
+                )
+            else:
+                scale_partition_dim = None if self.tp_mode == "blockwise" else update_partition_dim
+                is_expert_tp = getattr(p, "expert_tp", False)
+                radius_scale = self._resolve_radius_scale(is_out_proj)
+
+                def scale_update(update):
+                    size_out, size_in = self._global_sizes(
+                        update, scale_partition_dim, is_expert_tp
+                    )
+                    if use_radius_scale and self.hypersphere_radius_mode == "fan_in":
+                        # fan_in pins ||update||_F to the sphere radius outright, so the scale-mode factor
+                        # drops out (it is exactly shape_up * _init_radius_scale, and scale_mode is asserted
+                        # to be shape_up in _validate_radius_mode).
+                        scale = self._fan_in_update_scale(size_out, size_in)
+                    else:
+                        scale = _get_muon_scale_factor(
+                            size_out, size_in, mode=self._resolve_scale_mode(is_router)
+                        )
+                        if use_radius_scale:
+                            scale *= self._init_radius_scale(size_out, size_in)
+
+                    # Shrink Muon update for is_out_proj params to match the smaller target sphere. Muon's
+                    # shape_up (and spectral) scale targets the natural RMS of a unit-row/col matrix; with
+                    # target radius 1/sqrt(2L) the bare update needs the same shrink factor. Fixed-norm
+                    # updates are already normalized per logical block, which supersedes this scale.
+                    scale *= self.extra_scale_factor * radius_scale
+                    return update * scale
+
+                update_blocks = [scale_update(update) for update in update_blocks]
+
+            capture_muon_update_block_norms(p, update_blocks, group["lr"])
         else:  # AdamW branch.
-            beta2 = group["beta2"]
-            exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-            bias_correction1 = 1.0 - (beta1 ** group["step"])
+            if not hasattr(self, "_compiled_apply_momentum_and_bias_correction"):
 
-            if beta2 == 0:  # plain SGD with momentum (no exp_avg_sq).
-                update = exp_avg / bias_correction1
-            else:  # Adam.
-                exp_avg_sq = state["exp_avg_sq"]
-                bias_correction2 = 1.0 - (beta2 ** group["step"])
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
-                update = exp_avg.div(bias_correction1) / denom
+                @torch.compile(dynamic=True)
+                def _apply_momentum_and_bias_correction(
+                    grad, exp_avg, beta1, beta2, step, eps, exp_avg_sq=None
+                ):
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    bias_correction1 = 1.0 - (beta1**step)
 
-            if not _will_normalize:
-                self._apply_weight_decay_inplace(p, group)
+                    if (
+                        exp_avg_sq is None
+                    ):  # plain SGD with momentum (no exp_avg_sq), so beta2 == 0.
+                        update = exp_avg / bias_correction1
+                    else:  # Adam.
+                        bias_correction2 = 1.0 - (beta2**step)
+                        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                        denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                        update = exp_avg.div(bias_correction1) / denom
+                    return update
 
-        # Apply update.
-        p.add_(update, alpha=-group["lr"])
+                self._compiled_apply_momentum_and_bias_correction = (
+                    _apply_momentum_and_bias_correction
+                )
 
-        # Post-step hypersphere normalization (matrix clipping).
-        if _will_normalize:
-            self._normalize(p, p, is_qkv=is_qkv, is_out_proj=is_out_proj,
-                            is_embedding=is_embedding, is_router=is_router,
-                            is_merged_offload_expert=is_merged_offload_expert)
+            update = self._compiled_apply_momentum_and_bias_correction(
+                grad,
+                exp_avg,
+                beta1,
+                group["beta2"],
+                group["step"],
+                group["eps"],
+                state.get("exp_avg_sq", None),
+            )
 
-    def _apply_weight_decay_inplace(self, p, group):
-        weight_decay = group["weight_decay"]
-        if weight_decay != 0:
-            p.add_(p, alpha=-weight_decay * group["lr"])
+            if not will_normalize and group["weight_decay"] != 0:
+                p.add_(p, alpha=-group["weight_decay"] * group["lr"])
+
+            capture_muon_update_norms(p, update, group["lr"])
+            update_blocks, _, _ = self._logical_blocks(p, update, is_qkv, is_merged_offload_expert)
+
+        # Both are writable views of p, so block updates are visible through the batch.
+        weight_batch = None
+        if will_normalize and is_merged_offload_expert:
+            if partition_dim is not None:
+                raise RuntimeError("Merged offloaded experts must not be tensor-parallel sharded")
+            weight_batch = self._direct_weight_batch(p)
+        if len(update_blocks) == 1:
+            weight_blocks[0].add_(update_blocks[0], alpha=-group["lr"])
+        elif _FOREACH_ADD_ is not None:
+            _FOREACH_ADD_(weight_blocks, update_blocks, alpha=-group["lr"])
+        else:
+            for weight, update in zip(weight_blocks, update_blocks):
+                weight.add_(update, alpha=-group["lr"])
+
+        if will_normalize:
+            self._normalize_logical_blocks(
+                p,
+                weight_blocks,
+                partition_dim,
+                is_out_proj,
+                is_embedding,
+                is_router,
+                target_frobenius_norms=target_frobenius_norms,
+                batch=weight_batch,
+            )
+
+        # Writable split views need no merge.
+        if weight_merge is not None:
+            p.copy_(weight_merge(weight_blocks))
 
     def _split_param_tensor(self, p, x, is_qkv: bool = False):
-        """Return logical matrix parts and a merge function for fused projection weights."""
+        """Return logical blocks and a merge only when the blocks are not writable views."""
         if self.split_qkv and is_qkv:
             assert self.qkv_split_shapes is not None
             return (
@@ -605,52 +705,36 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 raise ValueError("KDA in_proj is missing kda_split_shapes metadata")
             shapes = self._local_dim0_split_shapes(p, x, shapes, allow_groups=False)
             if sum(shapes) != x.size(0):
-                raise ValueError(
-                    f"KDA split shapes {shapes} do not match tensor shape {x.shape}"
-                )
-            return (
-                list(torch.split(x, shapes, dim=0)),
-                lambda parts: torch.cat(parts, dim=0),
-            )
+                raise ValueError(f"KDA split shapes {shapes} do not match tensor shape {x.shape}")
+            return list(torch.split(x, shapes, dim=0)), lambda parts: torch.cat(parts, dim=0)
         glu_split_dim = getattr(p, "glu_split_dim", None)
         if self.split_fc1 and glu_split_dim is not None:
-            return _split_glu_fc1(x, glu_split_dim)
+            return _split_glu_fc1(x, glu_split_dim), None
         if self.split_qkv and self.is_qkv_down_proj_fn(p):
             assert self.qkv_down_proj_split_shapes is not None
             shapes = self._local_dim0_split_shapes(
                 p, x, self.qkv_down_proj_split_shapes, allow_groups=False
             )
-            return (
-                list(torch.split(x, shapes, dim=0)),
-                lambda parts: torch.cat(parts, dim=0),
-            )
+            return list(torch.split(x, shapes, dim=0)), None
         if (self.split_qkv or self.split_mla_per_head) and self.is_kv_up_proj_fn(p):
             assert self.kv_up_proj_split_shapes is not None
             shapes = self._local_dim0_split_shapes(
                 p, x, self.kv_up_proj_split_shapes, allow_groups=True
             )
             if self.split_mla_per_head:
-                return (
-                    _split_grouped_dim0_per_head(x, shapes),
-                    lambda parts: _merge_grouped_dim0_per_head(parts, x.shape, shapes),
-                )
+                return _split_grouped_dim0_per_head(x, shapes), None
             return (
                 _split_grouped_dim0(x, shapes),
                 lambda parts: _merge_grouped_dim0(parts, x.shape, shapes),
             )
         if self.split_mla_per_head and self.is_q_up_proj_fn(p):
             assert self.q_up_proj_head_dim is not None
-            return (
-                _split_heads_dim0(x, self.q_up_proj_head_dim),
-                lambda parts: _merge_heads_dim0(parts, x.shape),
-            )
+            return _split_heads_dim0(x, self.q_up_proj_head_dim), None
         return None
 
     def _split_partition_dim(self, p, partition_dim):
         """Return the TP partition dimension that still applies after splitting."""
-        if self.split_mla_per_head and (
-            self.is_q_up_proj_fn(p) or self.is_kv_up_proj_fn(p)
-        ):
+        if self.split_mla_per_head and (self.is_q_up_proj_fn(p) or self.is_kv_up_proj_fn(p)):
             return None
         return partition_dim
 
@@ -687,30 +771,31 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         local_shapes = tuple(shape // tp_size for shape in shapes)
         local_total = sum(local_shapes)
         if dim0 != local_total and not (allow_groups and dim0 % local_total == 0):
-            raise ValueError(
-                f"Local split shapes {local_shapes} do not match tensor dim0 {dim0}"
-            )
+            raise ValueError(f"Local split shapes {local_shapes} do not match tensor dim0 {dim0}")
         return local_shapes
 
-    def _orthogonalize_param(
-        self,
-        p,
-        grad,
-        is_qkv: bool = False,
-        use_radius_scale: bool = False,
-        is_merged_offload_expert: bool = False,
-        is_router: bool = False,
-    ):
-        """Newton-Schulz orthogonalization, with optional QKV/MLA/expert splitting.
+    def _direct_weight_batch(
+        self, p: torch.Tensor, tensor: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """Return a no-copy batch view matching the ordering of the logical blocks."""
+        tensor = p if tensor is None else tensor
+        glu_split_dim = getattr(p, "glu_split_dim", None)
+        if glu_split_dim == 0 and tensor.ndim == 2:
+            return tensor.view(2, tensor.size(0) // 2, tensor.size(1))
+        if glu_split_dim == 1 and tensor.ndim == 3:
+            return tensor.view(tensor.size(0), 2, tensor.size(1) // 2, tensor.size(2)).flatten(0, 1)
+        return tensor if getattr(p, "merged_offload_expert", False) else None
 
-        ``use_radius_scale`` enables the radius-mode rescale (see _orthogonalize_tensor); it is
-        per-block so each Q/K/V, MLA, or expert block gets its own factor from its own shape.
-        ``is_router`` selects router_scale_mode over scale_mode (see _resolve_scale_mode).
-        """
+    def _orthogonalize_param_blocks(
+        self, p, grad, is_qkv: bool = False, is_merged_offload_expert: bool = False
+    ):
+        """Newton-Schulz orthogonalization with optional QKV/MLA/expert splitting."""
         if self.pg_collection is not None:
-            tp_group = (self.pg_collection.expt_tp
-                        if getattr(p, "expert_tp", False)
-                        else self.pg_collection.tp)
+            tp_group = (
+                self.pg_collection.expt_tp
+                if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp
+            )
         else:
             tp_group = None
         norm_partition_dim = getattr(p, "partition_dim", None)
@@ -720,55 +805,35 @@ class _MDDecouplingBase(torch.optim.Optimizer):
 
         split = self._split_param_tensor(p, grad, is_qkv)
         if split is not None:
-            parts, merge = split
-            split_partition_dim = self._split_partition_dim(p, partition_dim)
-            parts = [
-                self._orthogonalize_tensor(
-                    g,
-                    tp_group,
-                    split_partition_dim,
-                    use_radius_scale,
-                    is_router=is_router,
-                )
-                for g in parts
+            blocks, _ = split
+            partition_dim = self._split_partition_dim(p, partition_dim)
+            norm_partition_dim = self._split_partition_dim(p, norm_partition_dim)
+        elif is_merged_offload_expert:
+            blocks = _split_experts(grad)
+        else:
+            blocks = [grad]
+
+        batch = None
+        if (
+            is_merged_offload_expert
+            and partition_dim is None
+            and _batched_newton_schulz is not None
+        ):
+            batch = _batched_newton_schulz(
+                self._direct_weight_batch(p, tensor=grad),
+                steps=self.num_ns_steps,
+                coefficient_type=self.coefficient_type,
+            )
+            blocks = list(batch.unbind(0))
+        else:
+            blocks = [
+                self._orthogonalize_tensor(block, tp_group, partition_dim) for block in blocks
             ]
-            if self.normalize_update_to_weight_norm:
-                parts = self._normalize_muon_update_blocks(
-                    p,
-                    parts,
-                    self._split_partition_dim(p, norm_partition_dim),
-                )
-            return merge(parts)
+            if is_merged_offload_expert and self.normalize_update_to_weight_norm:
+                batch = torch.stack(blocks)
+                blocks = list(batch.unbind(0))
 
-        if is_merged_offload_expert:
-            experts = _split_experts(grad)
-            for i, expert in enumerate(experts):
-                experts[i] = self._orthogonalize_tensor(
-                    expert,
-                    tp_group,
-                    partition_dim,
-                    use_radius_scale,
-                    is_router=is_router,
-                )
-            if self.normalize_update_to_weight_norm:
-                experts = self._normalize_muon_update_blocks(
-                    p, experts, norm_partition_dim
-                )
-            return _merge_experts(experts)
-
-
-        update = self._orthogonalize_tensor(
-            grad,
-            tp_group,
-            partition_dim,
-            use_radius_scale,
-            is_router=is_router,
-        )
-        if self.normalize_update_to_weight_norm:
-            update = self._normalize_muon_update_blocks(
-                p, [update], norm_partition_dim
-            )[0]
-        return update
+        return blocks, norm_partition_dim, batch
 
     def _resolve_scale_mode(self, is_router: bool) -> str:
         """Muon scale-factor mode for this param. Routers use ``router_scale_mode`` (default
@@ -777,13 +842,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         modulate the router update with width even when the matrix LR is held fixed."""
         return self.router_scale_mode if is_router else self.scale_mode
 
-    def _orthogonalize_tensor(self, grad, tp_group, partition_dim, use_radius_scale: bool = False, is_router: bool = False):
+    def _orthogonalize_tensor(self, grad, tp_group, partition_dim):
         assert grad.ndim == 2
-        size = [grad.size(-2), grad.size(-1)]
-        if partition_dim is not None:
-            # Use the global matrix shape for Muon scaling.
-            size[partition_dim] *= get_pg_size(tp_group)
-        orth = newton_schulz_tp(
+        return newton_schulz_tp(
             grad,
             steps=self.num_ns_steps,
             coefficient_type=self.coefficient_type,
@@ -791,30 +852,21 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             partition_dim=partition_dim,
             tp_mode=("duplicated" if self.tp_mode == "blockwise" else self.tp_mode),
         )
-        if self.normalize_update_to_weight_norm:
-            # The subsequent measured-norm rescale removes every scalar factor, including
-            # shape_up, radius scaling, and extra_scale_factor.
-            return orth
-        if use_radius_scale and self.hypersphere_radius_mode == "fan_in":
-            # fan_in pins ||update||_F to the sphere radius outright, so the scale-mode factor
-            # drops out (it is exactly shape_up * _init_radius_scale, and scale_mode is asserted
-            # to be shape_up in _validate_radius_mode).
-            scale = self._fan_in_update_scale(size[0], size[1])
-        else:
-            scale = _get_muon_scale_factor(
-                size[0], size[1], mode=self._resolve_scale_mode(is_router)
-            )
-            if use_radius_scale:
-                scale *= self._init_radius_scale(size[0], size[1])
-        return orth * scale * self.extra_scale_factor
 
-    def _resolve_mode(self, is_embedding: bool, is_router: bool = False):
+    def _resolve_mode(
+        self, p: torch.Tensor, is_out_proj: bool, is_embedding: bool, is_router: bool = False
+    ):
+        family = getattr(p, "md_gain_log_family", "unclassified")
         if is_router and self.hypersphere_router_mode is not None:
             mode = self.hypersphere_router_mode
         elif is_embedding and self.hypersphere_embedding_mode is not None:
             mode = self.hypersphere_embedding_mode
+        elif family in self.hypersphere_family_modes:
+            mode = self.hypersphere_family_modes[family]
         else:
             mode = self.hypersphere_mode
+        if mode == "embed":
+            mode = "col" if is_out_proj else "row"
         return None if mode == "none" else mode
 
     def _resolve_radius_scale(self, is_out_proj: bool) -> float:
@@ -824,8 +876,10 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         (_maybe_init_gain_state), so we keep bare scale=1 to avoid double-counting."""
         if not is_out_proj or self.out_proj_radius_scale == 1.0:
             return 1.0
-        if (getattr(self, "hypersphere_gains_mode", None) is not None
-                and self.hypersphere_preserve_init):
+        if (
+            getattr(self, "hypersphere_gains_mode", None) is not None
+            and self.hypersphere_preserve_init
+        ):
             return 1.0
         return self.out_proj_radius_scale
 
@@ -835,8 +889,17 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if self.hypersphere_radius_mode == "shape_native":
             return
         if self.hypersphere_radius_mode == "init":
-            assert self.hidden_size is not None and self.hidden_size > 0, (
-                "hypersphere_radius_mode='init' requires hidden_size"
+            assert (
+                self.hidden_size is not None and self.hidden_size > 0
+            ), "hypersphere_radius_mode='init' requires hidden_size"
+            unsupported = {
+                family: mode
+                for family, mode in self.hypersphere_family_modes.items()
+                if mode not in ("none", "flat")
+            }
+            assert not unsupported, (
+                "hypersphere_radius_mode='init' only supports flat family overrides; "
+                f"got {unsupported}."
             )
             return
         if self.hypersphere_radius_mode != "fan_in":
@@ -845,7 +908,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 "'shape_native', 'init' or 'fan_in')"
             )
         if self.normalize_update_to_weight_norm:
-            # Measured block norms supersede the shape-derived Muon update scale.
+            # Explicit Frobenius normalization uses the shared fan-in target directly, so it does
+            # not depend on the analytical Newton–Schulz scale or its TP/geometry restrictions.
             return
         # fan_in derives every radius from the block's own d_out/d_in, so both sides of the
         # constraint must see the same GLOBAL shape. blockwise scales the update from the LOCAL
@@ -862,36 +926,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             "hypersphere_radius_mode='fan_in' targets ||update||_F = sqrt(d_out), which only "
             f"agrees with scale_mode='shape_up'; got '{self.scale_mode}'."
         )
-        # row gives unit rows and flat gives sqrt(d_out) outright, both landing ||W||_F on
-        # sqrt(d_out) = the update norm. col/embed normalize COLUMNS, which cannot reach
-        # sqrt(d_out) without a per-column radius of sqrt(d_out/d_in), so they would contradict
-        # the update scale (_target_slice_radius implements that radius, but the combination is
-        # rejected here rather than silently enabled).
-        unsupported = {
-            name: mode
-            for name, mode in (
-                ("hypersphere_mode", self.hypersphere_mode),
-                ("hypersphere_embedding_mode", self.hypersphere_embedding_mode),
-                ("hypersphere_router_mode", self.hypersphere_router_mode),
-            )
-            if mode not in (None, "none", "row", "flat")
-        }
-        assert not unsupported, (
-            "hypersphere_radius_mode='fan_in' only supports the 'row' and 'flat' sphere modes; "
-            f"got {unsupported}."
-        )
-
-    def _use_radius_scale(self, mode: Optional[str], is_router: bool) -> bool:
-        """Whether this param's Muon update gets the radius-mode rescale.
-
-        'init' only moves the flat-mode sphere, so only flat-mode params are rescaled. 'fan_in'
-        moves the sphere for row mode too (its update factor is mode-independent — see
-        _fan_in_update_scale), so every on-sphere param is rescaled, EXCEPT routers: they keep
-        router_scale_mode (default "none" → 1.0), which already lands their update on the
-        sqrt(num_experts) fan-in radius whenever num_experts <= hidden."""
-        if self.hypersphere_radius_mode == "fan_in":
-            return mode is not None and not is_router
-        return mode == "flat"
+        # Row, flat, and output-channel projections all land on ||W||_F = sqrt(d_out):
+        # rows use radius 1, while columns use radius sqrt(d_out / d_in).
 
     def _init_radius_scale(self, size_out: int, size_in: int) -> float:
         """Radius multiplier that moves the flat-mode sphere off the shape-native
@@ -934,8 +970,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         'shape_native'/'init' keep the historical radii: sqrt(max)*_init_radius_scale for flat,
         unit slices for row/col. Under 'fan_in' (init_std = 1/sqrt(d_in)) a slice of |S| entries
         has expected norm sqrt(|S|/d_in), giving flat -> sqrt(d_out), row -> 1 and
-        col -> sqrt(d_out/d_in); all three put ||W||_F at sqrt(d_out). Only the flat and row cases
-        are reachable today (_validate_radius_mode rejects col/embed under fan_in)."""
+        col -> sqrt(d_out/d_in); all three put ||W||_F at sqrt(d_out)."""
         if self.hypersphere_radius_mode == "fan_in":
             numel = size_out * size_in if dim is None else (size_out if dim == 0 else size_in)
             return (numel / size_in) ** 0.5
@@ -943,15 +978,21 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             return max(size_out, size_in) ** 0.5 * self._init_radius_scale(size_out, size_in)
         return 1.0
 
-    def _global_squared_norm(
+    @torch.no_grad()
+    def _global_norm(
         self,
         tensor: torch.Tensor,
         p: torch.Tensor,
-        partition_dim: Optional[int],
+        dim=None,
+        partition_dim: Optional[int] = None,
+        keepdim: bool = False,
     ) -> torch.Tensor:
-        """Compiled local norm plus a TP reduction when this logical block is sharded."""
-        squared_norm = _local_squared_norm(tensor)
-        if partition_dim in (0, 1) and self.pg_collection is not None:
+        """Compute an FP32 norm and reduce it when a reduced axis is TP-sharded."""
+        squared_norm = _local_squared_norm(tensor.detach(), dim=dim, keepdim=keepdim)
+        reduced_partition = dim is None or (
+            partition_dim in dim if isinstance(dim, tuple) else partition_dim == dim
+        )
+        if reduced_partition and partition_dim in (0, 1) and self.pg_collection is not None:
             tp_group = (
                 self.pg_collection.expt_tp
                 if getattr(p, "expert_tp", False)
@@ -959,70 +1000,84 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             )
             if get_pg_size(tp_group) > 1:
                 torch.distributed.all_reduce(squared_norm, group=tp_group)
-        return squared_norm
+        return torch.sqrt(squared_norm).clamp_min(self.hypersphere_eps)
 
     def _logical_blocks(
-        self,
-        p: torch.Tensor,
-        tensor: torch.Tensor,
-        is_qkv: bool,
-        is_merged_offload_expert: bool,
-    ) -> tuple[list[torch.Tensor], Optional[int]]:
-        """Return logical matrix blocks and their TP partition dimension."""
+        self, p: torch.Tensor, tensor: torch.Tensor, is_qkv: bool, is_merged_offload_expert: bool
+    ):
+        """Return logical blocks, an optional merge, and their TP partition dimension."""
         partition_dim = getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
         split = self._split_param_tensor(p, tensor, is_qkv)
         if split is not None:
-            return split[0], self._split_partition_dim(p, partition_dim)
+            blocks, merge = split
+            return blocks, merge, self._split_partition_dim(p, partition_dim)
         if is_merged_offload_expert:
-            return _split_experts(tensor), partition_dim
-        return [tensor], partition_dim
+            return _split_experts(tensor), None, partition_dim
+        return [tensor], None, partition_dim
 
-    def _cache_fixed_weight_norms(
-        self,
-        p: torch.Tensor,
-        is_qkv: bool,
-        is_embedding: bool,
-        is_router: bool,
-        is_merged_offload_expert: bool,
+    def _cache_preserved_frobenius_norms(
+        self, p: torch.Tensor, is_qkv: bool, is_merged_offload_expert: bool, will_normalize: bool
     ) -> None:
-        """Measure each logical ``||W||_F`` once, before the first MuonMD decay/update."""
-        if p in self._fixed_weight_norms:
+        if (
+            not self.hypersphere_preserve_init
+            or self.hypersphere_radius_mode != "shape_native"
+            or not will_normalize
+            or p in self._fixed_weight_norms
+        ):
             return
-        if self._resolve_mode(is_embedding, is_router) is None:
-            raise ValueError(
-                "--md-normalize-update-to-weight-norm requires an active hypersphere mode "
-                "for every MuonMD-managed weight"
-            )
-        blocks, partition_dim = self._logical_blocks(
-            p, p, is_qkv, is_merged_offload_expert
-        )
+
+        # Gains, when enabled, have already been divided out by _preprocess_gains. Cache the
+        # resulting bare block radii before decay or the update changes the weight.
+        blocks, _, partition_dim = self._logical_blocks(p, p, is_qkv, is_merged_offload_expert)
         self._fixed_weight_norms[p] = tuple(
-            torch.sqrt(self._global_squared_norm(block, p, partition_dim))
-            for block in blocks
+            self._global_norm(block, p, partition_dim=partition_dim) for block in blocks
         )
 
-    def _normalize_muon_update_blocks(
+    def _target_logical_frobenius_norms(
         self,
         p: torch.Tensor,
         blocks: list[torch.Tensor],
         partition_dim: Optional[int],
-    ) -> list[torch.Tensor]:
-        """Match logical update blocks to cached first-step weight norms before merging."""
-        fixed_norms = self._fixed_weight_norms[p]
-        if len(blocks) != len(fixed_norms):
+        is_out_proj: bool,
+        is_embedding: bool,
+        is_router: bool,
+    ) -> tuple:
+        """Return the policy-selected Frobenius radius for each logical block."""
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
+        if mode is None:
+            raise ValueError(
+                "--md-normalize-update-to-weight-norm requires an active hypersphere mode "
+                "for every MuonMD-managed weight"
+            )
+
+        targets = self._fixed_weight_norms.get(p)
+        if targets is None:
+            radius_scale = self._resolve_radius_scale(is_out_proj)
+            targets = []
+            for block in blocks:
+                size_out, size_in = self._global_sizes(
+                    block, partition_dim, getattr(p, "expert_tp", False)
+                )
+                if mode == "col":
+                    dim = 0
+                    slice_count = size_in
+                elif mode == "row":
+                    dim = 1
+                    slice_count = size_out
+                else:
+                    dim = None
+                    slice_count = 1
+                slice_radius = self._target_slice_radius(dim, size_out, size_in)
+                targets.append(math.sqrt(slice_count) * slice_radius * radius_scale)
+            targets = tuple(targets)
+
+        if len(targets) != len(blocks):
             raise RuntimeError(
-                f"MuonMD logical block count changed from {len(fixed_norms)} to {len(blocks)}"
+                f"MuonMD logical block count changed from {len(targets)} to {len(blocks)}"
             )
-        return [
-            _scale_update_to_fixed_norm(
-                block,
-                self._global_squared_norm(block, p, partition_dim),
-                fixed_norm,
-            )
-            for block, fixed_norm in zip(blocks, fixed_norms)
-        ]
+        return targets
 
     def _global_sizes(self, x, partition_dim: Optional[int], is_expert_tp: bool = False):
         """TP-unsharded [d_out, d_in] for the trailing two axes of `x`, for radius/scale math."""
@@ -1032,38 +1087,33 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             sizes[partition_dim] *= get_pg_size(tp_group)
         return sizes
 
-    def _project_tangent_inplace(self, p, grad, is_qkv: bool = False, is_out_proj: bool = False,
-                                  is_embedding: bool = False, is_router: bool = False,
-                                  is_merged_offload_expert: bool = False):
+    def _project_tangent_inplace(
+        self,
+        p,
+        grad,
+        is_qkv: bool = False,
+        is_out_proj: bool = False,
+        is_embedding: bool = False,
+        is_router: bool = False,
+        is_merged_offload_expert: bool = False,
+    ):
         """In-place: remove the radial component of `grad` w.r.t. the hypersphere mode at `p`.
         Mirrors _normalize's QKV-split layout so the constraint matches the post-step projection."""
-        mode = self._resolve_mode(is_embedding, is_router)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         if mode is None:
             return
-        split_p = self._split_param_tensor(p, p, is_qkv)
-        if split_p is not None:
-            ps, _ = split_p
-            gs, merge = self._split_param_tensor(p, grad, is_qkv)
-            for pi, gi in zip(ps, gs):
-                self._project_tangent_single_(pi, gi, is_out_proj, mode)
-            grad.copy_(merge(gs))
-            return
-        if is_merged_offload_expert:
-            ps = _split_experts(p)
-            gs = _split_experts(grad)
-            for pi, gi in zip(ps, gs):
-                self._project_tangent_single_(pi, gi, is_out_proj, mode)
-            grad.copy_(_merge_experts(gs))
-            return
-        self._project_tangent_single_(p, grad, is_out_proj, mode)
+        weight_blocks, _, _ = self._logical_blocks(p, p, is_qkv, is_merged_offload_expert)
+        grad_blocks, grad_merge, _ = self._logical_blocks(p, grad, is_qkv, is_merged_offload_expert)
+        for weight, grad_block in zip(weight_blocks, grad_blocks):
+            self._project_tangent_single_(weight, grad_block, is_out_proj, mode)
+        if grad_merge is not None:
+            grad.copy_(grad_merge(grad_blocks))
 
     def _project_tangent_single_(self, p, grad, is_out_proj: bool, mode: str):
         if mode == "col":
             dim = 0
         elif mode == "row":
             dim = 1
-        elif mode == "embed":
-            dim = 0 if is_out_proj else 1
         elif mode == "flat":
             dim = None
         else:
@@ -1076,83 +1126,126 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             radial = (p * grad).sum(dim=dim, keepdim=True) / p_norm_sq
         grad.sub_(p * radial)
 
-    def _normalize(self, p, x, is_qkv: bool = False, is_out_proj: bool = False,
-                   is_embedding: bool = False, is_router: bool = False,
-                   is_merged_offload_expert: bool = False):
+    def _normalize_logical_blocks(
+        self,
+        p,
+        blocks,
+        partition_dim,
+        is_out_proj: bool,
+        is_embedding: bool,
+        is_router: bool,
+        target_frobenius_norms,
+        mode_override: Optional[str] = None,
+        batch: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Normalize logical blocks onto explicit target Frobenius spheres."""
+        mode = mode_override or self._resolve_mode(p, is_out_proj, is_embedding, is_router)
+        if mode is None:
+            return
+        if len(target_frobenius_norms) != len(blocks):
+            raise RuntimeError(
+                f"MuonMD has {len(blocks)} logical blocks but "
+                f"{len(target_frobenius_norms)} target norms"
+            )
+        if batch is None:
+            for block, target_frobenius_norm in zip(blocks, target_frobenius_norms):
+                self._normalize_single(p, block, mode, partition_dim, target_frobenius_norm)
+        else:
+            self._normalize_batch(batch, mode, target_frobenius_norms)
+
+    def _normalize_batch(self, batch: torch.Tensor, mode: str, target_frobenius_norms) -> None:
+        """Normalize an explicit batch of equal-shaped, non-TP logical blocks in place."""
+        if mode == "col":
+            dim = -2
+        elif mode == "row":
+            dim = -1
+        elif mode == "flat":
+            dim = (-2, -1)
+        else:
+            raise ValueError(f"Unsupported hypersphere mode: {mode}")
+
+        norm = _local_squared_norm(batch, dim=dim, keepdim=True)
+        norm.sqrt_().clamp_min_(self.hypersphere_eps)
+        size_out, size_in = batch.shape[-2:]
+        slice_count = 1 if isinstance(dim, tuple) else (size_in if dim == -2 else size_out)
+        if isinstance(target_frobenius_norms[0], torch.Tensor):
+            radii = torch.stack(target_frobenius_norms).to(dtype=norm.dtype, device=norm.device)
+        else:
+            radii = torch.as_tensor(target_frobenius_norms, dtype=norm.dtype, device=norm.device)
+        radii = radii.view(-1, 1, 1)
+
+        # Give each slice radius / sqrt(slice_count), yielding the target matrix Frobenius norm.
+        batch.mul_(radii / (math.sqrt(slice_count) * norm))
+
+    def _normalize(
+        self,
+        p,
+        x,
+        is_qkv: bool = False,
+        is_out_proj: bool = False,
+        is_embedding: bool = False,
+        is_router: bool = False,
+        is_merged_offload_expert: bool = False,
+    ):
         """In-place L2-sphere projection of a 2D tensor `x` (sized like `p`).
 
         For QKV-merged weights, normalize each of Q/K/V separately. Modes:
-            row    → unit-norm each output row     (dim=1)
-            col    → unit-norm each input column   (dim=0)
-            flat   → unit Frobenius then scale by sqrt(max(d_out, d_in))
-            embed  → row for non-out_proj, col for out_proj
+            row   → normalize each output row
+            col   → normalize each input column
+            flat  → normalize the full matrix Frobenius norm
+            embed → row for embeddings and input projections, col for output projections
         Each slice is then placed on its target radius (see _target_slice_radius), which is where
         --hypersphere-radius-mode moves the sphere.
         """
-        mode = self._resolve_mode(is_embedding, is_router)
+        mode = self._resolve_mode(p, is_out_proj, is_embedding, is_router)
         if mode is None:
             return
 
-        partition_dim = getattr(p, "partition_dim", None)
-        radius_scale = self._resolve_radius_scale(is_out_proj)
-
-        is_expert_tp = getattr(p, "expert_tp", False)
-        split = self._split_param_tensor(p, x, is_qkv)
-        if split is not None:
-            parts, merge = split
-            split_partition_dim = self._split_partition_dim(p, partition_dim)
-            for part in parts:
-                self._normalize_single(
-                    part, is_out_proj, mode, radius_scale, split_partition_dim, is_expert_tp
-                )
-            x.copy_(merge(parts))
-            return
-
-        # TODO(fuguan): for now merged experts follow the same pipeline of normalization
-        # as qkv. But it might introduce high memory cost.
+        blocks, merge, partition_dim = self._logical_blocks(p, x, is_qkv, is_merged_offload_expert)
+        batch = None
         if is_merged_offload_expert:
-            experts = _split_experts(x)
-            for expert in experts:
-                self._normalize_single(expert, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-            x.copy_(_merge_experts(experts))
-            return
+            if partition_dim is not None:
+                raise RuntimeError("Merged offloaded experts must not be tensor-parallel sharded")
+            batch = self._direct_weight_batch(p, tensor=x)
+        target_frobenius_norms = self._target_logical_frobenius_norms(
+            p, blocks, partition_dim, is_out_proj, is_embedding, is_router
+        )
+        self._normalize_logical_blocks(
+            p,
+            blocks,
+            partition_dim,
+            is_out_proj,
+            is_embedding,
+            is_router,
+            target_frobenius_norms,
+            mode_override=mode,
+            batch=batch,
+        )
+        if merge is not None:
+            x.copy_(merge(blocks))
 
-        self._normalize_single(x, is_out_proj, mode, radius_scale, partition_dim, is_expert_tp)
-
-    def _normalize_single(self, x, is_out_proj: bool, mode: str, radius_scale: float = 1.0,
-                          partition_dim: Optional[int] = None, is_expert_tp: bool = False):
+    def _normalize_single(
+        self, p, x, mode: str, partition_dim: Optional[int], target_frobenius_norm
+    ):
         if mode == "col":
             dim = 0
         elif mode == "row":
             dim = 1
         elif mode == "flat":
             dim = None
-        elif mode == "embed":
-            dim = 0 if is_out_proj else 1
         else:
             raise ValueError(f"Unsupported hypersphere mode: {mode}")
 
         # Find norm of x, sync with TP group if needed.
-        tp_group = self.pg_collection.expt_tp if is_expert_tp else self.pg_collection.tp
-        if partition_dim in {0, 1} and (mode == "flat" or partition_dim == dim):
-            norm = torch.norm(x, dim=dim, keepdim=True)
-            norm_squared = norm**2
-            torch.distributed.all_reduce(norm_squared, group=tp_group)
-            norm = torch.sqrt(norm_squared).clamp_min(self.hypersphere_eps)
-        else:
-            norm = torch.norm(x, dim=dim, keepdim=True).clamp_min(self.hypersphere_eps)
+        norm = self._global_norm(x, p, dim=dim, partition_dim=partition_dim, keepdim=True)
 
-        # Normalize x, then place each slice on its target radius. The radius is derived from
-        # GLOBAL (TP-unsharded) sizes so a matrix lands on the same sphere at any TP degree, and
-        # so it matches the globally-scaled Muon update.
-        x.div_(norm)
-        radius = self._target_slice_radius(
-            dim, *self._global_sizes(x, partition_dim, is_expert_tp)
-        )
-        if radius != 1.0:
-            x.mul_(radius)
-        if radius_scale != 1.0:
-            x.mul_(radius_scale)
+        # Convert the block Frobenius target into the configured per-slice target. Flat update
+        # normalization has one slice, while row/column weight projection distributes the same
+        # total radius over the globally-sized slices.
+        size_out, size_in = self._global_sizes(x, partition_dim, getattr(p, "expert_tp", False))
+        slice_count = 1 if dim is None else (size_in if dim == 0 else size_out)
+        radius = target_frobenius_norm / math.sqrt(slice_count)
+        x.mul_(radius / norm)
 
 
 class MDDecoupling(_MDDecouplingBase):
@@ -1173,10 +1266,18 @@ class MDDecoupling(_MDDecouplingBase):
     def __init__(
         self,
         params,
-        hypersphere_gains_mode: Optional[Literal["row", "col", "rowcol", "flat", "embed", "none"]] = None,
-        hypersphere_gains_mode_output: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
-        hypersphere_gains_mode_embedding: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
-        hypersphere_gains_mode_router: Optional[Literal["row", "col", "rowcol", "flat", "inherit", "none"]] = None,
+        hypersphere_gains_mode: Optional[
+            Literal["row", "col", "rowcol", "flat", "embed", "none"]
+        ] = None,
+        hypersphere_gains_mode_output: Optional[
+            Literal["row", "col", "rowcol", "flat", "inherit", "none"]
+        ] = None,
+        hypersphere_gains_mode_embedding: Optional[
+            Literal["row", "col", "rowcol", "flat", "inherit", "none"]
+        ] = None,
+        hypersphere_gains_mode_router: Optional[
+            Literal["row", "col", "rowcol", "flat", "inherit", "none"]
+        ] = None,
         gains_lr: Optional[float] = None,
         gains_min_lr: Optional[float] = None,
         gains_betas: tuple[float, float] = (0.9, 0.999),
@@ -1189,12 +1290,16 @@ class MDDecoupling(_MDDecouplingBase):
         gains_no_clamp_min: bool = False,
         **kwargs,
     ):
-        self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
+        self.hypersphere_gains_mode = (
+            None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
+        )
         self.hypersphere_gains_mode_output = (
             None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
         )
         self.hypersphere_gains_mode_embedding = (
-            None if hypersphere_gains_mode_embedding == "inherit" else hypersphere_gains_mode_embedding
+            None
+            if hypersphere_gains_mode_embedding == "inherit"
+            else hypersphere_gains_mode_embedding
         )
         self.hypersphere_gains_mode_router = (
             None if hypersphere_gains_mode_router == "inherit" else hypersphere_gains_mode_router
@@ -1230,7 +1335,9 @@ class MDDecoupling(_MDDecouplingBase):
             return _build_md_gain_factory(model_param, optim_param, gain_kind, key)
 
         if model_param.data is None:
-            raise ValueError(f'Model shard {model_param.key} has no local data for MD gain projection')
+            raise ValueError(
+                f'Model shard {model_param.key} has no local data for MD gain projection'
+            )
         retained_axes = _md_gain_retained_axes(gain_kind, model_param.data.ndim)
         return make_sharded_optimizer_tensor_for_axes(
             model_param,
@@ -1272,26 +1379,6 @@ class MDDecoupling(_MDDecouplingBase):
             return x + torch.log1p(-torch.exp(-x))
         raise ValueError(f"Unknown gain_parametrization {mode}")
 
-    @torch.no_grad()
-    def _tp_reduced_norm(self, x, dim, partition_dim=None, is_expert_tp=False):
-        """L2 norm of `x` over `dim` (full Frobenius if dim is None), all-reduced across the TP
-        group when the reduced axis is the TP-sharded one — so the preserve_init gains absorb the
-        SAME global magnitude on TP=1 and TP>1. Mirrors the distributed-norm logic in
-        _normalize_single:
-            dim is None (flat) -> reduce iff the param is sharded (partition_dim in {0,1})
-            dim in {0, 1}      -> reduce iff partition_dim == dim (reduced axis is sharded)
-        """
-        norm = torch.norm(x) if dim is None else torch.norm(x, dim=dim)
-        should_reduce = self.pg_collection is not None and (
-            partition_dim in {0, 1} if dim is None else partition_dim == dim
-        )
-        if should_reduce:
-            tp_group = self.pg_collection.expt_tp if is_expert_tp else self.pg_collection.tp
-            norm_squared = norm**2
-            torch.distributed.all_reduce(norm_squared, group=tp_group)
-            norm = torch.sqrt(norm_squared)
-        return norm.to(torch.float32).clamp_min(self.hypersphere_eps)
-
     def _gain_layout(self, p):
         """Broadcast/sum/norm-axis layout for the per-axis gains of parameter p.
 
@@ -1308,16 +1395,30 @@ class MDDecoupling(_MDDecouplingBase):
         if getattr(p, "merged_offload_expert", False):
             E = p.size(0)
             return dict(
-                row_shape=(E, p.size(-2)), col_shape=(E, p.size(-1)), flat_shape=(E,),
-                row_norm=2, col_norm=1, row_sum=2, col_sum=1, spatial_dims=(1, 2),
+                row_shape=(E, p.size(-2)),
+                col_shape=(E, p.size(-1)),
+                flat_shape=(E,),
+                row_norm=2,
+                col_norm=1,
+                row_sum=2,
+                col_sum=1,
+                spatial_dims=(1, 2),
                 row_bk=(slice(None), slice(None), None),
                 col_bk=(slice(None), None, slice(None)),
                 flat_bk=(slice(None), None, None),
             )
         return dict(
-            row_shape=(p.size(0),), col_shape=(p.size(1),), flat_shape=(),
-            row_norm=1, col_norm=0, row_sum=1, col_sum=0, spatial_dims=None,
-            row_bk=(slice(None), None), col_bk=(None, slice(None)), flat_bk=(),
+            row_shape=(p.size(0),),
+            col_shape=(p.size(1),),
+            flat_shape=(),
+            row_norm=1,
+            col_norm=0,
+            row_sum=1,
+            col_sum=0,
+            spatial_dims=None,
+            row_bk=(slice(None), None),
+            col_bk=(None, slice(None)),
+            flat_bk=(),
         )
 
     def _maybe_init_gain_state(self, p):
@@ -1363,9 +1464,9 @@ class MDDecoupling(_MDDecouplingBase):
             if absorb_axis == "row":
                 # norm over the in-axis (dim 1 for 2D, dim 2 for 3D experts) → reduced iff
                 # row-parallel (partition_dim == 1); per-expert → (E, out) for 3D.
-                target = self._tp_reduced_norm(p.detach(), dim=layout["row_norm"],
-                                               partition_dim=partition_dim,
-                                               is_expert_tp=is_expert_tp)
+                target = self._global_norm(
+                    p, p, dim=layout["row_norm"], partition_dim=partition_dim
+                )
             else:
                 target = torch.ones(layout["row_shape"], dtype=torch.float32, device=p.device)
             state["row_gain"] = self._phi_inv(target)
@@ -1376,9 +1477,9 @@ class MDDecoupling(_MDDecouplingBase):
             if absorb_axis == "col":
                 # norm over the out-axis (dim 0 for 2D, dim 1 for 3D experts) → reduced iff
                 # col-parallel (partition_dim == 0); per-expert → (E, in) for 3D.
-                target = self._tp_reduced_norm(p.detach(), dim=layout["col_norm"],
-                                               partition_dim=partition_dim,
-                                               is_expert_tp=is_expert_tp)
+                target = self._global_norm(
+                    p, p, dim=layout["col_norm"], partition_dim=partition_dim
+                )
             else:
                 target = torch.ones(layout["col_shape"], dtype=torch.float32, device=p.device)
             state["col_gain"] = self._phi_inv(target)
@@ -1391,12 +1492,12 @@ class MDDecoupling(_MDDecouplingBase):
                 # GLOBAL sizes so TP=1 and TP>1 match, and it must be the SAME radius
                 # _normalize_single projects onto (radius mode included) — otherwise bare_p starts
                 # off-sphere and the post-step projection undoes the preserved init magnitude.
-                # For 3D experts this is per-expert: norm over the spatial axes (1, 2) → (E,), target_frob is a shared scalar.
+                # Merged experts use one spatial Frobenius norm per expert.
                 gsizes = self._global_sizes(p, partition_dim, is_expert_tp)
                 target_frob = self._target_slice_radius(None, *gsizes)
-                cur_frob = self._tp_reduced_norm(p.detach(), dim=layout["spatial_dims"],
-                                                 partition_dim=partition_dim,
-                                                 is_expert_tp=is_expert_tp)
+                cur_frob = self._global_norm(
+                    p, p, dim=layout["spatial_dims"], partition_dim=partition_dim
+                )
                 target = cur_frob / target_frob
                 if layout["spatial_dims"] is None:
                     target = target.reshape(())
@@ -1453,7 +1554,9 @@ class MDDecoupling(_MDDecouplingBase):
         # multiply for any nonzero gain (letting direct gains shrink through eps or flip sign).
         clamp = not self.gains_no_clamp_min
         if flat_eff is not None:
-            p.div_(flat_eff[layout["flat_bk"]].clamp_min(eps) if clamp else flat_eff[layout["flat_bk"]])
+            p.div_(
+                flat_eff[layout["flat_bk"]].clamp_min(eps) if clamp else flat_eff[layout["flat_bk"]]
+            )
         if row_eff is not None:
             p.div_(row_eff[layout["row_bk"]].clamp_min(eps) if clamp else row_eff[layout["row_bk"]])
         if col_eff is not None:
@@ -1468,8 +1571,12 @@ class MDDecoupling(_MDDecouplingBase):
             assert row is None and col is None
             gain_grads["flat_gain"] = torch.sum(p_times_pgrad, dim=layout["spatial_dims"])
         elif row is not None and col is not None:
-            gain_grads["row_gain"] = torch.sum(p_times_pgrad * col_eff[layout["col_bk"]], dim=layout["row_sum"])
-            gain_grads["col_gain"] = torch.sum(p_times_pgrad * row_eff[layout["row_bk"]], dim=layout["col_sum"])
+            gain_grads["row_gain"] = torch.sum(
+                p_times_pgrad * col_eff[layout["col_bk"]], dim=layout["row_sum"]
+            )
+            gain_grads["col_gain"] = torch.sum(
+                p_times_pgrad * row_eff[layout["row_bk"]], dim=layout["col_sum"]
+            )
         elif row is not None:
             gain_grads["row_gain"] = torch.sum(p_times_pgrad, dim=layout["row_sum"])
         else:
@@ -1483,8 +1590,14 @@ class MDDecoupling(_MDDecouplingBase):
             # partition_dim=1 -> row parallel sharding.
             partition_dim = getattr(p, "partition_dim", None)
             if partition_dim in {0, 1}:  # Otherwise, p is not sharded so we don't need to sync it.
-                tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
-                if flat is not None:  # Flat gains always need to all-reduce to complete the decomposition.
+                tp_group = (
+                    self.pg_collection.expt_tp
+                    if getattr(p, "expert_tp", False)
+                    else self.pg_collection.tp
+                )
+                if (
+                    flat is not None
+                ):  # Flat gains always need to all-reduce to complete the decomposition.
                     torch.distributed.all_reduce(gain_grads["flat_gain"], group=tp_group)
                 if row is not None and partition_dim == 1:  # row gains sync only when row-sharded.
                     torch.distributed.all_reduce(gain_grads["row_gain"], group=tp_group)
@@ -1537,8 +1650,8 @@ class MDDecoupling(_MDDecouplingBase):
             gains_floor = self.gains_min_lr if self.gains_min_lr is not None else 0.0
             lr = gains_floor + coeff * (self.gains_lr - gains_floor)
 
-        bias_correction1 = 1.0 - beta1 ** step
-        bias_correction2 = 1.0 - beta2 ** step
+        bias_correction1 = 1.0 - beta1**step
+        bias_correction2 = 1.0 - beta2**step
 
         # Persistent 0-dim fp32 scalar buffers (gain state is fp32), updated in
         # place each step. Reusing the same tensors keeps the compiled kernel's
@@ -1557,9 +1670,17 @@ class MDDecoupling(_MDDecouplingBase):
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
             _fused_gain_adam(
-                gain, m, v, grad,
-                self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
-                beta1, beta2, eps, wd,
+                gain,
+                m,
+                v,
+                grad,
+                self._gain_lr_buf,
+                self._gain_bc1_buf,
+                self._gain_bc2_buf,
+                beta1,
+                beta2,
+                eps,
+                wd,
             )
 
     @torch.no_grad()
@@ -1622,11 +1743,7 @@ def _split_qkv(x, shapes: Sequence[int]) -> list[torch.Tensor]:
     linear_qkv. The split is layout-agnostic in the number of blocks."""
     shape = x.shape
     num_query_groups = shape[0] // sum(shapes)
-    qkv = torch.split(
-        x.view(num_query_groups, sum(shapes), -1),
-        shapes,
-        dim=1,
-    )
+    qkv = torch.split(x.view(num_query_groups, sum(shapes), -1), shapes, dim=1)
     return [g.reshape(-1, shape[-1]) for g in qkv]
 
 
@@ -1635,12 +1752,10 @@ def _merge_qkv(qkv, xshape: tuple[int, int], shapes: Sequence[int]) -> torch.Ten
     qkv = [g.view(num_query_groups, -1, xshape[-1]) for g in qkv]
     return torch.cat(qkv, dim=1).view(xshape)
 
+
 def _split_experts(x: torch.Tensor) -> list[torch.Tensor]:
     assert len(x.shape) == 3, f"Expected 3D tensor, got {x.shape}"
     return list(torch.unbind(x, dim=0))
-
-def _merge_experts(experts: list[torch.Tensor]) -> torch.Tensor:
-    return torch.stack(experts, dim=0)
 
 
 def _split_grouped_dim0(x, shapes: tuple[int, int]) -> list[torch.Tensor]:
@@ -1664,25 +1779,10 @@ def _split_grouped_dim0_per_head(x, shapes: tuple[int, int]) -> list[torch.Tenso
     return [part for head in heads for part in torch.split(head, shapes, dim=0)]
 
 
-def _merge_grouped_dim0_per_head(
-    parts, xshape: tuple[int, int], shapes: tuple[int, int]
-) -> torch.Tensor:
-    blocks_per_head = len(shapes)
-    heads = [
-        torch.cat(parts[i : i + blocks_per_head], dim=0)
-        for i in range(0, len(parts), blocks_per_head)
-    ]
-    return torch.stack(heads, dim=0).view(xshape)
-
-
 def _split_heads_dim0(x, head_dim: int) -> list[torch.Tensor]:
     xshape = x.shape
     num_heads = xshape[0] // head_dim
     return list(x.view(num_heads, head_dim, -1).unbind(0))
-
-
-def _merge_heads_dim0(parts, xshape: tuple[int, int]) -> torch.Tensor:
-    return torch.stack(parts, dim=0).view(xshape)
 
 
 # ===========================================================================
@@ -1720,8 +1820,11 @@ def _mddecoupling_config_overrides(
     its matching params materialize.
     """
     overrides: Dict[ParamKey, ParamGroupOverride] = dict(base_overrides) if base_overrides else {}
-    matrix_lr = (config.matrix_lr if config.matrix_lr is not None
-                 else config.muon_lr_factor * (config.lr or 0.0))
+    matrix_lr = (
+        config.matrix_lr
+        if config.matrix_lr is not None
+        else config.muon_lr_factor * (config.lr or 0.0)
+    )
 
     # Embedding/output: when a hypersphere mode for embeddings is requested they stay in
     # MDDecoupling on the Adam branch (use_orthogonal_updates=False) + post-step normalization.
@@ -1734,31 +1837,41 @@ def _mddecoupling_config_overrides(
         }
 
     # MoE router branch override. Effective branch: explicit override > global flag.
-    router_uses_adam = (
-        config.md_router_use_orthogonal_updates is False
-        or (config.md_router_use_orthogonal_updates is None
-            and not config.use_orthogonal_updates)
+    router_uses_adam = config.md_router_use_orthogonal_updates is False or (
+        config.md_router_use_orthogonal_updates is None and not config.use_orthogonal_updates
     )
+    # A router gets its own LR group (excluded from the matrix-LR group below) when either an
+    # explicit --router-lr is set, or it runs on the Adam branch (matrix_lr is Muon-tuned).
+    router_has_own_lr = config.router_lr is not None or router_uses_adam
     router_override: ParamGroupOverride = {}
     if config.md_router_use_orthogonal_updates is not None:
         router_override['use_orthogonal_updates'] = config.md_router_use_orthogonal_updates
-    if router_uses_adam:
+    if config.router_lr is not None:
+        # Takes precedence over both the Muon matrix_lr and the
+        # Adam base-lr paths, applying to Muon and Adam routers alike.
+        router_override['max_lr'] = config.router_lr
+        router_override['min_lr'] = _group_min_lr(config, config.router_lr)
+    elif router_uses_adam:
         # Adam routers use base lr (matrix_lr is Muon-tuned; doesn't fit Adam).
         router_override['max_lr'] = config.lr
         router_override['min_lr'] = _group_min_lr(config, config.lr)
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
-    # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
-    # get base lr from the router_override above.
+    # Matrix LR for non-embedding/non-output matrix weights. Routers with their own LR group
+    # (--router-lr, or the Adam branch) are excluded — they get their LR from router_override above.
+    # TODO: Make MuP and MDDecoupling LR overrides composable; both currently set max_lr/min_lr
+    # on these matrix parameters, which produces conflicting param-group overrides.
     # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
         name="md_non_embedding_or_output_matrix",
-        fn=lambda p: (not getattr(p, "is_embedding_or_output_parameter", False)
-                      and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
-                      and not getattr(p, "is_kda_decay_parameter", False)
-                      and not (router_uses_adam and getattr(p, "is_router", False))),
+        fn=lambda p: (
+            not getattr(p, "is_embedding_or_output_parameter", False)
+            and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
+            and not getattr(p, "is_kda_decay_parameter", False)
+            and not (router_has_own_lr and getattr(p, "is_router", False))
+        ),
     )
     overrides[ParamKey(predicate=non_emb_2d)] = {
         'max_lr': matrix_lr,
@@ -1777,8 +1890,10 @@ def _mddecoupling_config_overrides(
     if config.output_lr is not None:
         output_only = ParamPredicate(
             name="md_output_not_embedding",
-            fn=lambda p: (getattr(p, "is_md_output_parameter", False)
-                          and not getattr(p, "is_md_embedding_parameter", False)),
+            fn=lambda p: (
+                getattr(p, "is_md_output_parameter", False)
+                and not getattr(p, "is_md_embedding_parameter", False)
+            ),
         )
         overrides[ParamKey(predicate=output_only)] = {
             'max_lr': config.output_lr,
@@ -1828,9 +1943,9 @@ def get_megatron_mddecoupling_optimizer(
     :func:`get_megatron_optimizer`. When ``layer_wise_distributed_optimizer`` is True the whole
     chain is wrapped in :class:`LayerWiseDistributedOptimizer` to shard optimizer state over DP.
     """
-    assert HAVE_EMERGING_OPTIMIZERS or not config.use_orthogonal_updates, (
-        "emerging-optimizers is required for --use-orthogonal-updates under --optimizer md_decoupling."
-    )
+    assert (
+        HAVE_EMERGING_OPTIMIZERS or not config.use_orthogonal_updates
+    ), "emerging-optimizers is required for --use-orthogonal-updates under --optimizer md_decoupling."
     # The standard distributed optimizer flattens each param shard to 1-D, which breaks the 2-D
     # hypersphere/Muon math. Shard optimizer state via the layer-wise optimizer instead.
     if config.use_distributed_optimizer:
@@ -1887,9 +2002,10 @@ def get_megatron_mddecoupling_optimizer(
             q_up_proj_head_dim = None
 
         qkv_down_proj_split_shapes = (
-            cfg.q_lora_rank,
-            cfg.kv_lora_rank + cfg.qk_pos_emb_head_dim,
-        ) if is_mla and getattr(cfg, 'q_lora_rank', None) is not None else None
+            (cfg.q_lora_rank, cfg.kv_lora_rank + cfg.qk_pos_emb_head_dim)
+            if is_mla and getattr(cfg, 'q_lora_rank', None) is not None
+            else None
+        )
 
         named_modules = (
             dict(model_chunk.named_modules()) if hasattr(model_chunk, 'named_modules') else {}
@@ -1931,9 +2047,13 @@ def get_megatron_mddecoupling_optimizer(
                 elif not getattr(param, "is_md_embedding_parameter", False):
                     param.is_md_output_parameter = True
             is_out_proj = (
-                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name or name.endswith('out_proj.weight') ))
-                or (is_merged_offload_expert and 'experts.weight2' in name)
-            )
+                (len(param.shape) == 2)
+                and (
+                    'linear_fc2' in name
+                    or 'linear_proj' in name
+                    or name.endswith('out_proj.weight')
+                )
+            ) or (is_merged_offload_expert and 'experts.weight2' in name)
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
@@ -1977,12 +2097,16 @@ def get_megatron_mddecoupling_optimizer(
     md_overrides = _mddecoupling_config_overrides(config, base_overrides)
 
     md_kwargs = dict(
-        lr=(config.matrix_lr if config.matrix_lr is not None
-            else config.muon_lr_factor * (config.lr or 0.0)),
+        lr=(
+            config.matrix_lr
+            if config.matrix_lr is not None
+            else config.muon_lr_factor * (config.lr or 0.0)
+        ),
         weight_decay=config.weight_decay,
         betas=(config.adam_beta1, config.adam_beta2),
         eps=config.adam_eps,
         hypersphere_mode=config.hypersphere_mode,
+        hypersphere_family_modes=dict(config.hypersphere_family_modes),
         hypersphere_embedding_mode=hypersphere_embedding_mode,
         hypersphere_router_mode=config.hypersphere_router_mode,
         hypersphere_tangential_grad=config.hypersphere_tangential_grad,
@@ -2058,7 +2182,9 @@ def get_megatron_mddecoupling_optimizer(
             config.bf16 = False
             reset_config_bf16 = True
         else:
-            optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, _md_init_state_fn)
+            optimizer = Float16OptimizerWithFloat16Params(
+                optimizer, config, None, _md_init_state_fn
+            )
     else:
         optimizer = FP32Optimizer(optimizer, config, _md_init_state_fn)
     optimizers.append(optimizer)
@@ -2100,7 +2226,9 @@ def get_megatron_mddecoupling_optimizer(
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:
-        log_single_rank(logger, logging.INFO, 'Using LayerWiseDistributedOptimizer for MDDecoupling')
+        log_single_rank(
+            logger, logging.INFO, 'Using LayerWiseDistributedOptimizer for MDDecoupling'
+        )
         if reset_config_bf16:
             config.bf16 = True
         return LayerWiseDistributedOptimizer(
