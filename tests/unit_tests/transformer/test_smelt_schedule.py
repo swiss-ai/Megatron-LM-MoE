@@ -3,6 +3,7 @@ import importlib.util
 import ast
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -12,6 +13,16 @@ SPEC.loader.exec_module(smelt)
 
 
 class TestSmeltSchedule(unittest.TestCase):
+    def test_router_visit_capacity_and_normalization(self):
+        for start in (-1, 2):
+            config = SimpleNamespace(num_layers=10, smelt_loop_start=start, smelt_loop_layers=5)
+            visits = [smelt.smelt_layer_visits(config, i) for i in range(1, 11)]
+            self.assertEqual(visits, [1, 1, 2, 2, 2, 2, 2, 1, 1, 1])
+            for v in visits:
+                self.assertEqual((4 * v * 0.25) / v / 4, 0.25)
+            self.assertEqual(smelt.smelt_layer_visits(config, 3, True), 1)
+        self.assertEqual(smelt.smelt_layer_visits(SimpleNamespace(), None), 1)
+
     def test_disabled(self):
         self.assertEqual(smelt.smelt_layer_order(10), tuple(range(10)))
 

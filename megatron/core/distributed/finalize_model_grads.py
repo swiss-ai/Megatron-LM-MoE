@@ -387,6 +387,13 @@ def _log_microbatch_router_metrics(
         module_samples: torch.Tensor,
         samples_per_microbatch: int = 1,
     ):
+        from megatron.core.transformer.smelt import smelt_layer_visits
+
+        # The tracker later divides by microbatches. Average the two SMELT
+        # visits as well, keeping physical-layer MBS/sequence/EP metrics comparable.
+        visits = smelt_layer_visits(
+            config, module.layer_number, getattr(module, 'is_mtp_layer', False)
+        )
         tokens_per_expert = module_samples[:, :-1]
         total_num_tokens = module_samples[:, -1:]
         ideal_tokens_per_expert = total_num_tokens * module.topk / tokens_per_expert.shape[-1]
@@ -405,7 +412,7 @@ def _log_microbatch_router_metrics(
         ):
             save_to_aux_losses_tracker(
                 name,
-                values.sum() / samples_per_microbatch,
+                values.sum() / (samples_per_microbatch * visits),
                 module.layer_number,
                 num_layers,
                 avg_group=dp_group,

@@ -804,7 +804,11 @@ class TopKRouter(Router):
         self, mbs_sample: torch.Tensor, seq_sample: Optional[torch.Tensor]
     ) -> None:
         """Store one microbatch of expert counts in CUDA-graph-stable buffers."""
-        capacity = get_num_microbatches()
+        from megatron.core.transformer.smelt import smelt_layer_visits
+
+        capacity = get_num_microbatches() * smelt_layer_visits(
+            self.config, self.layer_number, self.is_mtp_layer
+        )
         if (
             self.is_mtp_layer
             and self.config.mtp_use_repeated_layer

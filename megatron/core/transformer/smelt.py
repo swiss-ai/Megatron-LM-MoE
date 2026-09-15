@@ -1,6 +1,19 @@
 """Physical-layer execution schedule for SMELT (arXiv:2609.01343)."""
 
 
+def smelt_layer_visits(config, layer_number, is_mtp_layer=False):
+    """Visits per microbatch for a one-based physical decoder layer."""
+    count = getattr(config, 'smelt_loop_layers', 0)
+    if not count or is_mtp_layer:
+        return 1
+    if layer_number is None:
+        raise ValueError("SMELT router metrics require a physical layer number")
+    start = getattr(config, 'smelt_loop_start', -1)
+    if start == -1:
+        start = (config.num_layers - count) // 2
+    return 2 if start <= layer_number - 1 < start + count else 1
+
+
 def smelt_layer_order(num_layers, loop_start=-1, loop_layers=0):
     """Return zero-based physical indices; repeat the whole span, not each layer.
 
