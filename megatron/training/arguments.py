@@ -3201,6 +3201,16 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-staging', type=str, default='pinned',
+                       choices=['pinned', 'pageable', 'streamed'],
+                       help='How torch_dist saves stage GPU shards to the host. "pinned": '
+                       'all tensors are copied into pinned host memory first (torch rounds '
+                       'every block up to a power of two, so the peak is up to 2x the shard). '
+                       '"pageable": all tensors are copied into ordinary host memory first '
+                       '(peak = shard size, freed after the write). "streamed": tensors are '
+                       'copied one at a time right before they are written (peak = largest '
+                       'tensor); synchronous saves only, falls back to pageable with '
+                       '--async-save.')
     group.add_argument('--save-iters', type=str, default=None,
                        help='Comma-separated list of iterations at which to save a '
                        'checkpoint, in addition to --save-interval. Unlike '

@@ -628,6 +628,10 @@ class TorchDistSaveShardedStrategy:
         self.version = version
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
+        # Host staging of GPU shards, see FileSystemWriterAsync.staging_mode. Anything other
+        # than "pinned" is only implemented by the MCore writer, so async_save switches to
+        # the mcore backend for those modes.
+        self.staging_mode = "pinned"
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -691,8 +695,17 @@ class TorchDistSaveShardedStrategy:
             self.thread_count = 2
 
         # Get async modules
+        if self.staging_mode != "pinned" and async_strategy != "mcore":
+            logger.info(
+                f"ckpt staging mode '{self.staging_mode}' requires the mcore writer; "
+                f"using async_strategy='mcore' instead of '{async_strategy}'"
+            )
+            async_strategy = "mcore"
         async_strategy, modules = get_async_strategy(async_strategy)
         async_writer = modules["FileSystemWriterAsync"]
+        async_writer_kwargs_staging = (
+            {"staging_mode": self.staging_mode} if self.staging_mode != "pinned" else {}
+        )
         save_state_dict_async_plan = modules["save_state_dict_async_plan"]
         if async_strategy == "nvrx":
             checkpointable_metadata_cache = modules["CheckpointMetadataCache"]
@@ -734,6 +747,7 @@ class TorchDistSaveShardedStrategy:
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
             **async_writer_kwargs,
+            **async_writer_kwargs_staging,
         )
 
         # This should be set differently if we run in a smaller process group than the default
