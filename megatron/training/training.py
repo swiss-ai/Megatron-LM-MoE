@@ -2687,6 +2687,7 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+        report_host_memory(f"before save_checkpoint for iteration {iteration}")
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2709,6 +2710,15 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    # The checkpoint writer stages every GPU-resident shard through pinned host memory
+    # (tensor.to("cpu", non_blocking=True)). torch's caching host allocator keeps those
+    # blocks forever, so each rank's pinned footprint grows by its whole shard (rounded
+    # up to powers of two) at the first save and never comes back. Return the now-free
+    # blocks to the OS; live pinned buffers (offload pools, parameters) are untouched.
+    if hasattr(torch._C, "_host_emptyCache"):
+        torch._C._host_emptyCache()
+    if should_report_memory:
+        report_host_memory(f"after save_checkpoint for iteration {iteration}")
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
