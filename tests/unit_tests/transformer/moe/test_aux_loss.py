@@ -191,6 +191,62 @@ class TestSeqAuxLoss:
         container.aux_loss_test(self.input, self.baseline_grad, "seq_load_balancing_loss")
 
 
+class TestPerTokenAuxLoss:
+    """Regression test for the aux_loss TP/CP scaling fix under
+    --calculate-per-token-loss. Computes a baseline aux-loss input
+    gradient at (tp=1, cp=1) and asserts that each parametrized
+    (tp, ep, cp) config produces a matching gradient on each rank's
+    local input slice. Without the fix, the per-rank scale on aux_loss
+    would shrink with tp_cp_size and the assertion would fail at any
+    config with tp_size > 1 or cp_size > 1.
+    """
+
+    def setup_method(self, method):
+        baseline_container = AuxlossTestContainer(
+            tp_size=1,
+            ep_size=1,
+            pp_size=1,
+            cp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+            calculate_per_token_loss=True,
+        )
+        moe_layer = baseline_container.moe_layer
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input.requires_grad = True
+        probs, indices = apply_module(moe_layer.router)(self.input)
+        probs.sum().mul_(0).backward()
+        self.baseline_grad = self.input.grad
+        self.input.grad = None
+        clear_aux_losses_tracker()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
+    def test_per_token_aux_loss_invariant_to_tp_cp(self, tp_size, ep_size, cp_size):
+        container = AuxlossTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            cp_size=cp_size,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+            calculate_per_token_loss=True,
+        )
+        container.aux_loss_test(self.input, self.baseline_grad, "load_balancing_loss")
+
+
 class TestRouterAuxLoss:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -209,6 +265,9 @@ class TestRouterAuxLoss:
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
+            # See MoEModelTestContainer: expert-load observability defaults to ["mbs"] and
+            # sizes its buffers from get_num_microbatches(), which unit tests never init.
+            moe_router_violation_metrics=[],
         )
 
     def new_router(self, **kwargs):
@@ -339,6 +398,79 @@ class TestRouterAuxLoss:
 
         torch.testing.assert_close(aux_loss, seq_aux_loss)
         torch.testing.assert_close(grad1, grad2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("with_padding", [False, True])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
+    def test_seq_aux_loss_mbs_invariant_per_token_loss(
+        self, tp_size, ep_size, cp_size, with_padding
+    ):
+        """seq_aux_loss gradient must be invariant to MBS under --calculate-per-token-loss.
+
+        The same global batch is processed as N micro-batches of size 1 (MBS=1) and as one
+        micro-batch of size N (MBS=N). Both cover the same tokens, so the finalize-time
+        1/total_tokens normalization is an identical constant and the accumulated
+        router-weight aux gradients must match. Before the fix (valid_token_count dropped the
+        bsz factor), the MBS=N gradient is scaled by 1/N and the assertion fails. The padding
+        case additionally checks the correction uses valid (non-padded) token counts.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        )
+        model_parallel_cuda_manual_seed(42)
+        clear_aux_losses_tracker()
+
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            calculate_per_token_loss=True,
+            # fp32 weights so the MBS=1 gradient (accumulated over N backward passes)
+            # is not degraded by bf16 rounding relative to the single MBS=N backward.
+            params_dtype=torch.float32,
+            bf16=False,
+            tensor_model_parallel_size=tp_size,
+            expert_tensor_parallel_size=ep_size,
+            context_parallel_size=cp_size,
+        ).cuda()
+
+        seq_len = 32
+        num_seqs = 4
+        with get_cuda_rng_tracker().fork():
+            hidden_states = torch.randn(
+                (seq_len, num_seqs, router.config.hidden_size),
+                device=torch.device("cuda"),
+                dtype=torch.float32,
+            )
+        padding_mask = None
+        if with_padding:
+            # True marks padding tokens (second half of each sequence).
+            padding_mask = torch.zeros((seq_len, num_seqs), dtype=torch.bool, device="cuda")
+            padding_mask[seq_len // 2 :, :] = True
+
+        def run(indices):
+            pmask = None if padding_mask is None else padding_mask[:, indices]
+            scores, _ = router(hidden_states[:, indices, :].contiguous(), padding_mask=pmask)
+            scores.backward(torch.zeros_like(scores))  # isolate the aux-loss gradient
+            clear_aux_losses_tracker()
+
+        # MBS=1: N micro-batches of size 1, accumulating the aux-loss gradient.
+        router.weight.grad = None
+        for b in range(num_seqs):
+            run(slice(b, b + 1))
+        grad_mbs1 = router.weight.grad.clone()
+
+        # MBS=N: a single micro-batch of size N.
+        router.weight.grad = None
+        run(slice(0, num_seqs))
+        grad_mbsN = router.weight.grad.clone()
+
+        torch.testing.assert_close(grad_mbs1, grad_mbsN)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -633,6 +765,9 @@ class TestPaddingMaskAuxLoss:
             expert_model_parallel_size=ep_size,
             context_parallel_size=cp_size,
             sequence_parallel=sequence_parallel and tp_size > 1,
+            # See MoEModelTestContainer: expert-load observability defaults to ["mbs"] and
+            # sizes its buffers from get_num_microbatches(), which unit tests never init.
+            moe_router_violation_metrics=[],
         )
 
     def new_router(self, **kwargs):

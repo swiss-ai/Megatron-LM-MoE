@@ -93,6 +93,12 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
+            # Router expert-load observability defaults to ["mbs"], whose sample buffers are
+            # sized from get_num_microbatches(). Unit tests never initialize the global
+            # microbatch calculator, so leaving it on raises AttributeError on every
+            # training-mode router forward. Off by default here; opt in per test.
+            moe_router_violation_metrics=kwargs.get("moe_router_violation_metrics", []),
         )
 
         # init moe layer
