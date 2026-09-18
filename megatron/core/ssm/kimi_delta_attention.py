@@ -1237,6 +1237,52 @@ class KimiDeltaAttention(GatedDeltaNet):
         else:
             cu = cu_seqlens.to(torch.int32)
 
+        # cuDNN keys its compiled plan AND workspace on the NUMBER of sequences,
+        # and rebuilds when that number changes. bfd packing hands us a different
+        # document count almost every step, so the cache grows without bound AND
+        # the plan is rebuilt nearly every call. Measured on one GPU at
+        # T=8192, H=16, counts cycling 2..97:
+        #     raw           8.81 ms/call, 21267 MiB held
+        #     fixed N=128   2.45 ms/call,  1409 MiB held
+        # i.e. 3.6x faster and 15x leaner. Padding with zero-length trailing
+        # segments is bit-exact (0.0 relative error on the output and on every
+        # gradient). KDA_CUDNN_CU_FIXED=0 disables it.
+        # cuDNN keys the plan on the TOKEN COUNT as well as the sequence count
+        # (measured: 8 distinct token counts hold 7782 MiB of cache against
+        # 1569 MiB for one). Under KCP each rank's slice length varies per step,
+        # so the token dimension is padded up to a multiple too, as a trailing
+        # all-zero document that contributes nothing. Bit-exact on the real rows
+        # (0.0 relative error on the output and every gradient).
+        t_real = q3.shape[0]
+        t_pad = int(os.environ.get("KDA_CUDNN_T_PAD", "512"))
+        if t_pad > 1:
+            t_target = -(-t_real // t_pad) * t_pad
+            if t_target > t_real:
+                n_extra = t_target - t_real
+                zpad = lambda x: torch.cat(
+                    [x, x.new_zeros((n_extra,) + tuple(x.shape[1:]))]
+                )
+                q3, k3, v3, g3, beta3 = (zpad(x) for x in (q3, k3, v3, g3, beta3))
+                cu = torch.cat(
+                    [cu, torch.full((1,), t_target, device=cu.device, dtype=cu.dtype)]
+                )
+
+        fixed = int(os.environ.get("KDA_CUDNN_CU_FIXED", "128"))
+        if fixed > 0:
+            n_seq = cu.numel() - 1
+            # Snap to a POWER OF TWO at or above `fixed`. Rounding to multiples
+            # of `fixed` still leaves many distinct counts once CP makes the
+            # per-rank document count vary widely (measured: +5 GB of cache at
+            # seq 16384/CP=2), whereas powers of two cap the cache at a handful
+            # of entries for any range.
+            target = fixed
+            while target < n_seq:
+                target *= 2
+            if target > n_seq:
+                cu = torch.cat([cu, cu[-1].expand(target - n_seq)])
+            if os.environ.get("KDA_CUDNN_CU_DEBUG"):
+                logger.info("KDA cuDNN cu_seqlens: %d docs -> padded to %d", n_seq, target)
+
         state_in = (
             initial_state_f32.transpose(-1, -2).contiguous()
             if initial_state_f32 is not None
@@ -1250,7 +1296,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             use_qk_l2norm_in_kernel=False,
             use_beta_sigmoid_in_kernel=False,
         )
-        out = out.reshape(b, s_len, out.shape[-2], out.shape[-1])
+        out = out[:t_real].reshape(b, s_len, out.shape[-2], out.shape[-1])
         if final_state is not None and final_state.numel():
             final_state = final_state.transpose(-1, -2)
         else:
