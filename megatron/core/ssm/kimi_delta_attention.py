@@ -66,6 +66,18 @@ except ImportError:
     HAVE_KDA = False
 
 try:
+    # cudnn-frontend >= 1.30 (NVIDIA/cudnn-frontend #1061 for the sm90 engine).
+    # Imported lazily-ish: the package pulls in a compiled module, and a build
+    # without it must cost only the cuDNN backend, not the whole layer.
+    import cudnn as _cudnn  # noqa: F401
+    from cudnn.linear_attention import kimi_delta_attention as cudnn_kda
+
+    HAVE_CUDNN_KDA = True
+except Exception:  # ImportError, or a frontend whose compiled module won't load
+    cudnn_kda = None
+    HAVE_CUDNN_KDA = False
+
+try:
     from fla.modules import FusedRMSNormGated
 
     HAVE_FUSED_RMSNORM_GATED = True
@@ -106,6 +118,7 @@ def _have_causal_conv1d_cuda() -> bool:
 
 
 HAVE_CAUSAL_CONV1D_CUDA = _have_causal_conv1d_cuda()
+
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -537,10 +550,55 @@ class KimiDeltaAttention(GatedDeltaNet):
         # One all-gather for both low-rank bottlenecks instead of two.
         self._fuse_low_rank_gather = _env_flag("KDA_FUSED_LOW_RANK_GATHER", True)
 
-        self._use_fused_beta_sigmoid = _KDA_SUPPORTS_FUSED_BETA_SIGMOID and (
-            not self.config.linear_attention_allow_neg_eigval
-            or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
+        # Which chunkwise KDA op runs the core. "fla" (default) is the Triton
+        # chunk_kda this layer has always used; "cudnn" is the cuDNN sm90 engine
+        # (kda_hopper_cuda). The cuDNN op serves NO backward when any activation
+        # is fused into it, so selecting it un-fuses the Q/K L2-norm, the beta
+        # sigmoid and the decay gate -- see _KDA_BACKEND handling below.
+        self._backend = os.environ.get("KDA_BACKEND", "fla").strip().lower()
+        if self._backend not in ("fla", "cudnn"):
+            raise ValueError(f"KDA_BACKEND={self._backend!r} is not one of fla/cudnn.")
+        if self._backend == "cudnn" and not HAVE_CUDNN_KDA:
+            raise RuntimeError(
+                "KDA_BACKEND=cudnn needs cudnn-frontend >= 1.30 with the "
+                "linear_attention package (NVIDIA/cudnn-frontend #1061). "
+                "`import cudnn.linear_attention` failed."
+            )
+
+        self._use_fused_beta_sigmoid = (
+            _KDA_SUPPORTS_FUSED_BETA_SIGMOID
+            and _env_flag("KDA_FUSED_BETA_SIGMOID", True)
+            and (
+                not self.config.linear_attention_allow_neg_eigval
+                or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
+            )
         )
+
+        if self._backend == "cudnn":
+            # The sm90 cuDNN KDA backward is only offered when q/k arrive
+            # already L2-normalised and beta already post-sigmoid; with either
+            # fused in, every backward plan disappears ("No valid engine configs
+            # for KDA_BWD"). The decay gate has no non-safe in-kernel form at
+            # all there, so it is always materialised outside.
+            self._qk_l2norm_in_kernel = False
+            self._use_fused_beta_sigmoid = False
+            self._use_fused_decay_gate = False
+            # _kda_gate_style is deliberately left as the layer resolved it
+            # above: the per-channel-A_log guard there disables FLA's fused gate
+            # when its backward cannot index A_log per channel, and re-enabling
+            # it makes kda_gate_bwd reshape a per-head dA_log into the
+            # per-channel shape and die.
+
+        # One line per process so a distributed log says unambiguously which core
+        # op is running and on what contract -- the whole comparison turns on it.
+        if int(os.environ.get("RANK", "0")) == 0:
+            logger.info(
+                "KDA core op: backend=%s qk_l2norm_in_kernel=%s fused_beta_sigmoid=%s "
+                "fused_decay_gate=%s safe_gate=%s",
+                self._backend, self._qk_l2norm_in_kernel,
+                self._use_fused_beta_sigmoid, self._use_fused_decay_gate, self._safe_gate,
+            )
+
 
         # Re-init A_log + dt_bias using the reference KDA time-scale distribution.
         self._reset_kda_decay_params(A_init_range)
@@ -1134,15 +1192,70 @@ class KimiDeltaAttention(GatedDeltaNet):
                 kda_kwargs["allow_neg_eigval"] = (
                     self.config.linear_attention_allow_neg_eigval
                 )
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query, key, value, **kda_kwargs
-        )
+        if self._backend == "cudnn":
+            core_attn_out, last_recurrent_state = self._cudnn_core(
+                query, key, value, g, beta, initial_state_f32,
+                need_final_state, cu_seqlens,
+            )
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query, key, value, **kda_kwargs
+            )
         nvtx_range_pop(suffix="chunk_kda")
 
         nvtx_range_push(suffix="gated_norm")
         norm_out = self._apply_gated_norm(core_attn_out, gate.contiguous())
         nvtx_range_pop(suffix="gated_norm")
         return norm_out, last_recurrent_state
+
+    def _cudnn_core(self, query, key, value, g, beta, initial_state_f32,
+                    need_final_state, cu_seqlens):
+        """Run the core recurrence on cuDNN's KDA op instead of FLA's chunk_kda.
+
+        Layout: FLA takes [b, s, h, d] (b == 1 when packed) and a state
+        [n, h, k, v]; cuDNN takes packed THD [total_tokens, h, d] and a state
+        [n, h, v, k], i.e. the state's last two axes transposed. A dense batch
+        with no cu_seqlens is expressed as equal spans over the flattened
+        tokens, which is exactly what reshape(-1, h, d) produces.
+
+        Every activation is already materialised by the caller: __init__ forces
+        _qk_l2norm_in_kernel / _use_fused_beta_sigmoid / _use_fused_decay_gate
+        off under this backend, because the sm90 cuDNN backward is only offered
+        on the fully un-fused contract.
+        """
+        b, s_len = query.shape[0], query.shape[1]
+        q3 = query.reshape(-1, query.shape[-2], query.shape[-1])
+        k3 = key.reshape(-1, key.shape[-2], key.shape[-1])
+        v3 = value.reshape(-1, value.shape[-2], value.shape[-1])
+        g3 = g.reshape(-1, g.shape[-2], g.shape[-1])
+        beta3 = beta.reshape(-1, beta.shape[-1])
+
+        if cu_seqlens is None:
+            cu = torch.arange(
+                0, b * s_len + 1, s_len, device=query.device, dtype=torch.int32
+            )
+        else:
+            cu = cu_seqlens.to(torch.int32)
+
+        state_in = (
+            initial_state_f32.transpose(-1, -2).contiguous()
+            if initial_state_f32 is not None
+            else None
+        )
+
+        out, final_state = cudnn_kda(
+            q3, k3, v3, g3, beta3, cu,
+            initial_state=state_in,
+            output_final_state=bool(need_final_state),
+            use_qk_l2norm_in_kernel=False,
+            use_beta_sigmoid_in_kernel=False,
+        )
+        out = out.reshape(b, s_len, out.shape[-2], out.shape[-1])
+        if final_state is not None and final_state.numel():
+            final_state = final_state.transpose(-1, -2)
+        else:
+            final_state = None
+        return out, final_state
 
     def backward_dw(self):
         """Execute deferred weight-gradient computation for all KDA linear projections."""
