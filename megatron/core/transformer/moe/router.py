@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -17,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
+    pop_routing_oob_accum,
     qb_dual_update,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -891,6 +893,26 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
+
+        # Debug ($MOE_VALIDATE_ROUTING=1): surface how often the router emitted an
+        # out-of-bounds expert index (clamped upstream to keep the run alive). Logged
+        # per layer via the aux-loss tracker, so the host read happens at the normal
+        # logging interval, not on the hot path. Drained here -- before the aux-loss
+        # recompute below re-invokes the score function -- so the count is not doubled.
+        if os.environ.get("MOE_VALIDATE_ROUTING", "0") == "1":
+            oob = pop_routing_oob_accum(routing_map.device)
+            if oob is not None:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                layer_number = (
+                    self.layer_number + self.config.num_layers
+                    if self.is_mtp_layer
+                    else self.layer_number
+                )
+                save_to_aux_losses_tracker(
+                    "routing_oob_tokens", oob.float(), layer_number, num_layers
+                )
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -821,6 +822,28 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
+# Debug counter for MOE_VALIDATE_ROUTING (see topk_routing_with_score_function and
+# Router.routing). Maps device -> on-device scalar tensor holding the number of routed
+# expert indices that were out of bounds and clamped since the last drain. Kept on the
+# device so accumulation never forces a host sync on the routing hot path.
+_ROUTING_OOB_ACCUM: Dict[torch.device, torch.Tensor] = {}
+
+
+def pop_routing_oob_accum(device: torch.device) -> Optional[torch.Tensor]:
+    """Return and reset the out-of-bounds routed-index count for ``device``.
+
+    The value is an on-device tensor (no host sync); callers hand it to the aux-loss
+    tracker, which reads it only at the logging interval. Returns None when the guard
+    has recorded nothing for this device (or is disabled). See MOE_VALIDATE_ROUTING.
+    """
+    acc = _ROUTING_OOB_ACCUM.get(device)
+    if acc is None:
+        return None
+    val = acc.clone()
+    acc.zero_()
+    return val
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -883,6 +906,24 @@ def topk_routing_with_score_function(
     assert not (
         fused and precomputed_indices is not None
     ), "precomputed_indices is not supported with the fused top-k score function."
+
+    # Debug guard ($MOE_VALIDATE_ROUTING=1): caller-supplied routed indices -- e.g. the
+    # quantile-balancing / sequence-parallel all-gather path -- can be out of range and
+    # otherwise detonate as a bare device-side ScatterGatherKernel "index out of bounds"
+    # assert in the gather/scatter below (or later in the token dispatcher), with only a
+    # block/thread id to go on. Count the offenders on-device (no host sync) and clamp
+    # them into range so the run survives a rare routing race; the per-layer count is
+    # logged via the aux-loss tracker in Router.routing(). Off by default so production
+    # routing is never silently altered. NOTE: covers the router index path only; a bad
+    # index inside the token dispatcher's own scatter is a separate site.
+    if precomputed_indices is not None and os.environ.get("MOE_VALIDATE_ROUTING", "0") == "1":
+        oob = (precomputed_indices < 0) | (precomputed_indices >= num_experts)
+        acc = _ROUTING_OOB_ACCUM.get(precomputed_indices.device)
+        if acc is None:
+            acc = torch.zeros((), dtype=torch.long, device=precomputed_indices.device)
+            _ROUTING_OOB_ACCUM[precomputed_indices.device] = acc
+        acc += oob.sum()
+        precomputed_indices = torch.clamp(precomputed_indices, 0, num_experts - 1)
 
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:

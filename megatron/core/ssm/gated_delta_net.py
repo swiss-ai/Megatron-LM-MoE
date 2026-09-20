@@ -441,12 +441,42 @@ class GatedDeltaNet(MegatronModule):
         cls._cu_seqlens_int64_cache.append((cu_seqlens, converted))
         return converted
 
+    @staticmethod
+    def _validate_cu_seqlens(cu_seqlens: Tensor) -> None:
+        """Opt-in sanity check ($KDA_VALIDATE_CU_SEQLENS=1) on the packed cu_seqlens.
+
+        A malformed cu_seqlens -- e.g. a batch tensor left truncated/garbage when a
+        dataloader worker dies on a /dev/shm SIGBUS ("insufficient shared memory")
+        -- otherwise detonates as an illegal memory access deep inside FLA's
+        ``_segmented_arange``/``repeat_interleave``, with a traceback that points at
+        the kernel rather than the corrupt input. This raises a readable error naming
+        the offending values instead. Costs one small D2H sync, so it is off by
+        default and enabled only while debugging."""
+        c = cu_seqlens.detach().to("cpu", torch.int64)
+        ok = (
+            c.ndim == 1
+            and c.numel() >= 2
+            and int(c[0]) == 0
+            and bool((c[1:] >= c[:-1]).all())  # monotonic non-decreasing, no wraparound/garbage
+        )
+        if not ok:
+            raise ValueError(
+                "Corrupt cu_seqlens handed to the KDA varlen path "
+                f"(shape={tuple(cu_seqlens.shape)}, dtype={cu_seqlens.dtype}, "
+                f"device={cu_seqlens.device}): expected a 1-D tensor starting at 0 and "
+                f"monotonically non-decreasing, got {c.tolist()}. This is the classic "
+                "signature of a batch truncated by a dataloader /dev/shm SIGBUS "
+                "(check `df -h /dev/shm`), not a KDA kernel bug."
+            )
+
     @classmethod
     def _seq_idx_for_cu_seqlens(cls, cu_seqlens: Tensor) -> Tensor:
         """Per-token document id the CUDA conv backend wants, shared across layers."""
         for source, seq_idx in cls._seq_idx_cache:
             if source is cu_seqlens:
                 return seq_idx
+        if os.environ.get("KDA_VALIDATE_CU_SEQLENS", "0") == "1":
+            cls._validate_cu_seqlens(cu_seqlens)
         from fla.ops.utils import prepare_sequence_ids
 
         seq_idx = prepare_sequence_ids(cu_seqlens).to(torch.int32).unsqueeze(0)
