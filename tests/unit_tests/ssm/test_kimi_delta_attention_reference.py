@@ -1,6 +1,7 @@
 # Copyright (c) 2026, ETH Zurich / Swiss AI Initiative.
 
 import os
+from copy import deepcopy
 
 import pytest
 import torch
@@ -103,6 +104,42 @@ class TestKimiDeltaAttentionReferenceParameterization:
         dt = F.softplus(kda.dt_bias)
         assert torch.all(dt >= 0.001)
         assert torch.all(dt <= 0.1)
+
+    @pytest.mark.parametrize("per_channel", [False, True])
+    @pytest.mark.parametrize("gate_bias", [False, True])
+    @pytest.mark.parametrize("bounded", [False, True])
+    def test_explicit_checkpoint_options_override_environment(self, monkeypatch, per_channel, gate_bias, bounded):
+        monkeypatch.setenv("KDA_ALOG_PER_CHANNEL", "0" if per_channel else "1")
+        config = deepcopy(self.kda.config)
+        config.linear_attention_safe_output_gate = bounded
+        config.linear_attention_safe_output_gate_lower_bound = -5.0
+        spec = get_experimental_attention_variant_module_spec(config=config)
+        kda = KimiDeltaAttention(
+            config, submodules=spec.submodules, layer_number=1,
+            pg_collection=self.kda.pg_collection,
+            a_log_per_channel=per_channel, output_gate_bias=gate_bias,
+        ).cuda()
+        expected_size = kda.num_value_heads * (kda.key_head_dim if per_channel else 1)
+        assert kda.A_log.shape == (expected_size,)
+        assert ("bias" in dict(kda.gate_out_proj.named_parameters())) is gate_bias
+        assert "bias" not in dict(kda.in_proj.named_parameters())
+        assert "bias" not in dict(kda.decay_out_proj.named_parameters())
+        assert "bias" not in dict(kda.out_proj.named_parameters())
+        assert kda.conv1d.bias is None
+        with torch.no_grad():
+            kda.A_log.copy_(torch.linspace(-0.7, 0.9, expected_size, device="cuda"))
+            kda.dt_bias.copy_(torch.linspace(-1, 1, kda.dt_bias.numel(), device="cuda"))
+        alpha = torch.randn(2, 3, kda.num_value_heads, kda.key_head_dim, device="cuda", dtype=torch.bfloat16)
+        logits = alpha.float() + kda.dt_bias.view(1, 1, kda.num_value_heads, kda.key_head_dim)
+        scale = kda.A_log.exp().view(1, 1, kda.num_value_heads, -1)
+        expected = -5.0 * torch.sigmoid(scale * logits) if bounded else -scale * F.softplus(logits)
+        torch.testing.assert_close(kda._activate_decay_torch(alpha, kda.A_log, kda.dt_bias), expected)
+        hidden = torch.randn(8, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output, _ = kda(hidden, None)
+        output.float().square().mean().backward()
+        for parameter in (kda.A_log, kda.dt_bias, kda.in_proj.weight, kda.gate_out_proj.weight):
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
 
     def test_beta_and_output_gate_match_reference_equations(self):
         kda = self.kda
