@@ -10,6 +10,20 @@ from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
 
+_shared_capture_stream = None
+
+
+def get_shared_capture_stream():
+    """Return the process-wide CUDA stream used by model builders for capture.
+
+    Select the target CUDA device before calling this helper. Backported from
+    NVIDIA/Megatron-LM 6513e3e alongside the model-builder API.
+    """
+    global _shared_capture_stream
+    if _shared_capture_stream is None:
+        _shared_capture_stream = torch.cuda.Stream()
+    return _shared_capture_stream
+
 # The below functions traverse through nested data structures (tuples, lists, dicts)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
 # detached from the computation graph, and moved to CUDA device. Non-tensor objects
