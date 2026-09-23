@@ -273,7 +273,15 @@ class KimiDeltaAttention(GatedDeltaNet):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: Optional[int] = None,
         cp_comm_type: Optional[str] = None,
+        a_log_per_channel: Optional[bool] = None,
+        output_gate_bias: Optional[bool] = None,
     ):
+        for name, value in (
+            ("a_log_per_channel", a_log_per_channel),
+            ("output_gate_bias", output_gate_bias),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean or None")
         if not HAVE_KDA:
             raise ImportError(
                 "FLA's chunk_kda op is required for Kimi Delta Attention. "
@@ -415,7 +423,7 @@ class KimiDeltaAttention(GatedDeltaNet):
                 config=second_stage_config,
                 init_method=self.config.init_method,
                 gather_output=False,
-                bias=bias,
+                bias=bias if output_gate_bias is None else output_gate_bias,
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name="kda_gate_out",
@@ -436,7 +444,13 @@ class KimiDeltaAttention(GatedDeltaNet):
         setattr(self.dt_bias, "tensor_model_parallel", True)
         setattr(self.dt_bias, "partition_dim", 0)
         self.dt_bias.is_kda_decay_parameter = True
-        self._alog_per_channel = _env_flag("KDA_ALOG_PER_CHANNEL", False)
+        # Explicit model configuration is authoritative for imported checkpoints.
+        # Preserve the environment switch only for existing training callers.
+        self._alog_per_channel = (
+            _env_flag("KDA_ALOG_PER_CHANNEL", False)
+            if a_log_per_channel is None
+            else a_log_per_channel
+        )
         self._alog_view = (1, 1, -1, self.key_head_dim if self._alog_per_channel else 1)
         self.A_log = nn.Parameter(
             torch.empty(
