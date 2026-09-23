@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -2113,6 +2114,32 @@ def get_batch_on_this_cp_rank(
     return batch
 
 
+def merge_short_documents(cu_seqlens: torch.Tensor, min_len: int) -> torch.Tensor:
+    """Merge every document of at most ``min_len`` tokens into its neighbour.
+
+    Each short document is merged into the next one; the last document, which has no
+    successor, is merged into the previous one if it is still short. Afterwards every
+    segment is longer than ``min_len`` unless the whole sequence is not.
+
+    Args:
+        cu_seqlens: 1-D cumulative sequence lengths, starting at 0.
+        min_len: documents with ``length <= min_len`` are merged; ``<= 0`` disables.
+
+    Returns:
+        cu_seqlens with the merged boundaries removed.
+    """
+    if min_len <= 0 or cu_seqlens.numel() <= 2:
+        return cu_seqlens
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    keep = torch.ones_like(cu_seqlens, dtype=torch.bool)
+    keep[1:-1] = lengths[:-1] > min_len
+    merged = cu_seqlens[keep]
+    # Every segment now ends in a document longer than min_len, except possibly the last.
+    if merged.numel() > 2 and merged[-1] - merged[-2] <= min_len:
+        merged = torch.cat((merged[:-2], merged[-1:]))
+    return merged
+
+
 def pad_thd_batch_for_cp(
     batch: Dict[str, Any],
     cu_seqlens: torch.Tensor,
@@ -2132,6 +2159,13 @@ def pad_thd_batch_for_cp(
     """
     alignment = 2 * cp_size * sp_size
     cu_seqlens_cpu = cu_seqlens.cpu()
+    # A document of at most `alignment` tokens gets a single token per zigzag chunk, which
+    # CP kernels do not handle; merge such documents into a neighbour first.
+    min_len = int(os.environ.get("MEGATRON_CP_MIN_DOC_TOKENS", alignment))
+    merged = merge_short_documents(cu_seqlens_cpu, min_len)
+    if merged.numel() != cu_seqlens_cpu.numel():
+        cu_seqlens_cpu = merged
+        cu_seqlens = merged.to(cu_seqlens.device, dtype=cu_seqlens.dtype)
     lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
     padded_lengths = (lengths + alignment - 1) // alignment * alignment
     padded_lengths[-1] += -padded_lengths.sum() % (local_multiple * cp_size * sp_size)
