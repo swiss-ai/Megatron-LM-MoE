@@ -71,19 +71,22 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
     return attention_mask
 
 
-# Initialize cache for sequence parallel modules
+# Cache MoE layers for the model currently used by inference helpers.
 moe_layer_cache = None
+_moe_layer_cache_model = None
+_moe_metadata_sync_model = None
 
 
 def _init_moe_expert_cache(model):
     """
     Initialize the cache of MoE layers once
     """
-    global moe_layer_cache
-    if moe_layer_cache is not None:
-        return  # already initialized
+    global moe_layer_cache, _moe_layer_cache_model
+    if _moe_layer_cache_model is model:
+        return
 
-    # Cache for moe layers.
+    # Rebind the cache when a new model or engine is created.
+    _moe_layer_cache_model = model
     moe_layer_cache = []
     seen_modules = set()
 
@@ -98,6 +101,19 @@ def _init_moe_expert_cache(model):
             walk(child)
 
     walk(model)
+
+
+def set_moe_metadata_sync(model) -> None:
+    """Enable metadata synchronization on the first inference MoE dispatcher."""
+    global moe_layer_cache, _moe_metadata_sync_model
+    _init_moe_expert_cache(model)
+    if _moe_metadata_sync_model is model:
+        return
+    for i, moe_layer in enumerate(moe_layer_cache):
+        dispatcher = getattr(moe_layer, "_inference_token_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher._runs_metadata_sync = i == 0
+    _moe_metadata_sync_model = model
 
 
 def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int = None):
@@ -115,8 +131,7 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
     - capacity_factor: Capacity scaling shared by router and dispatchers.
     """
     global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
+    _init_moe_expert_cache(model)
 
     cfg = get_model_config(model)
 
@@ -209,8 +224,7 @@ def set_inference_cuda_graphed_iteration_for_ep_inference(model):
     its behavior for CUDA graph compatibility.
     """
     global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
+    _init_moe_expert_cache(model)
 
     for moe_layer in moe_layer_cache:
         moe_layer.set_inference_cuda_graphed_iteration()
@@ -222,8 +236,7 @@ def unset_inference_cuda_graphed_iteration_for_ep_inference(model):
     Clears the flag in all MoELayers, restoring standard dispatcher behavior.
     """
     global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
+    _init_moe_expert_cache(model)
 
     for moe_layer in moe_layer_cache:
         moe_layer.unset_inference_cuda_graphed_iteration()

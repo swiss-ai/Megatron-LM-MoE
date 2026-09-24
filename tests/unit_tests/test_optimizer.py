@@ -74,6 +74,8 @@ class Net(nn.Module):
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_no_overrides(mock_get_world_size):
     net = Net()
     # NOTE: to get no overrides, supply an empty dictionary rather than None.
@@ -131,6 +133,8 @@ def test_filter_and_reorder_param_groups_rejects_duplicate_identity_keys():
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
     net = Net()
@@ -148,6 +152,8 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_with_overrides(mock_get_world_size):
     net = Net()
     config_overrides = {
@@ -173,6 +179,8 @@ def test_get_param_groups_with_overrides(mock_get_world_size):
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_multiple_matches(mock_get_world_size):
     net = Net()
 
@@ -203,6 +211,8 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_overlapping_matches(mock_get_world_size):
     """In this test, we see if we can have two matches that create three param groups."""
     net = Net()
@@ -243,6 +253,8 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernorm: bool):
     """In this test, we see if the standard config overrides are applied correctly."""
 
@@ -279,6 +291,8 @@ def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernor
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: bool):
     """In this test, we see if the `apply_wd_to_qk_layernorm` config is applied correctly."""
 
@@ -318,6 +332,8 @@ def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: b
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+
+
 def test_get_param_groups_weight_decay_all_param(mock_get_world_size):
     """With weight_decay_all_param=True, every parameter (including scalar/1d params such as
     biases and norm weights) receives weight decay (wd_mult=1.0). No wd_mult=0.0 override is
@@ -420,6 +436,378 @@ def test_chained_optimizer_get_parameters():
     assert result == opt1.params + opt2.params + opt3.params
 
 
+def test_chained_optimizer_clips_mtp_grads_separately():
+    """MTP gradients are normed and clipped independently from main gradients."""
+    from megatron.core import parallel_state
+
+    class MockOptimizer:
+        """Mock that exposes real MTP grads for group-norm computation."""
+
+        def __init__(self, main_param, mtp_param, config):
+            self.config = config
+            self.main_param = main_param
+            self.mtp_param = mtp_param
+            self.param_groups = [{"params": [main_param, mtp_param]}]
+            self.step_called = False
+            self.is_stub_optimizer = False
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            return 0.5
+
+        def get_parameters(self):
+            return [self.main_param, self.mtp_param]
+
+        def get_grad_stats_parallel_group(self):
+            return parallel_state.get_model_parallel_group()
+
+        def has_grad_norm_group(self, grad_norm_group):
+            return True
+
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
+            return [self.mtp_param.grad]
+
+        def step_with_ready_grads(self):
+            self.step_called = True
+            return True
+
+    Utils.initialize_model_parallel()
+    try:
+        config = OptimizerConfig(clip_grad=1.0)
+        main_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        main_param.grad = torch.full_like(main_param, 0.25)
+        mtp_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        mtp_param.grad_norm_group = 'mtp'
+        # MTP grad norm is much larger than the clipping threshold.
+        mtp_param.grad = torch.full_like(mtp_param, 10.0)
+
+        optimizer = MockOptimizer(main_param, mtp_param, config)
+        chained_optimizer = ChainedOptimizer([optimizer])
+
+        update_successful, grad_norm, num_zeros_in_grad = chained_optimizer.step()
+
+        # MTP group norm was computed independently from the main norm.
+        mtp_group_norm = chained_optimizer.grad_norms_by_group.get('mtp', 0.0)
+        assert mtp_group_norm > 1.0
+        assert update_successful is True
+        assert optimizer.step_called is True
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_separation():
+    """Test that grad-norm helpers separate gradients based on grad_norm_group."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        """Minimal mock of MegatronOptimizer for testing grad filtering."""
+
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        # Create params: 2 main + 2 MTP
+        main_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        mtp_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        for p in mtp_params:
+            p.grad_norm_group = 'mtp'
+
+        # Assign gradients
+        all_params = main_params + mtp_params
+        for p in all_params:
+            p.grad = torch.randn_like(p)
+
+        mock_opt = MockOptimizer(all_params)
+
+        main_grads = mock_opt.get_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm('mtp')
+
+        assert len(main_grads) == 2
+        assert len(mtp_grads) == 2
+
+        # Verify the grads match the expected params
+        for grad, param in zip(main_grads, main_params):
+            assert torch.equal(grad, param.grad)
+        for grad, param in zip(mtp_grads, mtp_params):
+            assert torch.equal(grad, param.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_separation_no_mtp_params():
+    """Test that without a registered separate grad-norm group, all grads go to main."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(3)]
+        for p in params:
+            p.grad = torch.randn_like(p)
+
+        mock_opt = MockOptimizer(params)
+
+        main_grads = mock_opt.get_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm('mtp')
+
+        assert len(main_grads) == 3
+        assert len(mtp_grads) == 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_unregistered_grad_norm_group_raises():
+    """Unknown grad-norm groups fail fast instead of silently joining the main norm."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+    param.grad_norm_group = 'unregistered'
+    param.grad = torch.randn_like(param)
+
+    with pytest.raises(ValueError, match="Unknown grad_norm_group"):
+        MockOptimizer([param]).get_grads_for_grad_norm()
+
+def test_has_grad_norm_group():
+    """has_grad_norm_group reflects whether any param is in the requested group."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        plain = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        assert MockOptimizer(plain).has_grad_norm_group('mtp') is False
+
+        tagged = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        tagged.grad_norm_group = 'mtp'
+        assert MockOptimizer(plain + [tagged]).has_grad_norm_group('mtp') is True
+
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_clipping_uses_separate_norms():
+    """clip_grad_norm clips MTP params by their own norm, independently of main params."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        clip_grad_norm = MegatronOptimizer.clip_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        clip = 1.0
+        # Main param: large grad (norm >> clip) -> should be scaled down.
+        main_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        main_param.grad = torch.full((4, 4), 10.0, device='cuda')
+        main_norm_before = main_param.grad.norm().item()
+        # MTP param: tiny grad (norm < clip) -> below threshold, should be untouched.
+        mtp_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        mtp_param.grad_norm_group = 'mtp'
+        mtp_param.grad = torch.full((4, 4), 1e-3, device='cuda')
+        mtp_grad_before = mtp_param.grad.clone()
+
+        opt = MockOptimizer([main_param, mtp_param])
+        returned_norm = opt.clip_grad_norm(clip)
+
+        # Returned norm excludes MTP and reflects only the main params.
+        torch.testing.assert_close(float(returned_norm), main_norm_before, rtol=1e-4, atol=1e-4)
+        # Main grads were clipped down toward the threshold.
+        assert main_param.grad.norm().item() < main_norm_before
+        # MTP grads, below the clip threshold, are clipped independently and left unchanged.
+        torch.testing.assert_close(mtp_param.grad, mtp_grad_before)
+        assert 'mtp' in opt.grad_norms_by_group
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_chained_optimizer_split_phase_refreshes_group_norms():
+    """Split-phase steps recompute grouped norms after gradients change."""
+    from megatron.core import parallel_state
+
+    class MockOptimizer:
+        def __init__(self, main_param, mtp_param, config):
+            self.config = config
+            self.main_param = main_param
+            self.mtp_param = mtp_param
+            self.param_groups = [{"params": [main_param, mtp_param]}]
+            self.is_stub_optimizer = False
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            return self.main_param.grad.norm().item()
+
+        def get_parameters(self):
+            return [self.main_param, self.mtp_param]
+
+        def get_grad_stats_parallel_group(self):
+            return parallel_state.get_model_parallel_group()
+
+        def has_grad_norm_group(self, grad_norm_group):
+            return True
+
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
+            return [self.mtp_param.grad] if grad_norm_group == 'mtp' else [self.main_param.grad]
+
+        def step_with_ready_grads(self):
+            return True
+
+    Utils.initialize_model_parallel()
+    try:
+        config = OptimizerConfig(clip_grad=1.0)
+        main_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        main_param.grad = torch.full_like(main_param, 0.25)
+        mtp_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        mtp_param.grad_norm_group = 'mtp'
+        mtp_param.grad = torch.ones_like(mtp_param)
+        optimizer = ChainedOptimizer(
+            [MockOptimizer(main_param, mtp_param, config)]
+        )
+
+        _, first_main_norm = optimizer.prepare_grad_norm()
+        optimizer.step_after_grad_norm(first_main_norm)
+        first_norm = float(optimizer.grad_norms_by_group['mtp'])
+        first_clipped_norm = float(mtp_param.grad.norm())
+
+        mtp_param.grad = torch.full_like(mtp_param, 2.0)
+        _, second_main_norm = optimizer.prepare_grad_norm()
+        optimizer.step_after_grad_norm(second_main_norm)
+        second_norm = float(optimizer.grad_norms_by_group['mtp'])
+        second_clipped_norm = float(mtp_param.grad.norm())
+
+        torch.testing.assert_close(float(first_main_norm), 0.5, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(float(second_main_norm), 0.5, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(float(main_param.grad.norm()), 0.5, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(first_norm, 2.0, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(second_norm, 4.0, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(first_clipped_norm, 1.0, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(second_clipped_norm, 1.0, rtol=1e-4, atol=1e-4)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_copy_optimizer_param_metadata_preserves_optimizer_routing():
+    """Optimizer copies retain shared, MTP, and existing routing metadata."""
+    from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
+
+    source = torch.nn.Parameter(torch.ones(2, 2))
+    destination = torch.nn.Parameter(torch.zeros(2, 2))
+    source.shared = True
+    source.grad_norm_group = 'mtp'
+    source.is_router = True
+    source.md_gain_log_layer = 3
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination.shared is True
+    assert destination.grad_norm_group == 'mtp'
+    assert destination.is_router is True
+    assert destination.md_gain_log_layer == 3
+
+
+def test_precision_aware_fsdp_group_norm_and_clipping_use_decoupled_grad():
+    """FSDP precision-aware paths norm and clip decoupled gradients by group."""
+    from megatron.core import parallel_state
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        clip_grad_norm = MegatronOptimizer.clip_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(
+                optimizer='adam',
+                lr=0.01,
+                clip_grad=1.0,
+                use_precision_aware_optimizer=True,
+                use_distributed_optimizer=True,
+            )
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        main_param = torch.nn.Parameter(torch.ones(4, 4, device='cuda'))
+        main_param.__fsdp_param__ = True
+        main_param.grad = None
+        main_param.decoupled_grad = torch.full_like(main_param, 2.0)
+        mtp_param = torch.nn.Parameter(torch.ones(4, 4, device='cuda'))
+        mtp_param.__fsdp_param__ = True
+        mtp_param.grad_norm_group = 'mtp'
+        mtp_param.grad = None
+        mtp_param.decoupled_grad = torch.full_like(mtp_param, 0.25)
+
+        opt = MockOptimizer([main_param, mtp_param])
+        returned_norm = opt.clip_grad_norm(1.0)
+
+        torch.testing.assert_close(float(returned_norm), 8.0, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(float(main_param.decoupled_grad.norm()), 1.0, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(
+            float(mtp_param.decoupled_grad.norm()), 1.0, rtol=1e-4, atol=1e-4
+        )
+        assert 'mtp' in opt.grad_norms_by_group
+    finally:
+        Utils.destroy_model_parallel()
+
 def test_precision_aware_fused_adam():
     try:
         from transformer_engine.pytorch.optimizers import FusedAdam
@@ -479,6 +867,8 @@ def test_precision_aware_fused_adam():
     [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
 @pytest.mark.skip(reason="inconsistent ci test runs resulting in NCCL errors")
+
+
 def test_precision_aware_optimizer(
     precision: str,
     main_params_dtype: torch.dtype,
@@ -587,6 +977,8 @@ def test_precision_aware_optimizer(
 
 
 @pytest.mark.parametrize("use_precision_aware", [True, False])
+
+
 def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
     """Test that save/load of distributed optimizer handles non-tensor state entries.
 
@@ -718,6 +1110,8 @@ def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("precision", ['bf16', 'fp32'])
+
+
 def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -840,6 +1234,8 @@ def test_optimizer_reload_model_params():
         (8, 2, 2, 2),  # 8 GPUs, 2 TP, 2 CP, 2 DP
     ],
 )
+
+
 def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, cp_size, dp_size):
     """
     Test that get_megatron_optimizer works correctly with custom process groups

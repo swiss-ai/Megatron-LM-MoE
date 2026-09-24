@@ -5,7 +5,6 @@ import concurrent.futures
 import logging
 import multiprocessing
 import socket
-import struct
 import time
 import warnings
 from collections import deque
@@ -24,6 +23,7 @@ from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
+    RequestCapacityOverflowError,
     TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -49,8 +49,8 @@ from megatron.core.inference.utils import (
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -60,7 +60,11 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    nvtx_range_pop,
+    nvtx_range_push,
+    round_up_to_nearest_multiple,
     trace_async_exceptions,
+    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
@@ -134,11 +138,40 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
+    if mem_bytes < 0:
+        return "-" + format_mem_bytes(-mem_bytes)
     for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
         suffix_bytes = 1024**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
+
+
+def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
+    """Return (reserved, allocated) bytes belonging to the global CUDA graph mempool.
+
+    PyTorch's `torch.cuda.memory_stats()` reports process-wide totals that mix in
+    every other allocation (KV cache, NCCL workspaces, layer scratch). To isolate
+    growth caused by graph capture, we walk `torch.cuda.memory_snapshot()` and
+    filter segments by their `segment_pool_id` against the graph pool handle.
+    Returns (0, 0) if the pool hasn't been created yet.
+    """
+    pool_id = CudaGraphManager.global_mempool
+    if pool_id is None:
+        return 0, 0
+    reserved = 0
+    allocated = 0
+    for seg in torch.cuda.memory_snapshot():
+        seg_pool_id = (
+            seg.get("segment_pool_id")
+            or seg.get("private_pool_id")
+            or seg.get("pool_id")
+            or seg.get("pool")
+        )
+        if seg_pool_id == pool_id:
+            reserved += seg.get("total_size", 0)
+            allocated += seg.get("allocated_size", 0)
+    return reserved, allocated
 
 
 @dataclass(kw_only=True)
@@ -212,11 +245,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > 0:
             assert (
-                self.num_speculative_tokens <= self.controller.num_mtp_heads
+                model_config.mtp_use_repeated_layer
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert (
-                not self.materialize_only_last_token_logits
-            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
 
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
@@ -225,8 +256,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        self.disable_ep_consensus = inference_config.disable_ep_consensus
         self.cuda_graph_impl = model_config.cuda_graph_impl
-        self.cuda_graph_scope = model_config.cuda_graph_scope
+        self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
+        self.cuda_graph_modules = model_config.cuda_graph_modules
         # Initialize engine.
         self.reset()
 
@@ -333,23 +366,24 @@ class DynamicInferenceEngine(AbstractEngine):
             reset_context (bool): Whether to reset the context after building cuda graphs.
         """
 
-        if self.cuda_graph_impl != "local":
+        if self.inference_cuda_graph_scope == InferenceCudaGraphScope.none:
             return
 
-        if (
-            CudaGraphScope.full_iteration in self.cuda_graph_scope
-            and CudaGraphScope.full_iteration_inference not in self.cuda_graph_scope
-        ):
-            warnings.warn(
-                "\n\n*** WARNING: 'full_iteration' CUDA graph scope used during inference! "
-                "This will not create inference CUDA graphs. Use '--cuda-graph-scope=full_iteration_inference' instead. ***\n"
-            )
+        if self.cuda_graph_impl != "local":
+            return
 
         context = self.context
         controller = self.controller
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
+
+        # Snapshot of process-wide stats for the "total memory used by capture" summary.
+        start_proc_reserved = mem_stats_start["reserved_bytes.all.current"]
+        start_proc_alloc = mem_stats_start["allocated_bytes.all.current"]
+
+        # Pool-scoped baselines for the per-iteration deltas.
+        prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
 
         logging.info("> dynamic_engine.py: building cuda graphs for ")
         for graph in context.cuda_graph_batch_dimensions_list:
@@ -364,6 +398,22 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
+        # Capture MTP graphs alongside decoder graphs for each distinct request count.
+        mtp_model = unwrap_model(controller.inference_wrapped_model.model)
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(mtp_model, "mtp")
+        )
+        if mtp_warmup_enabled:
+            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
+            sp_enabled = model_config.sequence_parallel and tp_size > 1
+            mtp_pass_depth = not mtp_model.mtp.mtp_use_repeated_layer
+            mtp_warmup_depths = (
+                range(controller._num_mtp_depths) if mtp_pass_depth else [None]
+            )
+            mtp_seen_batch_sizes = set()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -388,7 +438,36 @@ class DynamicInferenceEngine(AbstractEngine):
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
             # Forward pass -> logits.
-            controller._dynamic_step_forward_logits(input_ids, position_ids)
+            logits = controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+            # Warm FlashInfer sampling graphs after the model graph. Torch sampling
+            # remains eager and does not require a separate capture.
+            if controller._sampling_backend == "flashinfer":
+                if controller.num_speculative_tokens > 0:
+                    controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                else:
+                    controller._dynamic_step_sample_logits()
+
+            if mtp_warmup_enabled:
+                n = cuda_graph_batch_dimension.req_count
+                if sp_enabled:
+                    n = round_up_to_nearest_multiple(n, tp_size)
+                if n > 0 and n not in mtp_seen_batch_sizes:
+                    mtp_seen_batch_sizes.add(n)
+                    device = torch.cuda.current_device()
+                    batch_dim = n // tp_size if sp_enabled else n
+                    for depth in mtp_warmup_depths:
+                        mtp_model.compute_mtp_single_step(
+                            hidden_states=torch.zeros(
+                                (batch_dim, 1, model_config.hidden_size),
+                                device=device,
+                                dtype=model_config.params_dtype,
+                            ),
+                            next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                            position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                            depth=depth,
+                            cache_key=("mtp", n, depth),
+                        )
 
             context.reset()
 
@@ -396,24 +475,44 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
+            # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
+            # This isolates pool growth from process-wide scratch churn (KV cache,
+            # NCCL workspaces, etc.) that pollutes `torch.cuda.memory_stats()`.
+            pool_reserved, pool_alloc = _cuda_graph_mempool_bytes()
+            logging.info(
+                "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
+                tbar_idx + 1,
+                len(context.cuda_graph_batch_dimensions_list),
+                cuda_graph_batch_dimension,
+                format_mem_bytes(pool_reserved),
+                format_mem_bytes(pool_reserved - prev_pool_reserved),
+                format_mem_bytes(pool_alloc),
+                format_mem_bytes(pool_alloc - prev_pool_alloc),
+            )
+            prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
+
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            controller.has_mtp_cuda_graphs = True
+            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
+
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
+        final_pool_reserved, final_pool_alloc = _cuda_graph_mempool_bytes()
         capture_stats = {
             "time": time_end - time_start,
-            "allocated_bytes": (
-                mem_stats_end["allocated_bytes.all.current"]
-                - mem_stats_start["allocated_bytes.all.current"]
-            ),
-            "reserved_bytes": (
-                mem_stats_end["reserved_bytes.all.current"]
-                - mem_stats_start["reserved_bytes.all.current"]
-            ),
+            "allocated_bytes": (mem_stats_end["allocated_bytes.all.current"] - start_proc_alloc),
+            "reserved_bytes": (mem_stats_end["reserved_bytes.all.current"] - start_proc_reserved),
+            "pool_reserved_bytes": final_pool_reserved,
+            "pool_allocated_bytes": final_pool_alloc,
         }
         logging.info(
-            "> built cuda graph(s) in %.2f sec, with total memory usage: "
-            "allocated %s, reserved %s.",
+            "> built cuda graph(s) in %.2f sec. "
+            "Mempool: reserved %s, allocated %s. "
+            "Process-wide delta: allocated %s, reserved %s.",
             capture_stats["time"],
+            format_mem_bytes(capture_stats["pool_reserved_bytes"]),
+            format_mem_bytes(capture_stats["pool_allocated_bytes"]),
             format_mem_bytes(capture_stats["allocated_bytes"]),
             format_mem_bytes(capture_stats["reserved_bytes"]),
         )
@@ -549,20 +648,16 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            mp_len_sock = self.zmq_context.socket(zmq.PUB)
-            mp_len_sock.bind_to_random_port(f"tcp://{local_ip}")
-            mp_len_addr = mp_len_sock.getsockopt_string(zmq.LAST_ENDPOINT)
         else:
             mp_req_addr = None
-            mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
         bcast = [dp_addr]
         torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
-        bcast = [mp_req_addr, mp_len_addr]
+        bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
-        [mp_req_addr, mp_len_addr] = bcast
+        [mp_req_addr] = bcast
 
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
@@ -579,33 +674,24 @@ class DynamicInferenceEngine(AbstractEngine):
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
             self.model_parallel_publisher_socket = mp_req_sock
-
-            # 3. Create another publisher socket to broadcast the number of messages to receive.
-            self.model_parallel_num_msgs_publisher_socket = mp_len_sock
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
-                self.model_parallel_num_msgs_publisher_socket,
                 self.model_parallel_publisher_socket,
             ]
-        # All MP ranks subscribe to the two publisher sockets
+        # All MP ranks subscribe to the publisher socket
         self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
         self.model_parallel_subscriber_socket.connect(mp_req_addr)
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
-        self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-
-        self.zmq_sockets += [
-            self.model_parallel_subscriber_socket,
-            self.model_parallel_num_msgs_subscriber_socket,
-        ]
+        self.zmq_sockets += [self.model_parallel_subscriber_socket]
 
         torch.distributed.barrier(mp_group)
 
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
@@ -825,6 +911,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
+                f"Active buffer token capacity: "
+                f"{self.context.kv_block_allocator.active_count * self.context.block_size_tokens} "
                 f"Chunked prefill enabled: {self.enable_chunked_prefill}"
             )
 
@@ -936,6 +1024,27 @@ class DynamicInferenceEngine(AbstractEngine):
         ) or (request.sampling_params.num_tokens_to_generate < 0):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+
+        request_token_capacity = (
+            self.context.kv_block_allocator.active_count * self.context.block_size_tokens
+        )
+        request_token_count = (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+        )
+        if request_token_count > request_token_capacity:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(
+                RequestCapacityOverflowError(
+                    request_id,
+                    message=(
+                        f"request needs up to {request_token_count} tokens, but the active "
+                        f"inference buffer holds {request_token_capacity} tokens "
+                        f"({self.context.kv_block_allocator.active_count} blocks of "
+                        f"{self.context.block_size_tokens}); increase buffer_size_gb or "
+                        "reduce the prompt or generation length"
+                    ),
+                )
+            )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
@@ -1097,6 +1206,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            num_length_trim = 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1105,10 +1215,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    tokens = tokens[
-                        : request.sampling_params.num_tokens_to_generate
+                    remaining_tokens = (
+                        request.sampling_params.num_tokens_to_generate
                         - len(request.generated_tokens)
-                    ]
+                    )
+                    num_length_trim = len(tokens) - remaining_tokens
+                    tokens = tokens[:remaining_tokens]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1161,8 +1273,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Track acceptance statistics for logging.
                 if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
+                    num_output_trim = num_length_trim + num_stop_word_trim
+                    actual_proposed = max(0, self.num_speculative_tokens - num_output_trim)
+                    actual_accepted = max(0, len(accepted_tokens) - num_output_trim)
 
                     self._spec_tokens_proposed += actual_proposed
                     self._spec_tokens_accepted += actual_accepted
@@ -1190,13 +1303,39 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 active_request_ids.append(request_id)
 
-            # When a stop word was found mid-speculative-batch, trim log probs
-            # and top_n_logprobs to match the truncated generated_tokens.
-            if num_stop_word_trim > 0:
+            # A request whose stop word was detected on the previous step only
+            # participates in this step so bookkeeping can remove it. Discard
+            # outputs from that final forward because no corresponding tokens
+            # were appended above.
+            if request_id in self.stop_word_being_finished_ids:
+                request_log_probs = None
+                if top_n_logprobs is not None:
+                    top_n_logprobs.pop(req_idx, None)
+
+            # Trim per-token outputs to match tokens removed at the requested
+            # generation length or at a stop word inside a speculative batch.
+            num_output_trim = num_length_trim + num_stop_word_trim
+            if num_output_trim > 0:
+                # A multi-token stop word can span decode steps. In that case,
+                # some corresponding log probabilities have already been
+                # accumulated on the request and must be removed there too.
                 if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                    accumulated_trim = max(0, num_stop_word_trim - len(request_log_probs))
+                    if accumulated_trim > 0 and request.generated_log_probs:
+                        request.generated_log_probs = request.generated_log_probs[
+                            :-accumulated_trim
+                        ]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                    current_top_n = top_n_logprobs[req_idx]
+                    accumulated_trim = max(0, num_stop_word_trim - len(current_top_n))
+                    if accumulated_trim > 0 and request.generated_top_n_logprobs:
+                        request.generated_top_n_logprobs = request.generated_top_n_logprobs[
+                            :-accumulated_trim
+                        ]
+                if request_log_probs is not None:
+                    request_log_probs = request_log_probs[:-num_output_trim]
+                if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_output_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
             if request_log_probs is not None:
@@ -1785,6 +1924,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.prefix_cache_blocks_matched = 0
 
         # Log KV cache utilization stats to W&B
+        nvtx_range_push("wandb_logging")
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
@@ -1824,13 +1964,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.metrics_writer.log(metrics, commit=True)
             else:
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
+        nvtx_range_pop("wandb_logging")
 
         # Print context state.
+        nvtx_range_push("console_logging")
         if (
             self.logging_step_interval > 0
             and self.context.step_count % self.logging_step_interval == 0
         ):
+            nvtx_range_push("cuda_memory_stats")
             mem = torch.cuda.memory_stats()
+            nvtx_range_pop("cuda_memory_stats")
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
@@ -1896,6 +2040,8 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.context.enable_prefix_caching:
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
+
+        nvtx_range_pop("console_logging")
 
         return {
             "active_request_ids": active_request_ids,
@@ -1986,9 +2132,11 @@ class DynamicInferenceEngine(AbstractEngine):
     def _run_ep_dummy_step(self) -> None:
         """Participate in an EP inference step without advancing local requests."""
         self.step_start_event.record()
+        nvtx_range_push("EP-dummy-forward")
         self.controller.dummy_forward()
         self.step_end_event.record()
         self.step_end_event.synchronize()
+        nvtx_range_pop()
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
@@ -2061,28 +2209,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
-            messages_to_dequeue = len(all_messages)
-            # First publish the number of messages to dequeue.
-            # This is important because we want all tensor parallel ranks
-            # to dequeue the same number of messages.
-            self.model_parallel_num_msgs_publisher_socket.send(
-                struct.pack('!i', messages_to_dequeue)
+            self.model_parallel_publisher_socket.send_multipart(
+                [bytes([Headers.TP_BROADCAST.value])] + all_messages
             )
-            # Now publish the actual messages to all model parallel ranks
-            if messages_to_dequeue > 0:
-                self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
-            # First, receive the number of messages to dequeue from mp-rank 0
-            messages_to_dequeue = struct.unpack(
-                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
-            )[0]
-            # Now, dequeue the same number of messages from the subscriber socket.
-            # Note that these receives are blocking, because the messages
-            # are guaranteed to be available after the tp-rank 0 has sent them.
-            if messages_to_dequeue > 0:
-                all_messages = self.model_parallel_subscriber_socket.recv_multipart()
-            else:
-                all_messages = []
+            frames = self.model_parallel_subscriber_socket.recv_multipart()
+            all_messages = frames[1:]
 
         range_pop()
 
@@ -2309,9 +2441,50 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    global_work, all_pausing = await self._ep_establish_consensus(
-                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                    )
+                    if self.disable_ep_consensus:
+                        # Skip the EP consensus all-reduce; act on local state only.
+                        # NOTE: even with no consensus we must still participate in EP
+                        # collectives (NCCL all-to-all, etc.) every iteration. A peer with
+                        # real work will block at its all-to-all kernel waiting for this
+                        # rank, so when there is no local work we run dummy_forward()
+                        # rather than sleeping. Sleeping here would deadlock EP > 1.
+                        if self.state == EngineState.PAUSING:
+                            await self._world_barrier()
+                            self.state = EngineState.PAUSED
+                            self._state_events[EngineState.PAUSED].set()
+                        elif local_pending > 0:
+                            await self.async_step()
+                        else:
+                            self.step_start_event.record()
+                            nvtx_range_push("EP-dummy-forward")
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            self.step_end_event.synchronize()
+                            nvtx_range_pop("EP-dummy-forward")
+                            self.context.step_count += 1
+                            self.context.prefix_cache_lru_clock += 1
+                            # The consensus path yields via _ep_establish_consensus;
+                            # without it we must still let other coroutines (signal
+                            # delivery, request scheduling) run between steps.
+                            await asyncio.sleep(0)
+                        continue
+                    global_work_from_last_consensus, _ = self._last_ep_consensus
+                    if (
+                        global_work_from_last_consensus == 0
+                        or self._ep_consensus_loop_counter % 20 == 0
+                    ):
+                        # selectively enter ep_establish_consensus if
+                        # 1. there is no global work -> engine is idle. At any step in the future
+                        #    one of the ranks can receive work. So we should be eagerly checking for that
+                        # 2. it has been 20 steps since we last established consensus, and that consensus
+                        #    had some work.
+                        # In the worst case, this delays pausing by 20 steps which is around
+                        # 200-400 milliseconds.
+                        self._last_ep_consensus = await self._ep_establish_consensus(
+                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                        )
+                    global_work, all_pausing = self._last_ep_consensus
+                    self._ep_consensus_loop_counter += 1
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
@@ -2337,6 +2510,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
+                    # The cache from the PAUSING phase still has all_pausing=True;
+                    # without this reset the next RUNNING iteration would skip
+                    # consensus, read the stale flag, and immediately re-pause.
+                    self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()

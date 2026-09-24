@@ -33,7 +33,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -45,7 +45,7 @@ from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, 
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
+from .utils import append_to_progress_log, is_last_rank, print_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
@@ -452,6 +452,12 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
+    if getattr(args, 'moe_use_offloading_experts', False):
+        # OffloadingExpertsMLP now serializes weights in the canonical Sequential/TE schema.
+        # The marker distinguishes these checkpoints from older offloading checkpoints, whose
+        # args also enable offloading but whose tensor keys are experts.weight1/weight2.
+        metadata['moe_expert_checkpoint_schema'] = 'sequential'
+        metadata['moe_expert_checkpoint_has_te_extra_state'] = False
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -779,7 +785,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
                              f"saved local checkpoint from iteration {iteration:7d}")
                 if args.log_progress and args.async_save:
-                    append_to_progress_log(f'Saved async local checkpoint\tIteration: {iteration}',
+                    append_to_progress_log(args.save, f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
         else:
             def iter_finalize_fn():
@@ -798,7 +804,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
                              f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
                 if args.log_progress and args.async_save:
-                    append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
+                    append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
 
                 if save_retain_interval is not None:
@@ -899,7 +905,7 @@ def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=F
         print(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
               f'at {save_path}', flush=True)
         if log_progress:
-            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+            append_to_progress_log(save_path, f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
     except Exception as e:
         print(f'  encountered exception "{e}" when trying to delete checkpoint from '
               f'iteration {iteration_to_delete:7d} at {save_path}', flush=True)
@@ -1812,6 +1818,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Ensure we have a dict before updating to avoid NoneType AttributeError.
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
+        if (
+            getattr(ckpt_args, 'moe_use_offloading_experts', False)
+            and 'moe_expert_checkpoint_schema' not in sharded_sd_metadata
+        ):
+            # Pre-canonical offloading checkpoints used experts.weight1/weight2 in [in, out]
+            # orientation. Expert modules consume this marker to request that schema and
+            # transpose it into their runtime layout.
+            sharded_sd_metadata['moe_expert_checkpoint_schema'] = 'legacy_offloading'
+            sharded_sd_metadata['moe_expert_checkpoint_has_te_extra_state'] = False
         sharded_sd_metadata["dp_cp_group"] = dp_cp_group
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)

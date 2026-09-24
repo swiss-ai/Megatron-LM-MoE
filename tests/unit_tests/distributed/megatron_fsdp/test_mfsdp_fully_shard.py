@@ -664,6 +664,29 @@ class TestMegatronFsdpFullyShard:
         # Destroy device mesh.
         destroy_device_mesh(device_mesh)
 
+    def test_fully_shard_preserves_grad_norm_group(self):
+        """FSDP optimizer parameters retain gradient-norm metadata from model params."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        toy_model, fsdp_unit_modules = build_toy_model(TRANSFORMER, False)
+        tagged_name, tagged_param = next(iter(toy_model.named_parameters()))
+        tagged_param.grad_norm_group = "mtp"
+
+        mfsdp_model = fully_shard_model(
+            module=toy_model,
+            fsdp_unit_modules=fsdp_unit_modules,
+            zero_dp_strategy=OPTIM_GRADS_PARAMS,
+        )
+        optimizer = fully_shard_optimizer(Adam(params=mfsdp_model.parameters(), lr=0.01))
+        optimizer_params = [p for group in optimizer.param_groups for p in group["params"]]
+
+        assert any(getattr(param, "grad_norm_group", None) == "mtp" for param in optimizer_params), (
+            f"FSDP optimizer lost grad_norm_group from {tagged_name}"
+        )
+
     @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
     def test_fully_shard_ez(self, shard_strategy):
         """

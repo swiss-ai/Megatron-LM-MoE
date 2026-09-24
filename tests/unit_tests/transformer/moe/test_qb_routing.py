@@ -173,6 +173,23 @@ class TestQuantileBalancingRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_frozen_qb_routes_with_loaded_beta_without_collecting_updates(self):
+        config = replace(self.transformer_config, moe_router_quantile_balancing_freeze=True)
+        router = cast(Router, MoELayer(config, self.submodules).router).cuda()
+        router.train()
+        with torch.no_grad():
+            router.qb_beta.zero_()
+            router.qb_beta[:2] = 10.0
+
+        logits = torch.zeros((2, self.num_moe_experts), device="cuda", dtype=torch.bfloat16)
+        _, routing_map = router.quantile_balancing(logits)
+
+        assert not routing_map[:, :2].any()
+        torch.testing.assert_close(router.qb_beta_accum, torch.zeros_like(router.qb_beta_accum))
+        assert router.qb_beta_count.item() == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_qb_seq_aux_loss_uses_qb_dispatch_and_raw_aux_map(self, monkeypatch):
         config = TransformerConfig(
             num_layers=2,
@@ -341,11 +358,8 @@ class TestQuantileBalancingRouter:
             dtype=torch.bool,
             device="cuda",
         )
-        # The router now hands down every row plus the mask, instead of compacting the
-        # padded rows away itself: the compaction was a boolean gather, which lowers to
-        # nonzero(), synchronizes the device and makes the shape data-dependent, so the
-        # router could not be CUDA-graph captured. compute_qb_histogram drops the padded
-        # rows instead, and test_routers.py pins its counts to the compacting path's.
+        # Keep the row shape static for CUDA graph capture. The histogram helper
+        # excludes padded rows using the mask without compacting at this call site.
         all_scores = torch.sigmoid(logits.reshape(-1, self.num_moe_experts))
         expected_alpha = (
             (all_scores - router.qb_beta).topk(router.topk + 1, dim=1).values[:, -1]

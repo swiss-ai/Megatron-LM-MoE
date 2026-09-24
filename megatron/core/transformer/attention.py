@@ -52,7 +52,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 from .utils import is_layer_window_attention
 
@@ -834,16 +834,18 @@ class Attention(MegatronModule, ABC):
             "sm_margin": 0,
         }
 
-        # Parse the expect argument names from the function signature
-        if inspect.isfunction(_flash_attn_forward):
-            sig = inspect.signature(_flash_attn_forward)
-        else:
-            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
-            sig = inspect.signature(_flash_attn_forward._init_fn)
+        # FA3's inference wrapper is vulnerable to dispatcher schema lifetime
+        # failures. Use the registered implementation directly for this
+        # inference-only path, while preserving the module-global op. The
+        # private `_init_fn` API is intentionally scoped to this wrapper.
+        fa3_forward = _flash_attn_forward
+        if isinstance(fa3_forward, torch._library.custom_ops.CustomOpDef):
+            fa3_forward = fa3_forward._init_fn
+        sig = inspect.signature(fa3_forward)
         valid_kwargs = set(sig.parameters.keys())
         final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
-        output_total, *unused = _flash_attn_forward(**final_kwargs)
+        output_total, *unused = fa3_forward(**final_kwargs)
 
         return output_total
 
@@ -1059,6 +1061,9 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+            rotary_pos_cos = None
+            rotary_pos_sin = None
+            rotary_pos_cos_sin = None
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -1219,7 +1224,6 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")

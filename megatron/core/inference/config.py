@@ -1,14 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+WandbModule = Any
 
 
 @dataclass
@@ -50,7 +52,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -76,6 +78,66 @@ class MambaInferenceStateConfig:
                 mamba_chunk_size=mamba_chunk_size,
             )
         return None
+
+
+@dataclass
+class KDAInferenceStateConfig:
+    """Configuration for request-indexed KDA inference state tensors."""
+
+    kda_layer_map: Dict[int, int]
+    """Map zero-based global layer numbers to compact local KDA state indices."""
+
+    attention_layer_map: Dict[int, int]
+    """Map standard-attention layer numbers to compact local KV-cache indices."""
+
+    conv_states_shape: Tuple[int, ...]
+    """KDA convolution state shape per request."""
+
+    recurrent_states_shape: Tuple[int, ...]
+    """KDA recurrent state shape per request."""
+
+    conv_states_dtype: torch.dtype
+    """Dtype used by the KDA convolution state buffer."""
+
+    recurrent_states_dtype: torch.dtype
+    """Dtype used by the KDA recurrent state buffer."""
+
+    @classmethod
+    def from_model(cls, model: MegatronModule) -> Optional["KDAInferenceStateConfig"]:
+        """Build a KDA state configuration from an instantiated GPT decoder."""
+        from megatron.core.ssm.kimi_delta_attention import KimiDeltaAttention
+
+        decoder = get_attr_wrapped_model(model, "decoder")
+        model_config = get_attr_wrapped_model(model, "config")
+        kda_layers = []
+        attention_layer_numbers = []
+        for layer in decoder.layers:
+            self_attention = getattr(layer, "self_attention", None)
+            if self_attention is None or self_attention.layer_number is None:
+                continue
+            layer_number = self_attention.layer_number - 1
+            if isinstance(self_attention, KimiDeltaAttention):
+                kda_layers.append((layer_number, self_attention))
+            else:
+                attention_layer_numbers.append(layer_number)
+
+        if not kda_layers:
+            return None
+
+        conv_states_shape, recurrent_states_shape = kda_layers[0][
+            1
+        ].kda_state_shapes_per_request()
+
+        return cls(
+            kda_layer_map={layer_number: i for i, (layer_number, _) in enumerate(kda_layers)},
+            attention_layer_map={
+                layer_number: i for i, layer_number in enumerate(attention_layer_numbers)
+            },
+            conv_states_shape=conv_states_shape,
+            recurrent_states_shape=recurrent_states_shape,
+            conv_states_dtype=model_config.params_dtype,
+            recurrent_states_dtype=torch.float32,
+        )
 
 
 class PrefixCachingEvictionPolicy(str, Enum):
@@ -117,6 +179,22 @@ class KVCacheManagementMode(str, Enum):
     """Deallocate large tensors and recompute them from scratch during allocation."""
 
 
+class CudaGraphSizingDistribution(str, Enum):
+    """How CUDA graph token-count sizes are spaced when generating the captured graphs.
+
+    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
+    `log2(max_tokens)` total graphs.
+
+    LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
+    sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
+    Higher graph density at the top end.
+    """
+
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -149,6 +227,9 @@ class InferenceConfig:
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
     """The Mamba inference state config if the model is a hybrid model."""
+
+    kda_inference_state_config: Optional[KDAInferenceStateConfig] = None
+    """The KDA inference state config if the model contains KDA layers."""
 
     mamba_memory_ratio: Optional[float] = None
     """
@@ -188,18 +269,40 @@ class InferenceConfig:
     # =================================
     num_cuda_graphs: Optional[int] = None
     """
-    Maximum number of cuda graphs to capture, where the cuda graph batch sizes range from 1 to
-    `max_requests`. Due to rounding, the actual number of cuda graphs may not equal this argument.
+    Maximum number of cuda graphs to capture.
+    Graph token counts are spaced from 1 up to a per-graph-type budget:
+      - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
+      - Prefill/mixed graphs share that same bound by default,
+        or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
+    Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
-    """ 
+    """
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
+    """
+
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
+        CudaGraphSizingDistribution.EXPONENTIAL
+    )
+    """
+    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
+    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity +
+    a bigger step size at the top end).
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
     """
     Whether to use CUDA graphs for non-decode steps.
+    """
+
+    cuda_graph_all_prefills: bool = False
+    """
+    Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
+    When False (default), prefill/mixed graphs are bounded by the same token limit as decode graphs:
+    `max_requests * (num_speculative_tokens + 1)`.
+    When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
     """
 
     static_kv_memory_pointers: bool = False
@@ -297,6 +400,12 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
@@ -309,9 +418,46 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
-    def __post_init__(self):
+    disable_ep_consensus: bool = False
+    """If True, the engine skips the EP-group consensus all-reduce in
+    `run_engine_with_coordinator` and decides whether to step based on local
+    state alone. The rank still calls `controller.dummy_forward()` whenever
+    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
+    sync — without this, a peer running a real forward would deadlock waiting
+    on this rank's all-to-all participation. Trades off the consensus
+    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
+    """
+
+    verbose: InitVar[bool] = False
+    """Whether to log detailed context configuration at initialization.
+    This is an InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool):
+        self._verbose = verbose
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
+            )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e

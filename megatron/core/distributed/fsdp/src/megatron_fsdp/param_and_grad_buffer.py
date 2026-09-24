@@ -2867,6 +2867,7 @@ class ParamAndGradBuffer:
                             "requires_grad",
                             "sequence_parallel",
                             "shared",
+                            "grad_norm_group",
                             "tensor_model_parallel",
                             "partition_dim",
                             "partition_stride",

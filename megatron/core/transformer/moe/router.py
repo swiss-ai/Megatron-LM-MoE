@@ -374,7 +374,11 @@ class TopKRouter(Router):
         gather_group = self.tp_cp_group
         gather_size = gather_group.size() if gather_group is not None else 1
 
-        should_update_beta = self.training and torch.is_grad_enabled()
+        should_update_beta = (
+            self.training
+            and torch.is_grad_enabled()
+            and not self.config.moe_router_quantile_balancing_freeze
+        )
 
         with torch.no_grad():
             logits_fp32 = logits.detach().to(dtype=torch.float32)

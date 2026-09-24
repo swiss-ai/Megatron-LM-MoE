@@ -118,6 +118,9 @@ class DummyEngine(DynamicInferenceEngine):
         self.use_coordinator = False
 
         self.ep_world_size = 1
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus = (0, False)
+        self.disable_ep_consensus = False
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
@@ -125,7 +128,11 @@ class DummyEngine(DynamicInferenceEngine):
         # ZMQ-based world barrier (async-friendly, no NCCL).
         self.zmq_context = zmq.Context()
         total_world_size = torch.distributed.get_world_size()
-        self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+        self.world_zmq_communicator = AsyncZMQCommunicator(
+            self.zmq_context,
+            process_group=None,
+            hostname=os.environ.get("MASTER_ADDR", "127.0.0.1"),
+        )
         self.use_synchronous_zmq_collectives = False
 
     async def run_engine_with_coordinator(self, *, loop=None):
@@ -279,7 +286,9 @@ def test_case_communicator():
     calling _world_barrier() concurrently (e.g. during state transitions).
     """
     ctx = zmq.Context()
-    comm = AsyncZMQCommunicator(ctx, process_group=None)
+    comm = AsyncZMQCommunicator(
+        ctx, process_group=None, hostname=os.environ.get("MASTER_ADDR", "127.0.0.1")
+    )
     yield comm
     comm.close()
     ctx.term()
@@ -314,6 +323,8 @@ def coordinator():
                 "max_requests": 16,
                 "inference_coordinator_port": DEFAULT_PORT,
                 "deterministic_mode": False,
+                # Use the routable rendezvous address across task containers.
+                "hostname": os.environ.get("MASTER_ADDR", "127.0.0.1"),
             },
         )
         proc.start()
@@ -380,7 +391,8 @@ class TestCoordinator:
         rank = torch.distributed.get_rank()
 
         await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=port, launch_inference_coordinator=False
+            inference_coordinator_port=port, launch_inference_coordinator=False,
+                hostname=os.environ.get("MASTER_ADDR", "127.0.0.1")
         )
 
         # Ensure all engines are registered before submitting requests.
@@ -409,6 +421,70 @@ class TestCoordinator:
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1, 1), id="tp1-pp1-ep1")],
+        indirect=["initialize_model_parallel"],
+    )
+    async def test_disable_ep_consensus(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
+        """With disable_ep_consensus=True, the control loop must call
+        controller.dummy_forward() on iterations where local_pending == 0
+        instead of sleeping, so EP collectives stay in sync. Sleeping here
+        would deadlock peers running real forwards on EP > 1."""
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
+        requests = self.build_requests(num_requests=2)
+        engine = DummyEngine()
+        engine.disable_ep_consensus = True
+        engine.controller.dummy_forward = unittest.mock.MagicMock(
+            wraps=engine.controller.dummy_forward
+        )
+        rank = torch.distributed.get_rank()
+        client = None
+
+        try:
+            await engine.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=port, launch_inference_coordinator=False,
+                hostname=os.environ.get("MASTER_ADDR", "127.0.0.1")
+            )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+            if rank == 0:
+                client = InferenceClient(dp_addr)
+                client.start()
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
+
+                # Idle window: with no work, the loop must spin on dummy_forward,
+                # not sleep. Several iterations should fire within 0.2s.
+                idle_baseline = engine.controller.dummy_forward.call_count
+                await asyncio.sleep(0.2)
+                idle_calls = engine.controller.dummy_forward.call_count - idle_baseline
+                assert idle_calls > 0, (
+                    "disable_ep_consensus must call dummy_forward on idle iterations "
+                    f"to keep EP collectives in sync (call_count={idle_calls})"
+                )
+
+                # Submit and complete requests to confirm the step path still works.
+                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+
+                # Pause/unpause must still drive state transitions correctly.
+                client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                client.unpause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
+
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+        finally:
+            await cleanup_engine(engine, client)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("deserialize", [True, False], ids=["deserialize", "raw"])
     async def test_deserialize_flag(
         self, initialize_model_parallel, coordinator, test_case_communicator, deserialize
@@ -420,7 +496,8 @@ class TestCoordinator:
         requests = self.build_requests(num_requests=2)
 
         await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=port, launch_inference_coordinator=False
+            inference_coordinator_port=port, launch_inference_coordinator=False,
+                hostname=os.environ.get("MASTER_ADDR", "127.0.0.1")
         )
 
         # Ensure all engines are registered before submitting requests.
@@ -496,7 +573,8 @@ class TestCoordinator:
 
         try:
             await engine.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=port, launch_inference_coordinator=False
+                inference_coordinator_port=port, launch_inference_coordinator=False,
+                hostname=os.environ.get("MASTER_ADDR", "127.0.0.1")
             )
 
             # Synchronize all ranks so every engine has registered.
@@ -652,7 +730,8 @@ class TestCoordinator:
         requests = self.build_requests(num_requests=num_requests)
 
         await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=port, launch_inference_coordinator=False
+            inference_coordinator_port=port, launch_inference_coordinator=False,
+                hostname=os.environ.get("MASTER_ADDR", "127.0.0.1")
         )
 
         # Ensure all engines are registered before submitting requests.
