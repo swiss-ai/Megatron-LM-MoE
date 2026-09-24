@@ -187,53 +187,94 @@ def _build_md_gain_factory(
     """Build a gain-specific factory from a model parameter factory.
 
     Known model factories either split a 2D weight along dim 0 or expose a merged 3D expert
-    parameter as one transposed 2D shard per expert. Row gains follow the dim-0 split, while
-    column and flat gains are shared by all dim-0 pieces. Merged expert gains retain the expert
-    axis and project each per-expert leaf independently.
+    parameter as per-expert 2D shards. Legacy offloading shards are transposed ``[in, out]``;
+    canonical shards are ``[out, in]`` and gated FC1 has separate W/V leaves. Row gains follow
+    canonical W/V splitting, while column and flat gains are shared by both leaves. Merged
+    expert gains always retain the expert axis.
     """
     model_ndim = model_factory.data.ndim
     if model_ndim not in (2, 3):
         raise ValueError(
-            f'Unsupported {model_ndim}D factory-backed parameter for MD gain {key}'
+            f"Unsupported {model_ndim}D factory-backed parameter for MD gain {key}"
         )
 
     @torch.no_grad()
     def build_fn(runtime_key, data, replica_id, flattened_range):
         if flattened_range is not None or model_factory.flattened_range is not None:
-            raise ValueError(f'Flattened factory-backed MD gains are not supported for {key}')
+            raise ValueError(
+                f"Flattened factory-backed MD gains are not supported for {key}"
+            )
 
         template_state = model_factory.build_fn(
             runtime_key,
             model_factory.data,
             replica_id,
             model_factory.flattened_range,
-        ) # original model factory build_fn to get the template state for the gain
+        )  # original model factory build_fn to get the template state for the gain
         template_shards = list(nested_values(template_state))
         if not template_shards or not all(
             isinstance(shard, ShardedTensor) for shard in template_shards
         ):
-            raise TypeError(f'Model factory for {key} did not produce ShardedTensor leaves')
+            raise TypeError(
+                f"Model factory for {key} did not produce ShardedTensor leaves"
+            )
 
-        if model_ndim == 3:
-            # Fused expert factories store one transposed [in, out] tensor per expert.
-            if len(template_shards) != data.size(0):
+        def build_canonical_gain_shards(templates, gain_data, shared_key):
+            """Apply the existing 2D W/V projection to one expert."""
+            if gain_kind == "row":
+                gain_shards = []
+                row_offset = 0
+                for template in templates:
+                    row_count = template.local_shape[0]
+                    gain_shards.append(
+                        make_sharded_optimizer_tensor_for_axes(
+                            template,
+                            gain_data.narrow(0, row_offset, row_count),
+                            template.key,
+                            (0,),
+                            allow_shape_mismatch=template.allow_shape_mismatch,
+                        )
+                    )
+                    row_offset += row_count
+                if row_offset != gain_data.size(0):
+                    raise ValueError(
+                        f"Factory row shards for {key} cover {row_offset} values, "
+                        f"expected {gain_data.size(0)}"
+                    )
+                return gain_shards
+
+            retained_axes = (1,) if gain_kind == "col" else ()
+            signature = _projected_metadata_signature(templates[0], retained_axes)
+            if any(
+                _projected_metadata_signature(template, retained_axes) != signature
+                for template in templates[1:]
+            ):
                 raise ValueError(
-                    f'Expected one factory shard per local expert for {key}: '
-                    f'{len(template_shards)} != {data.size(0)}'
+                    f"Factory leaves do not share one {gain_kind} gain layout for {key}"
                 )
-            expected_leaf_shape = tuple(reversed(model_factory.data.shape[1:]))
-            if any(template.local_shape != expected_leaf_shape for template in template_shards):
-                raise ValueError(
-                    f'Expected transposed per-expert factory shards shaped '
-                    f'{expected_leaf_shape} for {key}'
+            return [
+                make_sharded_optimizer_tensor_for_axes(
+                    templates[0], gain_data, shared_key, retained_axes
                 )
-            retained_leaf_axes = {"row": (1,), "col": (0,), "flat": ()}[gain_kind]
+            ]
+
+        if model_ndim == 2:
+            return build_canonical_gain_shards(template_shards, data, runtime_key)
+
+        num_local_experts, model_out, model_in = model_factory.data.shape
+        if all(".linear_fc" not in template.key for template in template_shards):
+            # Legacy offloading stores one transposed [in, out] leaf per expert.
+            if len(template_shards) != num_local_experts or any(
+                template.local_shape != (model_in, model_out)
+                for template in template_shards
+            ):
+                raise ValueError(f"Expected one legacy shard per expert for {key}")
             return [
                 make_sharded_optimizer_tensor_for_axes(
                     template,
                     data[expert_idx],
                     template.key,
-                    retained_leaf_axes,
+                    {"row": (1,), "col": (0,), "flat": ()}[gain_kind],
                     allow_shape_mismatch=(
                         template.allow_shape_mismatch and gain_kind == "row"
                     ),
@@ -241,56 +282,56 @@ def _build_md_gain_factory(
                 for expert_idx, template in enumerate(template_shards)
             ]
 
-        if not all(shard.data.ndim == 2 for shard in template_shards):
-            raise ValueError(f'Expected 2D leaves from model factory for {key}')
-
-         # Row gains: one projected shard for each dim-0 W/V leaf. Example: weight [8, 4] (w: [4, 4], v: [4, 4]) then row gain [8] splits into [4] and [4].
-        if gain_kind == "row":
-            gain_shards = []
-            row_offset = 0
-            for template in template_shards:
-                row_count = template.local_shape[0]
-                gain_shards.append(
-                    make_sharded_optimizer_tensor_for_axes(
-                        template,
-                        data.narrow(0, row_offset, row_count),
-                        template.key,
-                        (0,),
-                        allow_shape_mismatch=template.allow_shape_mismatch,
-                    )
-                )
-                row_offset += row_count
-            if row_offset != data.size(0):
-                raise ValueError(
-                    f'Factory row shards for {key} only cover {row_offset} values, '
-                    f'expected {data.size(0)}'
-                )
-            return gain_shards
-
-        # Column and flat gains: one shard shared (the same gain is used by both W and V leaves) by all W/V leaves.
-        retained_axes = (1,) if gain_kind == "col" else ()
-        expected_signature = _projected_metadata_signature(template_shards[0], retained_axes)
-        if any(
-            _projected_metadata_signature(template, retained_axes) != expected_signature
-            for template in template_shards[1:]
-        ):
+        # Canonical fused experts use one [out, in] leaf, or two W/V leaves, per expert.
+        if len(template_shards) not in (num_local_experts, 2 * num_local_experts):
             raise ValueError(
-                f'Model factory leaves do not share one {gain_kind} gain layout for {key}'
+                f"Expected one or two canonical leaves per expert for {key}"
             )
-        return [
-            make_sharded_optimizer_tensor_for_axes(
-                template_shards[0], data, runtime_key, retained_axes
+        leaves_per_expert = len(template_shards) // num_local_experts
+        gain_shards = []
+        for expert_idx in range(num_local_experts):
+            start = expert_idx * leaves_per_expert
+            templates = template_shards[start : start + leaves_per_expert]
+            if sum(
+                template.local_shape[0] for template in templates
+            ) != model_out or any(
+                template.local_shape[1] != model_in for template in templates
+            ):
+                raise ValueError(f"Canonical expert leaf shape mismatch for {key}")
+            gain_shards.extend(
+                build_canonical_gain_shards(
+                    templates, data[expert_idx], templates[0].key
+                )
             )
-        ]
+        return gain_shards
 
     @torch.no_grad()
     def merge_fn(loaded_shards):
         if model_ndim == 3:
+            if gain_kind == "row" and len(loaded_shards) != gain.size(0):
+                if len(loaded_shards) % gain.size(0) != 0:
+                    raise ValueError(
+                        f"Loaded row gain shards do not divide evenly across experts for {key}"
+                    )
+                leaves_per_expert = len(loaded_shards) // gain.size(0)
+                return torch.stack(
+                    [
+                        torch.cat(
+                            loaded_shards[
+                                expert_idx * leaves_per_expert : (expert_idx + 1)
+                                * leaves_per_expert
+                            ],
+                            dim=0,
+                        )
+                        for expert_idx in range(gain.size(0))
+                    ],
+                    dim=0,
+                )
             return torch.stack(loaded_shards, dim=0)
         if gain_kind == "row":
             return torch.cat(loaded_shards, dim=0)
         if len(loaded_shards) != 1:
-            raise ValueError(f'Expected one loaded {gain_kind} gain shard for {key}')
+            raise ValueError(f"Expected one loaded {gain_kind} gain shard for {key}")
         return loaded_shards[0]
 
     return ShardedTensorFactory(
@@ -316,8 +357,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         eps: float = 1e-8,
         # Hypersphere (L2, post-step weight projection only).
         hypersphere_mode: Optional[Literal["row", "col", "flat", "embed"]] = None,
-        hypersphere_embedding_mode: Optional[Literal["row", "col", "flat", "embed", "none", "external"]] = None,
-        hypersphere_router_mode: Optional[Literal["row", "col", "flat", "embed", "none"]] = None,
+        hypersphere_embedding_mode: Optional[
+            Literal["row", "col", "flat", "embed", "none", "external"]
+        ] = None,
+        hypersphere_router_mode: Optional[
+            Literal["row", "col", "flat", "embed", "none"]
+        ] = None,
         hypersphere_eps: float = 1e-8,
         # Tangential-gradient / preserve-init options (off by default).
         hypersphere_tangential_grad: bool = False,

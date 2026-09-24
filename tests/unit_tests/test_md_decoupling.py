@@ -28,7 +28,10 @@ from megatron.core.optimizer.optimizer import FP32Optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.transformer.moe.fp8_utils import make_fused_experts_sharded_factory
+from megatron.core.transformer.moe.expert_checkpoint_utils import (
+    make_fused_offloading_experts_canonical_factory,
+    make_fused_experts_sharded_factory,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -1230,14 +1233,65 @@ def test_md_projected_gains_reshard_across_ep(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("gain_kind", ["row", "col", "flat"])
+def test_md_projected_gains_support_canonical_fused_experts(gated, gain_kind):
+    num_experts = 2
+    out_features = 6 if gated else 3
+    in_features = 4
+    param = torch.nn.Parameter(torch.ones(num_experts, out_features, in_features))
+    model_factory = make_fused_offloading_experts_canonical_factory(
+        param,
+        "",
+        "weight1",
+        "linear_fc1",
+        num_local_experts=num_experts,
+        local_expert_indices_offset=0,
+        num_global_experts=num_experts,
+        sharded_offsets=(),
+        replica_id=(0, 0, 0),
+        singleton_local_shards=False,
+        gated=gated,
+    )
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        pg_collection=None,
+    )
+    gain_shapes = {
+        "row": (num_experts, out_features),
+        "col": (num_experts, in_features),
+        "flat": (num_experts,),
+    }
+    gain = torch.arange(math.prod(gain_shapes[gain_kind]), dtype=torch.float32).view(
+        gain_shapes[gain_kind]
+    )
+
+    gain_factory = optimizer.build_sharded_optimizer_state(
+        model_factory,
+        gain,
+        f"{gain_kind}_gain",
+        f"optimizer.state.{gain_kind}_gain",
+    )
+    assert isinstance(gain_factory, ShardedTensorFactory)
+    shards = gain_factory.build()
+    expected_shards = num_experts * (2 if gated and gain_kind == "row" else 1)
+    assert len(shards) == expected_shards
+    torch.testing.assert_close(
+        gain_factory.merge_fn([shard.data for shard in shards]),
+        gain,
+    )
+
+
 def _md_sharded_optimizer(param):
     optimizer = MDDecoupling(
         params=[
             {
-                'params': [param],
-                'wd_mult': 1.0,
-                'is_expert_parallel': False,
-                'is_decoupled_lr': False,
+                "params": [param],
+                "wd_mult": 1.0,
+                "is_expert_parallel": False,
+                "is_decoupled_lr": False,
             }
         ],
         lr=0.01,
