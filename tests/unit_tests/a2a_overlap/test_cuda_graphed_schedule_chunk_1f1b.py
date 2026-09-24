@@ -160,6 +160,7 @@ class TestPartialCudaGraphedA2AOverlap:
         args.moe_permute_fusion = True
         args.moe_router_fusion = True
         args.moe_router_topk = 2
+        args.moe_router_violation_metrics = kwargs.get("moe_router_violation_metrics", [])
 
         # CUDA graph settings
         args.cuda_graph_impl = cuda_graph_impl

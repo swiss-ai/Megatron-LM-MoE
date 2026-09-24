@@ -206,6 +206,8 @@ class TestRouterAuxLoss:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=8,
             moe_aux_loss_coeff=0,
+            # Keep auxiliary violation metrics isolated from the global training calculator.
+            moe_router_violation_metrics=[],
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
@@ -626,6 +628,8 @@ class TestPaddingMaskAuxLoss:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=8,
             moe_aux_loss_coeff=1.0,
+            # Keep auxiliary violation metrics isolated from the global training calculator.
+            moe_router_violation_metrics=[],
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,

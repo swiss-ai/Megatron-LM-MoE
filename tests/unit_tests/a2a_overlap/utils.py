@@ -197,6 +197,8 @@ def compare_captures(capture_ref, capture_a2a_overlap, verbose=False, skip_embed
 
 
 def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_grouped_gemm=True):
+    extra_kwargs = dict(extra_kwargs)
+    extra_kwargs.setdefault("moe_router_violation_metrics", [])
     config = MLATransformerConfig(
         attention_backend="unfused",
         pipeline_model_parallel_size=1,

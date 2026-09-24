@@ -47,6 +47,7 @@ class TestTEGroupedMLP:
             params_dtype=torch.bfloat16,
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
+            moe_router_violation_metrics=[],
         )
 
         self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size
