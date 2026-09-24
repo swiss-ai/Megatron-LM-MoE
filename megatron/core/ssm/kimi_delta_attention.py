@@ -528,6 +528,9 @@ class KimiDeltaAttention(GatedDeltaNet):
                 "fused_kda_gate is usable in the installed flash-linear-attention; "
                 "computing the decay gate in torch instead (correct, but slower)."
             )
+        # fused_recurrent_kda_fwd's in-kernel gate reads A_log once per head, so
+        # with per-channel A_log decode materializes the decay before the kernel.
+        self._decode_gate_in_kernel = self._use_fused_decay_gate and not self._alog_per_channel
 
         # Dtype of the decay when one is materialized at all (None = fp32, the
         # kernel's native output dtype).
@@ -804,25 +807,29 @@ class KimiDeltaAttention(GatedDeltaNet):
             gate, _ = self.gate_out_proj(gate_low_rank)
         return qkv, gate, beta, alpha
 
-    def _prepare_g_and_beta(self, alpha, beta, A_log, dt_bias):
+    def _prepare_g_and_beta(self, alpha, beta, A_log, dt_bias, gate_in_kernel=None):
         """Prepare raw or activated decay and beta inputs for a KDA kernel."""
+        if gate_in_kernel is None:
+            gate_in_kernel = self._use_fused_decay_gate
         g = (
             alpha.reshape(*alpha.shape[:-1], -1, self.key_head_dim)
-            if self._use_fused_decay_gate
+            if gate_in_kernel
             else self._activate_decay(alpha, A_log, dt_bias)
         )
         if not self._use_fused_beta_sigmoid:
             beta = self._activate_beta(beta)
         return g, beta.contiguous()
 
-    def _kda_kernel_options(self, A_log, dt_bias):
+    def _kda_kernel_options(self, A_log, dt_bias, gate_in_kernel=None):
         """Feature options shared by chunked and recurrent KDA kernels."""
+        if gate_in_kernel is None:
+            gate_in_kernel = self._use_fused_decay_gate
         kwargs = {
             "use_qk_l2norm_in_kernel": self._qk_l2norm_in_kernel,
-            "use_gate_in_kernel": self._use_fused_decay_gate,
+            "use_gate_in_kernel": gate_in_kernel,
             "use_beta_sigmoid_in_kernel": self._use_fused_beta_sigmoid,
         }
-        if self._use_fused_decay_gate:
+        if gate_in_kernel:
             kwargs["A_log"] = A_log
             kwargs["dt_bias"] = dt_bias.reshape(-1)
             if self._safe_gate:
@@ -1222,11 +1229,13 @@ class KimiDeltaAttention(GatedDeltaNet):
         beta = beta.reshape(batch, seq_len, self.num_v_heads_local_tp)
         return qkv, gate, beta, alpha
 
-    def _prepare_dynamic_kda(self, qkv, gate, beta, alpha):
+    def _prepare_dynamic_kda(self, qkv, gate, beta, alpha, gate_in_kernel=None):
         """Prepare convolved projections and raw/fused gates for an inference kernel."""
         batch, seq_len, _ = qkv.shape
         query, key, value = self._prepare_qkv_for_kda(qkv, batch, seq_len)
-        g, beta = self._prepare_g_and_beta(alpha, beta, self.A_log, self.dt_bias)
+        g, beta = self._prepare_g_and_beta(
+            alpha, beta, self.A_log, self.dt_bias, gate_in_kernel
+        )
         return query, key, value, gate.contiguous(), g, beta
 
     def _dynamic_inference_decode(
@@ -1265,7 +1274,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         ).to(qkv_dtype)
 
         query, key, value, gate, g, beta = self._prepare_dynamic_kda(
-            qkv, gate, beta, alpha
+            qkv, gate, beta, alpha, self._decode_gate_in_kernel
         )
         core_attn_out, _ = fused_recurrent_kda_fwd(
             query,
@@ -1277,7 +1286,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             output_final_state=False,
             inplace_final_state=True,
             ssm_state_indices=safe_batch_indices,
-            **self._kda_kernel_options(self.A_log, self.dt_bias),
+            **self._kda_kernel_options(
+                self.A_log, self.dt_bias, self._decode_gate_in_kernel
+            ),
         )
         return self._apply_gated_norm(core_attn_out, gate).reshape(
             projected.shape[0], projected.shape[1], -1
