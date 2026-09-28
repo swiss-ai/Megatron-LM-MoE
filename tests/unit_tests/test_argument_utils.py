@@ -8,6 +8,7 @@ from typing import Callable, Literal, Optional, Union
 import pytest
 
 from megatron.training.argument_utils import ArgumentGroupFactory, TypeInferenceError
+from megatron.training.config.training_config import LoggerConfig
 
 
 @dataclass
@@ -312,6 +313,39 @@ class TestArgumentGroupFactoryLiteral:
 
         with pytest.raises(SystemExit):
             parser.parse_args(['--precision', '64'])
+
+
+class TestMuonLoggingSelectors:
+    """Test CLI parsing and validation for Muon logging selectors."""
+
+    def test_selector_lists_parse_and_validate_literal_choices(self):
+        parser = ArgumentParser()
+        ArgumentGroupFactory(LoggerConfig, exclude=["memory_keys"]).build_group(
+            parser, title="Logging"
+        )
+
+        args = parser.parse_args(
+            [
+                "--muon-log-tensor-kinds",
+                "updates",
+                "gradients",
+                "--muon-log-tensor-stats",
+                "frobenius-norm",
+                "sparsity",
+                "--muon-log-gain-stats",
+                "max",
+                "gain-field-rms",
+                "--muon-log-param-stats",
+                "frobenius-norm",
+            ]
+        )
+        assert args.muon_log_tensor_kinds == ["updates", "gradients"]
+        assert args.muon_log_tensor_stats == ["frobenius-norm", "sparsity"]
+        assert args.muon_log_gain_stats == ["max", "gain-field-rms"]
+        assert args.muon_log_param_stats == ["frobenius-norm"]
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--muon-log-tensor-kinds", "invalid"])
 
 
 class TestArgumentGroupFactoryHelpers:

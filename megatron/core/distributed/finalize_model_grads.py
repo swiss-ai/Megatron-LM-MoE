@@ -877,3 +877,7 @@ def finalize_model_grads(
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens
                 model_chunk.scale_gradients(scaling)
+
+    from megatron.core.optimizer.muon_logging import capture_finalized_gradient_norms
+
+    capture_finalized_gradient_norms(model)

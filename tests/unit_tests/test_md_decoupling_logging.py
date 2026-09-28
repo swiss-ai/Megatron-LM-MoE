@@ -18,6 +18,181 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 
+def test_muon_gradient_and_update_norms_are_grouped_by_family():
+    param = torch.nn.Parameter(torch.zeros(2, 3))
+    param.md_gain_log_family = "attention-in"
+    param.main_grad = torch.tensor([[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]])
+    model = torch.nn.Module()
+    model.register_parameter("weight", param)
+
+    md_logging_module.set_muon_norm_logging(True)
+    md_logging_module.capture_finalized_gradient_norms([model])
+    md_logging_module.capture_muon_update_norms(
+        param, torch.tensor([[0.0, 0.0, 12.0], [0.0, 0.0, 0.0]]), 0.5
+    )
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    prefix = "muon-md/gradients/attention-in"
+    assert stats[f"{prefix}/rms"] == pytest.approx(math.sqrt(25.0 / 6.0))
+    assert stats[f"{prefix}/frobenius-norm"] == pytest.approx(5.0)
+    assert stats[f"{prefix}/row-rms/mean"] == pytest.approx(math.sqrt(25.0 / 3.0) / 2.0)
+    assert stats[f"{prefix}/col-rms/mean"] == pytest.approx(7.0 / (3.0 * math.sqrt(2.0)))
+    update_prefix = "muon-md/updates/attention-in"
+    assert stats[f"{update_prefix}/rms"] == pytest.approx(6.0 / math.sqrt(6.0))
+    assert stats[f"{update_prefix}/frobenius-norm"] == pytest.approx(6.0)
+    for kind, expected_sparsity in (("gradients", 4.0 / 6.0), ("updates", 5.0 / 6.0)):
+        for threshold in (1e-20, 1e-10, 1e-30):
+            assert stats[
+                f"muon-md/{kind}/sparsity/attention-in/fraction-below-{threshold}"
+            ] == pytest.approx(expected_sparsity)
+
+
+def test_muon_tensor_norms_are_also_grouped_by_global_layer():
+    model = torch.nn.Module()
+    params = []
+    for layer, value in ((0, 1.0), (2, 3.0)):
+        param = torch.nn.Parameter(torch.zeros(2, 2))
+        param.md_gain_log_family = "attention-in"
+        param.md_gain_log_layer = layer
+        param.main_grad = torch.full_like(param, value)
+        model.register_parameter(f"weight_{layer}", param)
+        params.append((param, value))
+
+    md_logging_module.set_muon_norm_logging(True, tensor_stats=["rms"], layer_count=3)
+    md_logging_module.capture_finalized_gradient_norms([model])
+    for param, value in params:
+        update = torch.full_like(param, 2.0 * value)
+        md_logging_module.capture_muon_update_block_norms(
+            param, [update], 1.0, kind="orthogonal-updates"
+        )
+        md_logging_module.capture_muon_update_norms(param, update, 0.5)
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    assert stats["muon-md/gradients/layer-0/attention-in/rms"] == pytest.approx(1.0)
+    assert stats["muon-md/gradients/layer-2/attention-in/rms"] == pytest.approx(3.0)
+    assert stats["muon-md/orthogonal-updates/layer-0/attention-in/rms"] == pytest.approx(2.0)
+    assert stats["muon-md/updates/layer-2/attention-in/rms"] == pytest.approx(3.0)
+
+
+def test_muon_tensor_selectors_skip_unrequested_stages_and_stats(monkeypatch):
+    param = torch.nn.Parameter(torch.zeros(2, 2))
+    param.md_gain_log_family = "attention-in"
+    param.main_grad = torch.ones_like(param)
+    model = torch.nn.Module()
+    model.register_parameter("weight", param)
+
+    def reject_quantile(*args, **kwargs):
+        raise AssertionError("RMS tails should not be computed")
+
+    monkeypatch.setattr(torch, "quantile", reject_quantile)
+    md_logging_module.set_muon_norm_logging(
+        True,
+        tensor_kinds=["updates"],
+        tensor_stats=["frobenius-norm", "row-col-rms-means"],
+    )
+    md_logging_module.capture_finalized_gradient_norms([model])
+    md_logging_module.capture_muon_update_norms(param, torch.ones_like(param), 0.5)
+
+    assert md_logging_module.collect_captured_muon_norms() == {
+        "muon-md/updates/attention-in/frobenius-norm": pytest.approx(1.0),
+        "muon-md/updates/attention-in/row-rms/mean": pytest.approx(0.5),
+        "muon-md/updates/attention-in/col-rms/mean": pytest.approx(0.5),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for compiled logging")
+def test_compiled_muon_tensor_selectors():
+    param = torch.nn.Parameter(torch.zeros(2, 2, device="cuda"))
+    param.md_gain_log_family = "attention-in"
+
+    md_logging_module.set_muon_norm_logging(
+        True,
+        tensor_kinds=["updates"],
+        tensor_stats=["frobenius-norm"],
+    )
+    md_logging_module.capture_muon_update_norms(param, torch.ones_like(param), 0.5)
+    stats = md_logging_module.collect_captured_muon_norms()
+    assert stats == {
+        "muon-md/updates/attention-in/frobenius-norm": pytest.approx(1.0)
+    }
+
+    md_logging_module.set_muon_norm_logging(
+        True,
+        sparsity_thresholds=[10.0],
+        tensor_kinds=["updates"],
+        tensor_stats=["sparsity"],
+    )
+    update = torch.tensor([[12.0, 0.0], [0.0, 0.0]], device="cuda")
+    md_logging_module.capture_muon_update_norms(param, update, 0.5)
+    stats = md_logging_module.collect_captured_muon_norms()
+    assert stats == {
+        "muon-md/updates/sparsity/attention-in/fraction-below-10.0": 1.0
+    }
+
+
+def test_muon_update_block_selector_skips_excluded_kind_before_iteration():
+    class ExcludedUpdates:
+        def __iter__(self):
+            raise AssertionError("Excluded tensor kind must not iterate update blocks")
+
+    md_logging_module.set_muon_norm_logging(True, tensor_kinds=["updates"])
+    md_logging_module.capture_muon_update_block_norms(
+        None, ExcludedUpdates(), 1.0, kind="orthogonal-updates"
+    )
+    md_logging_module.set_muon_norm_logging(False)
+
+
+def test_muon_update_sparsity_uses_configured_thresholds_after_lr_scaling():
+    param = torch.nn.Parameter(torch.zeros(2, 2))
+    param.md_gain_log_family = "attention-in"
+
+    md_logging_module.set_muon_norm_logging(
+        True, [10.0], tensor_stats=["sparsity"]
+    )
+    md_logging_module.capture_muon_update_norms(
+        param, torch.tensor([[12.0, 0.0], [0.0, 0.0]]), 0.5
+    )
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    assert stats == {
+        "muon-md/updates/sparsity/attention-in/fraction-below-10.0": 1.0
+    }
+
+
+def test_muon_update_norms_capture_logical_blocks_without_merging():
+    param = torch.nn.Parameter(torch.zeros(4, 2))
+    param.md_gain_log_family = "attention-in"
+
+    md_logging_module.set_muon_norm_logging(True)
+    md_logging_module.capture_muon_update_block_norms(
+        param,
+        [torch.ones(1, 2), torch.full((3, 2), 3.0)],
+        1.0,
+        kind="orthogonal-updates",
+    )
+    md_logging_module.capture_muon_update_block_norms(
+        param,
+        [torch.full((2, 2), 2.0), torch.full((2, 2), 4.0)],
+        1.0,
+    )
+    stats = md_logging_module.collect_captured_muon_norms()
+
+    raw_prefix = "muon-md/orthogonal-updates/attention-in"
+    assert stats[f"{raw_prefix}/rms"] == pytest.approx(2.0)
+    assert stats[f"{raw_prefix}/frobenius-norm"] == pytest.approx(
+        (math.sqrt(2.0) + 3.0 * math.sqrt(6.0)) / 2.0
+    )
+    assert stats[f"{raw_prefix}/row-rms/mean"] == pytest.approx(2.0)
+    assert stats[f"{raw_prefix}/col-rms/mean"] == pytest.approx(2.0)
+    final_prefix = "muon-md/updates/attention-in"
+    assert stats[f"{final_prefix}/rms"] == pytest.approx(3.0)
+    assert stats[f"{final_prefix}/frobenius-norm"] == pytest.approx(6.0)
+    for kind in ("orthogonal-updates", "updates"):
+        assert stats[
+            f"muon-md/{kind}/sparsity/attention-in/fraction-below-1e-20"
+        ] == 0.0
+
+
 def test_md_gain_log_family_classifies_matrix_types():
     cases = [
         ("decoder.layers.0.mlp.router.weight", "is_router", "router"),
@@ -50,6 +225,12 @@ def test_md_gain_log_family_classifies_matrix_types():
         if attribute:
             setattr(param, attribute, True)
         assert _gain_log_family(name, param) == expected
+
+    grouped_fc2 = torch.nn.Parameter(torch.ones(2, 2, 2))
+    assert (
+        _gain_log_family("decoder.layers.0.mlp.experts.linear_fc2.weight", grouped_fc2)
+        == "expert-out"
+    )
 
 
 def test_collect_md_gain_stats_logs_layernorm_effective_gains():
@@ -169,6 +350,20 @@ def test_collect_md_gain_stats_logs_softplus_saturation_only():
     assert not any("saturated-fraction" in name for name in direct_stats)
     assert not any("muon-md/gauge/" in name for name in direct_stats)
 
+    selected_stats = collect_md_gain_stats(
+        SimpleNamespace(optimizer=direct_optimizer),
+        log_sparsity=False,
+        log_param_rms=False,
+        gain_stats=["max", "gain-field-rms"],
+    )
+    assert selected_stats == {
+        "muon-md/gains/router/row/max": 2.0,
+        "muon-md/gains/router/col/max": 4.0,
+        "muon-md/gain-field/router/rms": pytest.approx(
+            ((5.0 / 2.0) * (25.0 / 2.0)) ** 0.5
+        ),
+    }
+
 
 def test_collect_md_gain_stats_logs_global_layer_buckets():
     layer_zero = torch.nn.Parameter(torch.ones(2, 2))
@@ -247,6 +442,13 @@ def test_collect_md_gain_stats_logs_effective_weight_sparsity_per_matrix():
     assert stats["muon-md/params/expert-in/rms"] == pytest.approx(1.25)
     assert stats["muon-md/layers/0/params/expert-in/rms"] == pytest.approx(0.5)
     assert stats["muon-md/layers/1/params/expert-in/rms"] == pytest.approx(2.0)
+    assert stats["muon-md/params/expert-in/frobenius-norm"] == pytest.approx(1.5)
+    assert stats[
+        "muon-md/layers/0/params/expert-in/frobenius-norm"
+    ] == pytest.approx(1.0)
+    assert stats[
+        "muon-md/layers/1/params/expert-in/frobenius-norm"
+    ] == pytest.approx(2.0)
 
     custom_stats = collect_md_gain_stats(wrapped_optimizer, sparsity_thresholds=[0.5])
     assert custom_stats[
@@ -273,7 +475,20 @@ def test_collect_md_gain_stats_logs_effective_weight_sparsity_per_matrix():
         wrapped_optimizer, log_gains=False, log_sparsity=False
     )
     assert param_only_stats["muon-md/params/expert-in/rms"] == pytest.approx(1.25)
+    assert param_only_stats[
+        "muon-md/params/expert-in/frobenius-norm"
+    ] == pytest.approx(1.5)
     assert all("/params/" in name for name in param_only_stats)
+
+    frobenius_only_stats = collect_md_gain_stats(
+        wrapped_optimizer,
+        log_gains=False,
+        log_sparsity=False,
+        param_stats=["frobenius-norm"],
+    )
+    assert frobenius_only_stats == {
+        "muon-md/params/expert-in/frobenius-norm": pytest.approx(1.5)
+    }
 
 
 def test_collect_md_gain_stats_pairs_row_and_col_within_each_matrix():

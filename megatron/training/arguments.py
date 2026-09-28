@@ -1574,6 +1574,9 @@ def validate_args(args, defaults={}):
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
     if args.optimizer == 'md_decoupling':
+        args.hypersphere_family_modes = tuple(
+            dict(spec.split("=", 1) for spec in args.hypersphere_family_modes).items()
+        )
         if args.hypersphere_mode == "none":
             args.hypersphere_mode = None
         if args.hypersphere_embedding_mode == "external":
@@ -1642,12 +1645,6 @@ def validate_args(args, defaults={}):
                 "least one active hypersphere mode."
             )
             if not args.md_normalize_update_to_weight_norm:
-                unsupported = {k: v for k, v in active.items() if v not in ("row", "flat")}
-                assert not unsupported, (
-                    "--hypersphere-radius-mode fan_in puts ||W||_F at sqrt(d_out), which the "
-                    "'row' (unit rows) and 'flat' modes reach but the column-normalizing modes "
-                    f"do not; got {unsupported}."
-                )
                 if args.num_experts is not None:
                     assert args.num_experts <= args.hidden_size, (
                         "--hypersphere-radius-mode fan_in keeps the router's Muon scale "
@@ -2992,6 +2989,11 @@ def _add_training_args(parser):
     group.add_argument('--output-lr', type=float, default=None,
                        help='Absolute LR for the (untied) output LM-head params under '
                        'md_decoupling. When unset, the output layer uses the base --lr.')
+    group.add_argument('--router-lr', type=float, default=None,
+                       help='Absolute LR for MoE router weights under --optimizer md_decoupling. '
+                       'When set, routers use this LR instead of --matrix-lr (Muon routers) or '
+                       '--lr (Adam routers), and are excluded from the matrix-LR group. When '
+                       'unset, the existing router LR behavior applies.')
     group.add_argument('--min-lr-mode', dest='min_lr_mode', type=str, default='relative',
                        choices=['relative', 'absolute'],
                        help='How per-group min_lr is set for any group with a custom max_lr. '
@@ -3001,19 +3003,42 @@ def _add_training_args(parser):
     group.add_argument('--muon-lr-factor', type=float, default=1.0,
                        help='When --matrix-lr is unset, matrix-param LR for md_decoupling and '
                        'muon/dist_muon is muon_lr_factor * lr. Default 1.0 (matrices track --lr).')
-    group.add_argument('--hypersphere-mode', type=str, default='flat',
-                       choices=['row', 'col', 'flat', 'embed', 'none'],
-                       help='Hypersphere normalization mode for non-embedding/output 2D matrices '
-                       'under md_decoupling. Applied post-step to project the weight onto the L2 '
-                       "sphere. Defaults to 'flat'; use 'none' to disable.")
-    group.add_argument('--hypersphere-embedding-mode', type=str, default='row',
-                       choices=['row', 'col', 'flat', 'embed', 'none', 'external'],
-                       help='Hypersphere mode override for embedding + LM head under md_decoupling. '
-                       "'external' routes those params to the chained optimizer. Defaults to 'row'.")
-    group.add_argument('--hypersphere-router-mode', type=str, default='row',
-                       choices=['row', 'col', 'flat', 'embed', 'none'],
-                       help='Hypersphere mode override for MoE router weights under md_decoupling. '
-                       "Defaults to 'row'.")
+    group.add_argument(
+        '--hypersphere-mode',
+        type=str,
+        default='flat',
+        choices=['row', 'col', 'flat', 'embed', 'none'],
+        help='Default hypersphere normalization mode for ordinary matrices under '
+        "md_decoupling. 'embed' selects row normalization for input projections and "
+        "column normalization for output projections. Defaults to 'flat'.",
+    )
+    group.add_argument(
+        '--hypersphere-family-modes',
+        type=str,
+        nargs='*',
+        default=(),
+        metavar='FAMILY=MODE',
+        help='Per-family hypersphere overrides. Families are attention-in/out, '
+        'dense-mlp-in/out, expert-in/out, moe-latent-in/out, and unclassified; '
+        'modes are row, col, flat, and none. Explicit overrides take precedence '
+        'over --hypersphere-mode.',
+    )
+    group.add_argument(
+        '--hypersphere-embedding-mode',
+        type=str,
+        default='row',
+        choices=['row', 'col', 'flat', 'embed', 'none', 'external'],
+        help='Hypersphere mode override for embedding + LM head under md_decoupling. '
+        "'external' routes those params to the chained optimizer. Defaults to 'row'.",
+    )
+    group.add_argument(
+        '--hypersphere-router-mode',
+        type=str,
+        default='row',
+        choices=['row', 'col', 'flat', 'embed', 'none'],
+        help='Hypersphere mode override for MoE router weights under md_decoupling. '
+        "Defaults to 'row'.",
+    )
     group.add_argument('--hypersphere-tangential-grad', action='store_true', default=False,
                        help='Project p.grad onto the hypersphere tangent space before the update '
                        '(only effective with an active hypersphere mode).')
