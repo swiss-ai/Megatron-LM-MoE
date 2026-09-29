@@ -37,6 +37,7 @@ class TestSharedExperts:
             gated_linear_unit=True,
             bias_activation_fusion=True,
             moe_router_load_balancing_type="sinkhorn",
+            moe_router_violation_metrics=[],
             moe_router_topk=1,
             add_bias_linear=False,
             moe_shared_expert_gate=shared_expert_gate,
@@ -98,6 +99,7 @@ class TestSharedExpertsOverlap:
             gated_linear_unit=True,
             bias_activation_fusion=True,
             moe_router_load_balancing_type="sinkhorn",
+            moe_router_violation_metrics=[],
             moe_router_topk=1,
             add_bias_linear=False,
         )

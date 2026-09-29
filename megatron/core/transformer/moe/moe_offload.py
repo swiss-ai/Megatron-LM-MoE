@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import weakref
+import os
 import torch
 
 
@@ -197,10 +198,19 @@ class MoEOffloadMemoryPool:
             cls._instance = cls()
         return cls._instance
 
-    def __init__(self):
+    def __init__(self, cpu_cache_limit_bytes=None):
+        # Per-process limit on UNUSED activation buffers, not live activations.
+        # Pending copies may temporarily exceed this limit. -1 restores unlimited
+        # caching; 0 drops completed free buffers. Checked without synchronizing.
+        if cpu_cache_limit_bytes is None:
+            limit_gib = int(os.environ.get("MOE_ACT_CPU_CACHE_LIMIT_GIB", "16"))
+            cpu_cache_limit_bytes = -1 if limit_gib == -1 else limit_gib * 1024**3
+        if cpu_cache_limit_bytes < -1:
+            raise ValueError("MOE_ACT_CPU_CACHE_LIMIT_GIB must be -1 or nonnegative")
+        self.cpu_cache_limit_bytes = cpu_cache_limit_bytes
         # List of [buffer, ready_event_or_None]; scanned best-fit by capacity.
         self._free_cpu: list = []
-        # strong refs so buffers are never GC'd / freed (avoids cudaFreeHost syncs).
+        # Own live and cached buffers; trimming drops completed free buffers.
         self._all_cpu: list = []
         self._total_bytes_cpu: int = 0
 
@@ -209,6 +219,30 @@ class MoEOffloadMemoryPool:
         # strong refs of buffers so the memory never returned to the allocator.
         self._all_gpu: list = []
         self._total_bytes_gpu: int = 0
+
+    def trim_cpu_cache(self):
+        """Evict completed free buffers above budget; never wait for CUDA work.
+
+        PyTorch may retain released storage in its own pinned-memory allocator.
+        This only removes this pool's ownership; it does not flush that allocator.
+        """
+        if self.cpu_cache_limit_bytes < 0:
+            return
+        free_bytes = sum(buf.numel() for buf, _ in self._free_cpu)
+        if free_bytes <= self.cpu_cache_limit_bytes:
+            return
+        retained = []
+        evicted_ids = set()
+        # Oldest returned buffers first, preserving recently used capacities.
+        for buf, event in self._free_cpu:
+            if free_bytes > self.cpu_cache_limit_bytes and (event is None or event.query()):
+                free_bytes -= buf.numel()
+                self._total_bytes_cpu -= buf.numel()
+                evicted_ids.add(id(buf))
+            else:
+                retained.append([buf, event])
+        self._free_cpu = retained
+        self._all_cpu = [buf for buf in self._all_cpu if id(buf) not in evicted_ids]
 
     def stats(self) -> dict:
         """(num_buffers, total_bytes, free_bytes)"""
@@ -228,6 +262,7 @@ class MoEOffloadMemoryPool:
         """Return a flat buffer of exactly ``numel`` elements of ``dtype`` on ``device``"""
         # allocate pinned host memory for activation offload
         if device == "cpu":
+            self.trim_cpu_cache()
             best_idx = -1
             best_cap = None
             nbytes = numel * torch.tensor([], dtype=dtype).element_size()
@@ -272,6 +307,7 @@ class MoEOffloadMemoryPool:
         """Return ``buf`` to the pool, tagged with the event after which it is safe to overwrite."""
         if buf.device.type == "cpu":
             self._free_cpu.append([buf, ready_event])
+            self.trim_cpu_cache()
         else:
             self._free_gpu.setdefault((buf.numel(), buf.dtype, buf.device), []).append([buf, ready_event])
 

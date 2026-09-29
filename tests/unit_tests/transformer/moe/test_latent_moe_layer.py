@@ -44,6 +44,7 @@ class TestLatentMoELayer:
             moe_token_dispatcher_type=moe_token_dispatcher_type,
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
+            moe_router_violation_metrics=[],
             moe_grouped_gemm=grouped_gemm,
             moe_ffn_hidden_size=128,
             moe_shared_expert_intermediate_size=128,

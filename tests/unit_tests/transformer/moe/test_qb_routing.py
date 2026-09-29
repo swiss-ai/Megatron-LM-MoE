@@ -110,6 +110,7 @@ def test_qb_only_combines_with_seq_aux_loss(load_balancing_type):
             num_moe_experts=8,
             use_cpu_initialization=True,
             moe_router_load_balancing_type=load_balancing_type,
+            moe_router_violation_metrics=[],
             moe_aux_loss_coeff=[0, 0],
         )
 
@@ -127,6 +128,7 @@ class TestQuantileBalancingRouter:
             use_cpu_initialization=True,
             moe_router_load_balancing_type="quantile_balancing",
             moe_router_quantile_balancing_method="average",
+            moe_router_violation_metrics=[],
             moe_router_score_function="softmax",
             moe_router_topk=2,
             moe_aux_loss_coeff=0,
@@ -182,6 +184,7 @@ class TestQuantileBalancingRouter:
             use_cpu_initialization=True,
             moe_router_load_balancing_type=["quantile_balancing", "seq_aux_loss"],
             moe_router_score_function="softmax",
+            moe_router_violation_metrics=[],
             moe_router_topk=2,
             moe_aux_loss_coeff=[0, 0.5],
             bf16=True,

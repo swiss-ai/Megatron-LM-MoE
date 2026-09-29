@@ -101,6 +101,7 @@ param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_d
 # helper already handles TP metadata plus QKV/MLA/KDA projection-splitting attributes. The attrs
 # below must be propagated separately from the model param onto the FP32 main/shard param.
 _MAIN_PARAM_ROUTING_ATTRS = (
+    'allreduce',
     'is_out_proj',
     'is_router',
     'md_gain_log_family',
@@ -179,8 +180,13 @@ class MegatronOptimizer(ABC):
                 grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
+            tp_group = getattr(self, 'tp_group', None)
+            if getattr(param, 'expert_tp', False) or not getattr(param, 'allreduce', True):
+                # Layer-wise optimizers can own both dense and expert parameters.
+                # Distinct EP experts are not replicas across the dense TP group.
+                tp_group = getattr(self, 'expt_tp_group', tp_group)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
+                param, tp_group
             )
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
@@ -254,6 +260,7 @@ class MegatronOptimizer(ABC):
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=getattr(self, 'tp_group', None),
+            expt_tp_group=getattr(self, 'expt_tp_group', None),
         )
 
     @abstractmethod

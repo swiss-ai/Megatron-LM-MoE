@@ -71,6 +71,7 @@ class TestVisionLayerIsGraphable:
             num_attention_heads=2,
             use_cpu_initialization=True,
             cuda_graph_impl="transformer_engine",
+            moe_router_violation_metrics=[],
         )
         from megatron.core.transformer.transformer_block import TransformerBlock
 
@@ -214,6 +215,7 @@ class TestVisionTECudaGraphHelper:
             hidden_size=self.language_hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            moe_router_violation_metrics=[],
         )
 
         self.vision_config = TransformerConfig(
@@ -222,6 +224,7 @@ class TestVisionTECudaGraphHelper:
             num_attention_heads=2,
             use_cpu_initialization=True,
             cuda_graph_impl="transformer_engine",
+            moe_router_violation_metrics=[],
             bf16=True,
             pipeline_dtype=torch.bfloat16,
         )
@@ -232,6 +235,7 @@ class TestVisionTECudaGraphHelper:
             ffn_hidden_size=32,
             num_attention_heads=1,
             use_cpu_initialization=True,
+            moe_router_violation_metrics=[],
             bf16=True,
             pipeline_dtype=torch.bfloat16,
         )
@@ -470,6 +474,7 @@ class TestVisionTECudaGraphHelperPP2:
             num_attention_heads=4,
             use_cpu_initialization=True,
             pipeline_model_parallel_size=2,
+            moe_router_violation_metrics=[],
             bf16=True,
             pipeline_dtype=torch.bfloat16,
         )
@@ -480,6 +485,7 @@ class TestVisionTECudaGraphHelperPP2:
             num_attention_heads=2,
             use_cpu_initialization=True,
             cuda_graph_impl="transformer_engine",
+            moe_router_violation_metrics=[],
             bf16=True,
             pipeline_dtype=torch.bfloat16,
         )
@@ -490,6 +496,7 @@ class TestVisionTECudaGraphHelperPP2:
             ffn_hidden_size=32,
             num_attention_heads=1,
             use_cpu_initialization=True,
+            moe_router_violation_metrics=[],
             bf16=True,
             pipeline_dtype=torch.bfloat16,
         )

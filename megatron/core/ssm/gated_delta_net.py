@@ -227,11 +227,11 @@ class GatedDeltaNet(MegatronModule):
             + self.n_hh * self.num_value_heads  # beta (per-Householder)
             + self.num_value_heads            # alpha (per-token for g)
         )
-        if self.config.fp8:
+        if self.config.fp8 and type(self) is GatedDeltaNet:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
-                "For FP8, the innermost dimension of the GDN layer "
-                "input projection output tensor must be a multiple of 16."
+                "For FP8, the innermost dimension of the GDN layer input projection "
+                f"output tensor must be a multiple of {fp8_align_size}."
             )
         self.in_proj = build_module(
             submodules.in_proj,
@@ -444,6 +444,34 @@ class GatedDeltaNet(MegatronModule):
         cls._cu_seqlens_int64_cache.append((cu_seqlens, converted))
         return converted
 
+    @staticmethod
+    def _validate_cu_seqlens(cu_seqlens: Tensor) -> None:
+        """Opt-in sanity check ($KDA_VALIDATE_CU_SEQLENS=1) on the packed cu_seqlens.
+
+        A malformed cu_seqlens -- e.g. a batch tensor left truncated/garbage when a
+        dataloader worker dies on a /dev/shm SIGBUS ("insufficient shared memory")
+        -- otherwise detonates as an illegal memory access deep inside FLA's
+        ``_segmented_arange``/``repeat_interleave``, with a traceback that points at
+        the kernel rather than the corrupt input. This raises a readable error naming
+        the offending values instead. Costs one small D2H sync, so it is off by
+        default and enabled only while debugging."""
+        c = cu_seqlens.detach().to("cpu", torch.int64)
+        ok = (
+            c.ndim == 1
+            and c.numel() >= 2
+            and int(c[0]) == 0
+            and bool((c[1:] >= c[:-1]).all())  # monotonic non-decreasing, no wraparound/garbage
+        )
+        if not ok:
+            raise ValueError(
+                "Corrupt cu_seqlens handed to the KDA varlen path "
+                f"(shape={tuple(cu_seqlens.shape)}, dtype={cu_seqlens.dtype}, "
+                f"device={cu_seqlens.device}): expected a 1-D tensor starting at 0 and "
+                f"monotonically non-decreasing, got {c.tolist()}. This is the classic "
+                "signature of a batch truncated by a dataloader /dev/shm SIGBUS "
+                "(check `df -h /dev/shm`), not a KDA kernel bug."
+            )
+
     @classmethod
     def _cu_seqlens_cpu_for(cls, cu_seqlens: Tensor) -> Tensor:
         """Host-side copy of `cu_seqlens`, reusing the same tensor across layers.
@@ -468,6 +496,8 @@ class GatedDeltaNet(MegatronModule):
         for source, seq_idx in cls._seq_idx_cache:
             if source is cu_seqlens:
                 return seq_idx
+        if os.environ.get("KDA_VALIDATE_CU_SEQLENS", "0") == "1":
+            cls._validate_cu_seqlens(cu_seqlens)
         from fla.ops.utils import prepare_sequence_ids
 
         seq_idx = prepare_sequence_ids(cu_seqlens).to(torch.int32).unsqueeze(0)

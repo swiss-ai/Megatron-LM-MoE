@@ -532,13 +532,6 @@ class TransformerConfig(ModelParallelConfig):
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
 
-    linear_attention_output_gate_bias: bool = False
-    """Whether the KDA low-rank output gate's second projection (gate_out_proj) has a bias.
-    This is the only control for that bias: it does not follow --disable-bias-linear, because
-    the two are independent choices. Checkpoints whose KDA layers carry a trained
-    gate_out_proj.bias need this set, or the tensor has no home and the gate loads without
-    its learned offset."""
-
     linear_attention_qk_norm_init_scale: float = 1.0
     """Multiplier applied to the QK-RMSNorm weight init for the Schlag DeltaNet variant. The
     base init is 1/sqrt(head_dim) (unit-norm output); values < 1 produce sub-unit-norm Q,K which
@@ -580,6 +573,10 @@ class TransformerConfig(ModelParallelConfig):
     low-rank output-gate bottleneck otherwise requires (only the decay bottleneck still needs it).
     Changes the in_proj layout, so checkpoints are not interchangeable with the low-rank variant.
     Only affects Kimi Delta Attention (KDA)."""
+
+    kda_legacy_gate_out_proj_bias: bool = False
+    """Restore the low-rank gate bias for legacy KDA checkpoints trained with a
+    hardcoded gate_out_proj bias, independent of add_bias_linear."""
 
     linear_attention_safe_output_gate: bool = False
     """If True, use the Kimi-K3 / FlashKDA 'safe' bounded reparameterization of the log-decay

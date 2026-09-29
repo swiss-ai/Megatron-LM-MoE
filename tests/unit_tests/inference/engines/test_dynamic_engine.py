@@ -26,12 +26,17 @@ from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
     DynamicInferenceContext,
+    RequestCapacityOverflowError,
     RequestOverflowError,
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
+    DynamicInferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -727,6 +732,38 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         env.engine._add_request(env.requests[0])
         assert list(env.engine.waiting_request_ids) == [0]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_request_larger_than_active_buffer_fails(self) -> None:
+        """A request that can never fit must not remain in the waiting queue."""
+        env = self._build_test_env(DynamicEngineTestConfig())
+        buffer_size_gb = (env.engine.context.block_size_bytes + 1) / 1024**3
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                min_prompt_length=512,
+                max_prompt_length=512,
+                num_tokens_to_generate=1,
+                context_buffer_size_gb=buffer_size_gb,
+            )
+        )
+
+        with pytest.warns(UserWarning, match="Active buffer token capacity: 256"):
+            future = env.engine._add_request(env.requests[0])
+
+        assert future.done()
+        assert env.requests[0].status == Status.FAILED
+        assert not env.engine.waiting_request_ids
+        errors = [
+            event.payload
+            for event in env.requests[0].events
+            if event.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
+        ]
+        assert len(errors) == 1
+        assert isinstance(errors[0], RequestCapacityOverflowError)
+        assert errors[0].is_transient is False
 
     @pytest.mark.internal
     @pytest.mark.skipif(

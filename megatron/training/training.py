@@ -567,18 +567,17 @@ def num_floating_point_operations(args, batch_size):
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
-            # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
                     0 if ((i + 1) % args.linear_attention_freq == 0)
-                    else 1 for i in range(num_layers)
+                    else 1 for i in range(args.num_layers)
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+                assert len(linear_attention_pattern) == args.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
+                    f"expected {args.num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
@@ -593,7 +592,10 @@ def num_floating_point_operations(args, batch_size):
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            # MTP layers reuse the last decoder layer's attention spec.
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if args.experimental_attention_variant == "gated_delta_net":
@@ -624,32 +626,40 @@ def num_floating_point_operations(args, batch_size):
                     )
                 )
             elif args.experimental_attention_variant == "kda":
-                # Kimi Delta Attention: vector channel-wise decay alpha in R^{d_k}, so
-                # alpha occupies qk_dim slots (instead of num_v_heads). Plus sigmoid
-                # output gate. FLOPs accounting follows GDN with the alpha slot resized.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
                 num_qk_heads = args.linear_num_key_heads
                 num_v_heads = args.linear_num_value_heads
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
+                alpha_dim = qk_head_dim * num_v_heads
+                low_rank_dim = v_head_dim
+                full_rank_output_gate = args.linear_attention_full_rank_output_gate
+                output_gate_in_proj_dim = v_dim if full_rank_output_gate else low_rank_dim
+                in_proj_dim = (
+                    2 * qk_dim
+                    + v_dim
+                    + low_rank_dim
+                    + output_gate_in_proj_dim
+                    + num_v_heads
+                )
                 linear_self_attn_term = (
                     forward_backward_expansion_factor
                     * fma_expansion_factor
                     * (
-                        ## in proj (qk*2 + v*2 + scalar beta + vector alpha=qk_dim)
-                        args.hidden_size
-                        * (2 * qk_dim + 2 * v_dim + num_v_heads + qk_dim)
-                        ## conv1d
-                        + args.linear_conv_kernel_dim
-                        * (2 * qk_dim + v_dim)
-                        ## kda chunkwise (KK^T, VK^T, S a + S b k k^T, SQ)
-                        + num_v_heads
-                        * (v_head_dim ** 2)
-                        * 4
-                        ## out proj
-                        + args.hidden_size
-                        * v_dim
+                        # Fused Q/K/V, decay bottleneck, output gate, and beta projection.
+                        args.hidden_size * in_proj_dim
+                        # Low-rank decay projection.
+                        + low_rank_dim * alpha_dim
+                        # The low-rank output gate has a second projection if it uses low rank,
+                        # the full-rank gate is already included directly in in_proj.
+                        + (0 if full_rank_output_gate else low_rank_dim * v_dim)
+                        # Depthwise Q/K/V convolution.
+                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        # KDA recurrent state has shape [d_k, d_v] per value head.
+                        + 4 * num_v_heads * qk_head_dim * v_head_dim
+                        # Output projection.
+                        + args.hidden_size * v_dim
                     )
                 )
             else:
@@ -2002,6 +2012,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
+        # Zero spurious non-finite grad elements (nan/inf -> 0) so a rare artifact
+        # (e.g. the fp8-offloading wgrad GEMM on a near-dead expert) can't poison
+        # the grad-norm below / the optimizer step. Gated by NAN_DEBUG_SANITIZE=1
+        # (a true no-op otherwise). Runs after backward, before prepare_grad_norm()
+        # and the optimizer consume the grads. To get mask-and-continue behavior,
+        # pair NAN_DEBUG_SANITIZE=1 with CHECK_NAN=0 (the param_and_grad_buffer
+        # NaN check is fatal and fires DURING backward, before this runs).
+        from megatron.training.nan_debug import nan_debug_sanitize_grads
+        nan_debug_sanitize_grads(model)
+
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:
             from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
             from functools import partial
@@ -2668,18 +2688,11 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers. GUARDED on async_save: torch.cuda.empty_cache()
-    # unmaps CUDA segments NCCL has registered for pipeline-parallel P2P
-    # (fragile under expandable_segments), so with PP>1 the next P2P after the
-    # save touches an unmapped address -> CUDA illegal memory access (the run
-    # dies right after checkpointing; a fresh resume re-registers and continues).
-    # It only buys headroom for the async-save worker PROCESS, so for synchronous
-    # saves it is pure downside -- skip the whole block.
-    if args.async_save:
-        for model_chunk in model:
-            if hasattr(model_chunk, 'free_overlap_buffers'):
-                model_chunk.free_overlap_buffers()
-        torch.cuda.empty_cache()
+    # D2H tensor transfers.
+    for model_chunk in model:
+        if hasattr(model_chunk, 'free_overlap_buffers'):
+            model_chunk.free_overlap_buffers()
+    torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
@@ -2687,6 +2700,7 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+        report_host_memory(f"before save_checkpoint for iteration {iteration}")
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2709,6 +2723,15 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    # The checkpoint writer stages every GPU-resident shard through pinned host memory
+    # (tensor.to("cpu", non_blocking=True)). torch's caching host allocator keeps those
+    # blocks forever, so each rank's pinned footprint grows by its whole shard (rounded
+    # up to powers of two) at the first save and never comes back. Return the now-free
+    # blocks to the OS; live pinned buffers (offload pools, parameters) are untouched.
+    if hasattr(torch._C, "_host_emptyCache"):
+        torch._C._host_emptyCache()
+    if should_report_memory:
+        report_host_memory(f"after save_checkpoint for iteration {iteration}")
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
@@ -2789,7 +2812,8 @@ def post_training_step_callbacks(
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
-            torch.cuda.empty_cache()
+            # Retain cached GPU segments to avoid unmapping memory that may
+            # still be registered with communication libraries.
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
@@ -2910,7 +2934,8 @@ def checkpoint_and_decide_exit(
     if saved_checkpoint:
         # checkpointing can sometimes bring extra memory consumption
         gc.collect()
-        torch.cuda.empty_cache()
+        # Retain cached GPU segments here too; pinned-host cache cleanup is
+        # handled separately in save_checkpoint_and_time.
 
     return False
 

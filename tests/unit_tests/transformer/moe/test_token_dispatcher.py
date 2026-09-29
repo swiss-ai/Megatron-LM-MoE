@@ -93,6 +93,8 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            # Keep auxiliary violation metrics isolated from the global training calculator.
+            moe_router_violation_metrics=kwargs.get("moe_router_violation_metrics", []),
         )
 
         # init moe layer

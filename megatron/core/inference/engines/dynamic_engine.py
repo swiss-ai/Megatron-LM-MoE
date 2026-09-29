@@ -24,6 +24,7 @@ from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
+    RequestCapacityOverflowError,
     TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -825,6 +826,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
+                f"Active buffer token capacity: "
+                f"{self.context.kv_block_allocator.active_count * self.context.block_size_tokens} "
                 f"Chunked prefill enabled: {self.enable_chunked_prefill}"
             )
 
@@ -936,6 +939,27 @@ class DynamicInferenceEngine(AbstractEngine):
         ) or (request.sampling_params.num_tokens_to_generate < 0):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+
+        request_token_capacity = (
+            self.context.kv_block_allocator.active_count * self.context.block_size_tokens
+        )
+        request_token_count = (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+        )
+        if request_token_count > request_token_capacity:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(
+                RequestCapacityOverflowError(
+                    request_id,
+                    message=(
+                        f"request needs up to {request_token_count} tokens, but the active "
+                        f"inference buffer holds {request_token_capacity} tokens "
+                        f"({self.context.kv_block_allocator.active_count} blocks of "
+                        f"{self.context.block_size_tokens}); increase buffer_size_gb or "
+                        "reduce the prompt or generation length"
+                    ),
+                )
+            )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED

@@ -656,6 +656,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 )
                 validate_sharding_integrity = True
                 save_strategy = TorchDistSaveShardedStrategy()
+                staging = getattr(args, 'ckpt_staging', 'pinned')
+                if staging == 'streamed' and args.async_save:
+                    logger.warning('--ckpt-staging streamed needs the GPU in the writing process; '
+                                   'falling back to pageable staging for --async-save')
+                    staging = 'pageable'
+                save_strategy.staging_mode = staging
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     print_rank_0(
                         f"ckpt_assume_constant_structure"
@@ -1562,6 +1568,8 @@ def load_args_from_checkpoint(
     _set_arg('window_size', force=True)
     _set_arg('window_attn_skip_freq', force=True)
     _set_arg('no_rope_freq', force=True)
+    # Old checkpoints lack this field; preserve their explicit CLI override.
+    _set_arg('kda_legacy_gate_out_proj_bias', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)

@@ -63,6 +63,7 @@ def _build_gpt_model(
         # MoE
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
+        moe_router_violation_metrics=[],
         # Fine-grained activation offloading
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
@@ -421,6 +422,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             # MoE + EP overlap
             num_moe_experts=num_experts,
             moe_grouped_gemm=True,
+            moe_router_violation_metrics=[],
             expert_model_parallel_size=ep_size,
             moe_token_dispatcher_type="alltoall" if dispatcher_backend == "alltoall" else "flex",
             moe_flex_dispatcher_backend=dispatcher_backend,

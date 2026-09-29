@@ -815,14 +815,20 @@ class GPTDataset(MegatronDataset):
             path_to_sample_index = get_path_to("sample_index.npy")
             path_to_shuffle_index = get_path_to("shuffle_index.npy")
             path_to_chunk_map = get_path_to("chunk_map.npy")
+            # Compact sampling index (see _compact_bfd_index): what the sample loader
+            # actually touches. chunk_map is only needed to build it.
+            path_to_bfd_docs = get_path_to("bfd_docs.npy")
+            path_to_bfd_splits = get_path_to("bfd_splits.npy")
             cache_hit = all(
                 map(os.path.isfile, [
                     path_to_description, path_to_document_index,
                     path_to_sample_index, path_to_shuffle_index, path_to_chunk_map,
                 ])
             )
+            compact_hit = os.path.isfile(path_to_bfd_docs) and os.path.isfile(path_to_bfd_splits)
         else:
             cache_hit = False
+            compact_hit = False
 
         if not path_to_cache or (
             not cache_hit
@@ -896,6 +902,11 @@ class GPTDataset(MegatronDataset):
                 numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
                 numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
                 numpy.save(path_to_chunk_map, chunk_map, allow_pickle=True)
+            bfd_docs, bfd_splits = self._compact_bfd_index(chunk_map, document_index, seq_lens)
+            if path_to_cache:
+                numpy.save(path_to_bfd_docs, bfd_docs, allow_pickle=True)
+                numpy.save(path_to_bfd_splits, bfd_splits, allow_pickle=True)
+            self.bfd_docs, self.bfd_splits = bfd_docs, bfd_splits
 
             self.chunk_map = chunk_map
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {time.time() - t_beg:4f} s")
@@ -916,17 +927,60 @@ class GPTDataset(MegatronDataset):
         document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode='r')
         sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode='r')
         shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode='r')
-        self.chunk_map = numpy.load(path_to_chunk_map, allow_pickle=True, mmap_mode='r')
+        if not compact_hit:
+            # Legacy cache (chunk_map only): derive the compact index once. Rank 0 builds
+            # every dataset before the other ranks read the cache (see
+            # BlendedMegatronDatasetBuilder.build_generic_dataset), so it writes the files;
+            # any other rank that gets here keeps the arrays in memory.
+            chunk_map = numpy.load(path_to_chunk_map, allow_pickle=True, mmap_mode='r')
+            bfd_docs, bfd_splits = self._compact_bfd_index(
+                numpy.asarray(chunk_map), numpy.asarray(document_index), self.dataset.sequence_lengths
+            )
+            num_virtual = len(chunk_map)
+            del chunk_map
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                for path, arr in ((path_to_bfd_docs, bfd_docs), (path_to_bfd_splits, bfd_splits)):
+                    tmp = f"{path}.{os.getpid()}.tmp.npy"
+                    numpy.save(tmp, arr, allow_pickle=True)
+                    os.replace(tmp, path)
+                compact_hit = True
+            else:
+                self.bfd_docs, self.bfd_splits = bfd_docs, bfd_splits
+        if compact_hit:
+            self.bfd_docs = numpy.load(path_to_bfd_docs, allow_pickle=True, mmap_mode='r')
+            self.bfd_splits = numpy.load(path_to_bfd_splits, allow_pickle=True, mmap_mode='r')
+            num_virtual = len(self.bfd_docs)
         log_single_rank(logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}")
 
         self._log_bfd_packing_statistics(
             num_docs=len(self.indices),
-            num_virtual=len(self.chunk_map),
+            num_virtual=num_virtual,
             sample_index=sample_index,
             from_cache=True,
         )
-        
+
         return document_index, sample_index, shuffle_index
+
+    @staticmethod
+    def _compact_bfd_index(chunk_map, document_index, sequence_lengths):
+        """Fold chunk_map into what sampling needs: for every position of the packed
+        epoch (bin order), the real document id when the chunk is a whole document,
+        or -(k + 1) pointing at row k of a small [K, 4] table of (real_doc_id,
+        chunk_start, chunk_len, append_eod) for the chunks of oversized documents.
+
+        chunk_map is 32 bytes per chunk and is read at random positions by every
+        sample; a node memory-maps ~100 MB of it per shard, i.e. tens of GB over a full
+        blend, all of which the kernel keeps resident and counts against MemAvailable.
+        The compact form is 4 bytes per chunk, read as one contiguous slice per sample.
+        """
+        rows = numpy.asarray(chunk_map)[numpy.asarray(document_index)]
+        seq_lens = numpy.asarray(sequence_lengths)
+        whole = (rows[:, 1] == 0) & (rows[:, 3] == 0) & (rows[:, 2] == seq_lens[rows[:, 0]])
+        splits = rows[~whole].astype(numpy.int64)
+        assert rows[:, 0].max(initial=0) < 2**31 - 1 and len(splits) < 2**31 - 1
+        # At the k-th split position (0-based) cumsum(~whole) equals k + 1, so this is -(k + 1).
+        docs = numpy.where(whole, rows[:, 0], -numpy.cumsum(~whole)).astype(numpy.int32)
+        return docs, splits
 
     def _log_bfd_packing_statistics(self, num_docs, num_virtual, sample_index, from_cache=False):
         num_samples = sample_index.shape[0] - 1
@@ -960,31 +1014,42 @@ class GPTDataset(MegatronDataset):
         target_length = self.config.sequence_length + self.config.add_extra_token_to_sequence
         eod_token_id = self.config.tokenizer.eod
 
+        # Read every chunk's chunk_map row in one fancy-indexed access. Reading them
+        # one scalar at a time costs a document_index lookup plus four mmap reads per
+        # chunk, which dominates __getitem__ once bins hold many short documents
+        # (~80 chunks/sample on the chonk stage-1 mix).
+        # One contiguous slice of the compact index (4 bytes per chunk): whole documents
+        # by id, split chunks of oversized documents as -(k+1) into bfd_splits.
+        ids = numpy.asarray(self.bfd_docs[doc_index_beg:doc_index_end]).tolist()
+        eod = numpy.array([eod_token_id], dtype=numpy.int64)
+        get = self.dataset.get
+
         sample_parts = []
         document_ids = []
-        for i in range(doc_index_beg, doc_index_end):
-            virtual_id = int(self.document_index[i])
-            real_doc_id = int(self.chunk_map[virtual_id, 0])
-            chunk_start = int(self.chunk_map[virtual_id, 1])
-            chunk_len   = int(self.chunk_map[virtual_id, 2])
-            append_eod  = int(self.chunk_map[virtual_id, 3])
-
-            data = self.dataset.get(real_doc_id, offset=chunk_start, length=chunk_len)
-            if append_eod:
-                data = numpy.concatenate([data, numpy.array([eod_token_id], dtype=data.dtype)])
-            sample_parts.append(data)
-            document_ids.append(real_doc_id)
-
-        length = sum(map(len, sample_parts))
-
         # Each chunk (a whole document, or one split of an oversized document, which
-        # already carries its own EOD -- see append_eod above) is its own cu_seqlens
-        # segment for inter_document_masking.
-        document_lengths = [len(p) for p in sample_parts]
+        # carries its own EOD -- see append_eod) is its own cu_seqlens segment for
+        # inter_document_masking. The synthesized EOD is appended as its own part and
+        # concatenated once at the end, rather than re-allocating every chunk.
+        document_lengths = []
+        for doc in ids:
+            if doc >= 0:
+                data = get(doc)
+                sample_parts.append(data)
+                document_ids.append(doc)
+                document_lengths.append(len(data))
+            else:
+                real_doc_id, chunk_start, chunk_len, append_eod = self.bfd_splits[-doc - 1].tolist()
+                data = get(real_doc_id, offset=chunk_start, length=chunk_len)
+                sample_parts.append(data)
+                if append_eod:
+                    sample_parts.append(eod)
+                document_ids.append(real_doc_id)
+                document_lengths.append(len(data) + append_eod)
 
+        length = sum(document_lengths)
         if length < target_length:
             sample_parts.append(
-                [self._pad_token_id] * (target_length - length)
+                numpy.full(target_length - length, self._pad_token_id, dtype=numpy.int64)
             )
 
         return (

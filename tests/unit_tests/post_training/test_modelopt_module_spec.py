@@ -71,7 +71,11 @@ class TestModelOptGPTModel:
         self._dist_checkpoint_name = "standard_gpt_model"
 
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            moe_router_violation_metrics=[],
         )
         self.default_model = GPTModel(
             config=transformer_config,
@@ -133,6 +137,7 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             moe_layer_freq=[0, 1],
             moe_ffn_hidden_size=128,
             moe_shared_expert_intermediate_size=128,
+            moe_router_violation_metrics=[],
             qk_layernorm=True,
             use_cpu_initialization=True,
         )
@@ -172,6 +177,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             moe_layer_freq=[0, 1],
             moe_ffn_hidden_size=128,
             moe_shared_expert_intermediate_size=128,
+            moe_router_violation_metrics=[],
             qk_layernorm=True,
             qk_l2_norm=True,
             use_cpu_initialization=True,
@@ -203,7 +209,11 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            moe_router_violation_metrics=[],
         )
 
         # A Hybrid MambaModel using fused-TE spec (default)

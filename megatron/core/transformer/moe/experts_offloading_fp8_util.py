@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import collections
 import itertools
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -328,6 +329,50 @@ def guarded_per_channel_cast_to_fp8_pack_kmajor(
     if free_input:
         x.data.untyped_storage().resize_(0)
     return fp8
+
+
+# Read once: the disabled path never queries CUDA or the training state.
+_FP8_DIAG_MODE = os.getenv("MOE_FP8_BWD_DIAG", "off").lower()
+if _FP8_DIAG_MODE not in ("off", "trace", "sync"):
+    raise ValueError("MOE_FP8_BWD_DIAG must be off, trace, or sync")
+
+
+def _fp8_backward_diagnostic(ctx, device):
+    """Return a boundary logger for selected backward passes, or None.
+
+    TRACE records CPU enqueue progress only. SYNC waits for all device streams
+    at each boundary and can substantially slow selected ranks and their peers.
+    Iteration bounds are inclusive and use the usual 1-based training number.
+    """
+    from megatron.core.rerun_state_machine import get_rerun_state_machine
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    ranks = os.getenv("MOE_FP8_BWD_DIAG_RANKS", "all")
+    if ranks != "all" and rank not in {int(r.strip()) for r in ranks.split(",")}:
+        return None
+    iteration = get_rerun_state_machine().current_iteration + 1
+    start = int(os.getenv("MOE_FP8_BWD_DIAG_START", "0"))
+    end = int(os.getenv("MOE_FP8_BWD_DIAG_END", str(2**63 - 1)))
+    if not start <= iteration <= end:
+        return None
+    # A process-local parameter identity distinguishes expert modules without
+    # modifying module/config interfaces; it is not a global layer number.
+    module = hex(id(ctx.cpu_w1))
+
+    def boundary(label):
+        prefix = (f"[fp8-bwd-diag rank={rank} iteration={iteration} "
+                  f"module={module} mode={_FP8_DIAG_MODE} boundary={label}]")
+        print(prefix + " reached", flush=True)
+        if _FP8_DIAG_MODE == "sync":
+            try:
+                torch.cuda.synchronize(device)
+            except Exception:
+                print(prefix + " FAILED: error since previous successful boundary "
+                      "(entry may include earlier work)", flush=True)
+                raise
+            print(prefix + " complete", flush=True)
+
+    return boundary
 
 
 class FP8ExpertsParameterManager:
@@ -1449,6 +1494,10 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
         ctx, 
         *grad_outputs
     ):
+        diag = (_fp8_backward_diagnostic(ctx, grad_outputs[0].device)
+                if _FP8_DIAG_MODE != "off" else None)
+        if diag:
+            diag("entry")
         config: OffloadingFP8Config = ctx.config
         cpu_w1: torch.nn.Parameter = ctx.cpu_w1
         cpu_w2: torch.nn.Parameter = ctx.cpu_w2
@@ -1530,6 +1579,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
                 fp8_fc1_output = MoEOffloadManager.get(act_offload_handle, "fp8_fc1")
             fc1_output = per_token_dequant_from_fp8(fp8_fc1_output, fp8_fc1_output_scales)
 
+        if diag:
+            diag("activation_reload_or_recompute")
+
         grad_y = grad_outputs[0].contiguous()
 
         # prepare tokens_per_expert for packing the grad_y and grad_a
@@ -1548,10 +1600,16 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             gran_k=128,
         )
 
+        if diag:
+            diag("input_dequant")
+
         # backward computation (per-chunk quantize -> avoids transpose in DeepGEMM)
         fp8_grad_y_full, fp8_grad_y_chunks, fp8_grad_y_sf_chunks = per_token_cast_to_fp8_chunked_fused(
             grad_y, total_token_num_per_chunk, gran_k=128,
         )
+        if diag:
+            diag("grad_y_quantize")
+
         coarse_w2_t = None
         if config.coarse_grained_reload:
             coarse_w2_t = (param_offload_handle, "w2_t", coarse_w2_t_scale)
@@ -1573,10 +1631,16 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             coarse_w2_t,
         )
 
+        if diag:
+            diag("grad_a_gemm_and_activation_backward")
+
         # backward grad_x computation
         fp8_grad_a_full, fp8_grad_a_chunks, fp8_grad_a_sf_chunks = per_token_cast_to_fp8_chunked_fused(
             grad_a, total_token_num_per_chunk, gran_k=128,
         )
+        if diag:
+            diag("grad_a_quantize")
+
         coarse_w1_t = None
         if config.coarse_grained_reload:
             coarse_w1_t = (param_offload_handle, "w1_t", coarse_w1_t_scale)
@@ -1593,14 +1657,23 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             coarse_w1_t,
         )
 
+        if diag:
+            diag("grad_x_gemm")
+
         if param_offload_handle is not None:
             MoEOffloadManager.release_parameters(param_offload_handle)
+
+        if diag:
+            diag("parameter_release")
 
         # backward grad_w2 computation
         fp8_grad_y_t = guarded_per_channel_cast_to_fp8_pack_kmajor(
             grad_y, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
             name="w2_grad_y", config=config, gran_k=128, free_input=True,
         )
+        if diag:
+            diag("grad_y_pack")
+
         OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w2(
             fp8_grad_y_t,
             fc1_output,
@@ -1620,6 +1693,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             ctx.mgrad_offload_handle,
         )
 
+        if diag:
+            diag("w2_grad")
+
         # backward grad_w1 computation
         fp8_grad_a_t = per_channel_cast_to_fp8_pack_kmajor(
             grad_a, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
@@ -1629,6 +1705,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             bf16_x, tokens_per_expert_list, tokens_per_expert_cuda, tokens_per_expert_cumsum,
             use_ue8m0=False, gran_k=128, free_input=True,
         )
+        if diag:
+            diag("w1_operands_pack")
+
         OffloadingExpertsFP8GroupedSwiMLP.call_backward_grad_w1(
             fp8_grad_a_t,
             fp8_x_t,
@@ -1645,6 +1724,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             ctx.mgrad_offload_handle,
         )
 
+        if diag:
+            diag("w1_grad")
+
         # NOTE: gradients have been attached in _wgrad_post_process, 
         # so we can return None for grad_w1 and grad_w2
         grad_w1_ret = None
@@ -1658,6 +1740,9 @@ class OffloadingExpertsFP8GroupedSwiMLP(torch.autograd.Function):
             MoEOffloadManager.offload_main_grad(ctx.mgrad_offload_handle)
             for hook_fn in ctx.wgrad_accumulation_and_reduce_hooks:
                 hook_fn()
+
+        if diag:
+            diag("exit")
 
         # Leading grads correspond to the a1/a2 PolyNorm coefficient inputs (None for SwiGLU),
         # then the main-grad and parameter offload handles at indices 2 and 3.

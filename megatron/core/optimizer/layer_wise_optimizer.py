@@ -93,6 +93,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
+        # Each child may mix dense and expert parameters. Duplicate filtering
+        # must use the parameter's TP domain, independently of DP ownership.
+        for optimizer in optimizers:
+            optimizer.tp_group = self.pg_collection.tp
+            optimizer.expt_tp_group = self.pg_collection.expt_tp
+
         super().__init__(optimizers)
 
         # TODO(kunlun, deyuf): potential future perf optimization
@@ -322,6 +328,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=None,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.pg_collection.tp,
+            expt_tp_group=self.pg_collection.expt_tp,
         )
 
     @torch.no_grad()
