@@ -148,6 +148,12 @@ def run_case(tp, merged):
         clipped[label] = reference_norm([(key, p.grad) for (key, _), p in zip(entries, copies)])
     assert math.isclose(clipped["corrected"], 1.0, abs_tol=3e-6)
     assert math.isclose(clipped["original"], 1.0, abs_tol=3e-6)
+    # Every unique element is now zero, so count must include both EP owners
+    # and exactly one copy of the replicated dense parameter.
+    for _, grad in entries:
+        grad.zero_()
+    zero_count = optimizer.count_zeros()
+    assert zero_count == 768 * 2 + 8, zero_count
     ownership = [None] * dist.get_world_size()
     dist.all_gather_object(ownership, {
         "rank": dist.get_rank(), "tp_rank": groups.tp.rank(),
@@ -158,6 +164,7 @@ def run_case(tp, merged):
                           "layout": "merged" if merged else "ordinary",
                           "original_norm": original, "reference_norm": expected,
                           "corrected_norm": fixed, "actual_norm_after_clip_1": clipped,
+                          "zero_count": zero_count,
                           "ownership": ownership}), flush=True)
     dist.barrier()
     ps.destroy_model_parallel()

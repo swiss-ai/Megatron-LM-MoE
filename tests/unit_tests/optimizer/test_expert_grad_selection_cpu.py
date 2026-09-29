@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace as NS
 import unittest
+from typing import Optional, Union
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -32,6 +33,27 @@ class Group:
         return self._rank
 
 
+class Scalar(int):
+    def __add__(self, other):
+        return Scalar(int(self) + int(other))
+
+    __radd__ = __add__
+
+    def item(self):
+        return int(self)
+
+
+class Grad:
+    def __init__(self, values):
+        self.values = values
+
+    def detach(self):
+        return self
+
+    def numel(self):
+        return len(self.values)
+
+
 class TestExpertGradSelection(unittest.TestCase):
     def setUp(self):
         namespace = {"List": list, "torch": NS(Tensor=object),
@@ -42,6 +64,50 @@ class TestExpertGradSelection(unittest.TestCase):
         namespace["tensor_parallel"] = NS(param_is_not_tensor_parallel_duplicate=predicate)
         self.select = load_function("megatron/core/optimizer/optimizer.py",
                                     "get_main_grads_for_grad_norm", namespace, "MegatronOptimizer")
+        namespace.update({
+            "Optional": Optional, "Union": Union,
+            "torch": NS(Tensor=Grad, int64=int, zeros=lambda *a, **kw: Scalar(0),
+                        count_nonzero=lambda g: sum(v != 0 for v in g.values),
+                        distributed=NS(ProcessGroup=Group, ReduceOp=NS(SUM="sum"),
+                                       all_reduce=lambda *a, **kw: None)),
+            "get_data_parallel_group_if_dtensor": lambda g, group: group,
+            "to_local_if_dtensor": lambda g: g,
+        })
+        self.count = load_function("megatron/core/optimizer/clip_grads.py",
+                                   "count_zeros_fp32", namespace)
+
+    def test_zero_count_expert_and_dense_domains(self):
+        expert = self.param(allreduce=False, grad=Grad([0, 0, 1]))
+        dense = self.param(grad=Grad([0, 1]))
+        self.assertEqual(self.count([expert, dense], None, tp_group=Group(1),
+                                    expt_tp_group=Group(0)), 2)
+        self.assertEqual(self.count([expert, dense], None, tp_group=Group(0),
+                                    expt_tp_group=Group(1)), 1)
+        expert.tensor_model_parallel = True
+        self.assertEqual(self.count([expert, dense], None, tp_group=Group(0),
+                                    expt_tp_group=Group(1)), 3)
+
+    def test_zero_count_shared_missing_and_decoupled(self):
+        params = [self.param(allreduce=False, shared=True, grad=Grad([0])),
+                  self.param(allreduce=False, grad=None),
+                  self.param(expert_tp=True, decoupled_grad=Grad([0, 0, 1]))]
+        self.assertEqual(self.count(params, None, use_decoupled_grad=True,
+                                    tp_group=Group(1), expt_tp_group=Group(0)), 2)
+
+    def test_zero_count_legacy_fallback(self):
+        p = self.param(allreduce=False, grad=Grad([0]))
+        self.assertEqual(self.count([p], None, tp_group=Group(1)), 0)
+
+    def test_layerwise_zero_count_passes_groups(self):
+        calls = []
+        method = load_function("megatron/core/optimizer/layer_wise_optimizer.py",
+                               "count_zeros", {"count_zeros_fp32": lambda *a, **kw: calls.append(kw)},
+                               "LayerWiseDistributedOptimizer")
+        groups = NS(tp=Group(1), expt_tp=Group(0))
+        method(NS(chained_optimizers=[NS(get_parameters=lambda: [])], pg_collection=groups,
+                  config=NS(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False)))
+        self.assertIs(calls[0]["tp_group"], groups.tp)
+        self.assertIs(calls[0]["expt_tp_group"], groups.expt_tp)
 
     def selected(self, params, tp=1, etp=0):
         opt = NS(get_parameters=lambda: params, tp_group=Group(tp),

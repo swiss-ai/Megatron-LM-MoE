@@ -260,6 +260,7 @@ class MegatronOptimizer(ABC):
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=getattr(self, 'tp_group', None),
+            expt_tp_group=getattr(self, 'expt_tp_group', None),
         )
 
     @abstractmethod
