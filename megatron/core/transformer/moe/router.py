@@ -725,23 +725,31 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-        if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
+        apply_penalty = self.config.moe_z_loss_coeff not in (None, 0.0)
+        if (apply_penalty or self.config.moe_router_log_z_loss) and self.training and torch.is_grad_enabled():
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
-            moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
-            z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
-            if self.calculate_per_token_loss:
-                # The expected final scaling for z_loss gradients is
-                # 1/(num_micro_batches * dp_size).
-                # After commit 02648000, Megatron started using the number of total tokens
-                # to scale gradients under the argument of calculate_per_token_loss,
-                # which scales both the main_loss gradient and z_loss gradient by
-                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
-                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
-                # Count valid tokens: sum of inverted mask (False -> True = valid)
-                num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+            if apply_penalty:
+                moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
+                z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
+                if self.calculate_per_token_loss:
+                    # The expected final scaling for z_loss gradients is
+                    # 1/(num_micro_batches * dp_size).
+                    # After commit 02648000, Megatron started using the number of total tokens
+                    # to scale gradients under the argument of calculate_per_token_loss,
+                    # which scales both the main_loss gradient and z_loss gradient by
+                    # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
+                    # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
+                    # Count valid tokens: sum of inverted mask (False -> True = valid)
+                    num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+                    logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+                else:
+                    logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+
             else:
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+                # Diagnostic only: retain no autograd graph and attach no auxiliary gradient.
+                moe_z_loss_coeff = 1.0
+                with torch.no_grad():
+                    z_loss = z_loss_func(logits.detach().float(), 1.0, padding_mask=padding_mask)
 
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers

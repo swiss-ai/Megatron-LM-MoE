@@ -2364,7 +2364,7 @@ def training_log(
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("global_load_balancing_loss")
-        if args.moe_z_loss_coeff is not None:
+        if args.moe_z_loss_coeff not in (None, 0.0) or args.moe_router_log_z_loss:
             track_names.append("z_loss")
         if "mbs" in args.moe_router_violation_metrics:
             track_names.append("expert_max_violation")

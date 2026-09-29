@@ -1130,6 +1130,12 @@ class TransformerConfig(ModelParallelConfig):
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
     a corresponding list of coefficients should be provided here."""
 
+    moe_router_log_z_loss: bool = False
+    """Log unweighted router z-loss without requiring a z-loss penalty.
+
+    When moe_z_loss_coeff is None or zero, this does not alter router gradients.
+    """
+
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
