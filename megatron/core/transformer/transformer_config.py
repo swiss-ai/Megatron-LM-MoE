@@ -532,6 +532,13 @@ class TransformerConfig(ModelParallelConfig):
     """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
     matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
 
+    linear_attention_output_gate_bias: bool = False
+    """Whether the KDA low-rank output gate's second projection (gate_out_proj) has a bias.
+    This is the only control for that bias: it does not follow --disable-bias-linear, because
+    the two are independent choices. Checkpoints whose KDA layers carry a trained
+    gate_out_proj.bias need this set, or the tensor has no home and the gate loads without
+    its learned offset."""
+
     linear_attention_qk_norm_init_scale: float = 1.0
     """Multiplier applied to the QK-RMSNorm weight init for the Schlag DeltaNet variant. The
     base init is 1/sqrt(head_dim) (unit-norm output); values < 1 produce sub-unit-norm Q,K which

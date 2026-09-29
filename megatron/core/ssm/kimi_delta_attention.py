@@ -427,7 +427,7 @@ class KimiDeltaAttention(GatedDeltaNet):
                 config=second_stage_config,
                 init_method=self.config.init_method,
                 gather_output=False,
-                bias=bias,
+                bias=self.config.linear_attention_output_gate_bias,
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name="kda_gate_out",
