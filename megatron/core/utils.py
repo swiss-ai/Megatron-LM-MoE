@@ -2160,8 +2160,11 @@ def pad_thd_batch_for_cp(
     alignment = 2 * cp_size * sp_size
     cu_seqlens_cpu = cu_seqlens.cpu()
     # A document of at most `alignment` tokens gets a single token per zigzag chunk, which
-    # CP kernels do not handle; merge such documents into a neighbour first.
-    min_len = int(os.environ.get("MEGATRON_CP_MIN_DOC_TOKENS", alignment))
+    # CP kernels do not handle. Merging such documents into a neighbour avoids that layout,
+    # but it also removes the inter-document boundary, so it is OPT-IN: it changes the
+    # attention mask and must not alter packing for callers that did not ask for it.
+    # Set MEGATRON_CP_MIN_DOC_TOKENS (e.g. to 2*cp_size*sp_size) to enable it.
+    min_len = int(os.environ.get("MEGATRON_CP_MIN_DOC_TOKENS", 0))
     merged = merge_short_documents(cu_seqlens_cpu, min_len)
     if merged.numel() != cu_seqlens_cpu.numel():
         cu_seqlens_cpu = merged
