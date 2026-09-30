@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import json
 from dataclasses import dataclass
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -21,6 +22,68 @@ identity_template = """{% for message in messages %}{{ message['content'] }}{% e
 
 
 IGNORE_INDEX = -100
+
+
+def to_apertus_messages(conversation: List[Dict]) -> Tuple[List[Dict], Optional[list], bool]:
+    """Turn a conversation into Apertus chat-template input: (messages, tools, enable_thinking).
+
+    Accepts plain {"role", "content": str} messages ("from"/"value" too) and the Apertus SFT-mix
+    schema. The mix keeps tools and the deliberation flag in a leading "developer" message,
+    which the template rejects: it builds the developer block itself from `tools` and
+    `enable_thinking`. Nested content (user `parts`, assistant `blocks` with thoughts,
+    tool_calls, tool_outputs) is passed through, minus nulls and the empty {"name": ""}
+    placeholder calls/outputs. A message's "train" flag is kept.
+    """
+    messages, tools, enable_thinking = [], None, False
+    for message in conversation:
+        role = message.get("role", message.get("from", "")).lower()
+        content = message.get("content", message.get("value", ""))
+        is_mapping = isinstance(content, dict)
+        if is_mapping and content.get("has_thinking"):
+            enable_thinking = True
+        if role == "developer":
+            raw_tools = content.get("tools") if is_mapping else None
+            if raw_tools:
+                tools = json.loads(raw_tools) if isinstance(raw_tools, str) else raw_tools
+            continue
+        if not is_mapping:
+            content = content or ""
+        elif role == "user":
+            parts = [
+                {"type": p["type"], "text": p.get("text") or ""} for p in content.get("parts") or []
+            ]
+            if not parts and content.get("text"):
+                parts = [{"type": "text", "text": content["text"]}]
+            content = {"parts": parts}
+        elif role == "assistant":
+            blocks = []
+            for b in content.get("blocks") or []:
+                block = {"type": b["type"], "text": b.get("text") or ""}
+                if b["type"] == "thoughts" and block["text"]:
+                    enable_thinking = True
+                elif b["type"] == "tool_calls":
+                    block["calls"] = [
+                        {"name": c["name"], "arguments": c.get("arguments") or "{}"}
+                        for c in b.get("calls") or []
+                        if c.get("name")
+                    ]
+                elif b["type"] == "tool_outputs":
+                    block["outputs"] = [
+                        {"name": o.get("name") or "", "output": o.get("output") or ""}
+                        for o in b.get("outputs") or []
+                        if o.get("name") or o.get("output")
+                    ]
+                blocks.append(block)
+            if not blocks and content.get("text"):
+                blocks = [{"type": "response", "text": content["text"]}]
+            content = {"blocks": blocks}
+        else:  # system, tool
+            content = content.get("text") or ""
+        converted = {"role": role, "content": content}
+        if "train" in message:
+            converted["train"] = message["train"]
+        messages.append(converted)
+    return messages, tools, enable_thinking
 
 
 @dataclass
@@ -91,6 +154,33 @@ class SFTTokenizer:
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "apertus":
+            # Template: <s><|system_start|>...<|system_end|><|developer_start|>...<|developer_end|>
+            #   <|user_start|>...<|user_end|><|assistant_start|>...<|assistant_end|>
+            apertus_template = transformers.AutoTokenizer.from_pretrained(
+                "swiss-ai/Apertus-8B-Instruct-2509"
+            ).chat_template
+            self._prompt_config = PromptConfig(
+                # <|assistant_start|> is rendered by the assistant turn; don't train on it.
+                assistant_prefix_len=1,
+                # <pad> (3); must differ from eos <|assistant_end|> (68), or SFTDataset masks EOS.
+                pad_token_id=tokenizer.pad_token_id,
+                custom_chat_template=apertus_template,
+                # The template emits {{ bos_token }} itself.
+                has_bos=True,
+                has_system_role=True,
+            )
+            # Mask boundaries; the tokenizer's sft_* fields (create_instruct.py) take precedence.
+            begin = tokenizer.init_kwargs.get("sft_assistant_begin_sequence") or [
+                tokenizer.convert_tokens_to_ids("<|assistant_start|>")
+            ]
+            eot = tokenizer.init_kwargs.get("sft_eot_token") or [
+                tokenizer.convert_tokens_to_ids("<|assistant_end|>")
+            ]
+            self._apertus_assistant_start, self._apertus_assistant_end = begin[0], eot[0]
+            assert tokenizer.unk_token_id not in (begin[0], eot[0]), (
+                f"{tokenizer_path} has no <|assistant_start|>/<|assistant_end|> tokens"
+            )
         elif prompt_format == "default":
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=0,
@@ -124,6 +214,11 @@ class SFTTokenizer:
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
+        if self._prompt_format == "apertus":
+            return self._tokenize_conversation_apertus(
+                conversation, return_target, add_generation_prompt
+            )
+
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
@@ -182,6 +277,64 @@ class SFTTokenizer:
             idx += turn_len
 
         assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
+
+        return tokens, target
+
+    def _tokenize_conversation_apertus(
+        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+    ):
+        """Apertus tokenization, ported from swiss-ai/multimodal-data chat_preprocess.py
+        (style="apertus", add_bos=False, add_eos=True as in its SFTChatDataset).
+
+        The Apertus template emits <s> + system + developer blocks on every render, so the
+        per-turn re-render used for the other formats cannot align turns. Instead the whole
+        conversation is rendered once and the mask is built by scanning for
+        <|assistant_start|> ... <|assistant_end|>: tokens after the start token up to and
+        including the end token are trained, unless that assistant turn has "train": False.
+        Rows in the Apertus SFT-mix schema are converted first (see to_apertus_messages).
+        """
+        chat, tools, enable_thinking = to_apertus_messages(conversation)
+        # Render to text, then encode: the template emits {{ bos_token }} itself, and this
+        # returns plain ids across transformers versions (v5 returns a BatchEncoding).
+        text = self._tokenizer.apply_chat_template(
+            chat,
+            tools=tools,
+            enable_thinking=enable_thinking,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            chat_template=self._prompt_config.custom_chat_template,
+        )
+        tokens = np.asarray(
+            self._tokenizer(text, add_special_tokens=False)["input_ids"], dtype=np.int64
+        )
+        if not return_target:
+            return tokens
+
+        train_flags = [m.get("train", True) for m in chat if m["role"] == "assistant"]
+        mask = np.zeros(len(tokens), dtype=bool)
+        turn_idx, in_assistant, should_train = 0, False, True
+        for i, tok in enumerate(tokens.tolist()):
+            # Mask first (before state changes): the start token itself is never trained.
+            if in_assistant and should_train:
+                mask[i] = True
+            if tok == self._apertus_assistant_start:
+                in_assistant = True
+                should_train = train_flags[turn_idx] if turn_idx < len(train_flags) else True
+            if tok == self._apertus_assistant_end:
+                if in_assistant:
+                    turn_idx += 1
+                in_assistant = False
+
+        # BOS is never trained; EOS is appended (and trained) if the render doesn't end with it.
+        if len(tokens) and tokens[0] == self._tokenizer.bos_token_id:
+            mask[0] = False
+        eos_id = self._tokenizer.eos_token_id
+        ends_with_eos = len(tokens) > 0 and tokens[-1] == eos_id
+        if not add_generation_prompt and eos_id is not None and not ends_with_eos:
+            tokens = np.append(tokens, eos_id)
+            mask = np.append(mask, True)
+
+        target = np.where(mask, tokens, IGNORE_INDEX)
 
         return tokens, target
 

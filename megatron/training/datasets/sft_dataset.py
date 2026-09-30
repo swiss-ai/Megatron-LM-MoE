@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import atexit, json
+import atexit, json, os
 from collections import Counter
 from typing import Any, Dict, Optional
 
@@ -18,7 +18,9 @@ class SFTLowLevelDataset:
     """The low-level dataset loading jsonl data for SFT
 
     Args:
-        dataset_path (str): The path to jsonl data
+        dataset_path (str): The path to jsonl data, or to a directory written by HF
+            `save_to_disk` (a Dataset, or a DatasetDict with a "train" split). Directories are
+            memory-mapped via `load_from_disk`; only the "messages" column is exposed.
             Each line of the jsonl must have key "messages" (List[Dict]),
             which is a sequence of system/user/assistant messages.
             Must be in the following format:
@@ -34,12 +36,22 @@ class SFTLowLevelDataset:
 
     def __init__(self, dataset_path: str) -> None:
         try:
-            from datasets import load_dataset
+            from datasets import DatasetDict, load_dataset, load_from_disk
         except ImportError:
             raise ImportError(
                 "SFTDataset currently requires datasets library to be installed"
             )
-        self.dataset = load_dataset("json", data_files=dataset_path, split="all")
+        if os.path.isdir(dataset_path):
+            dataset = load_from_disk(dataset_path)
+            if isinstance(dataset, DatasetDict):
+                assert "train" in dataset, (
+                    f"{dataset_path} is a DatasetDict without a 'train' split: {list(dataset)}"
+                )
+                dataset = dataset["train"]
+            # Skip decoding the other (possibly large) columns on every __getitem__.
+            self.dataset = dataset.select_columns(["messages"])
+        else:
+            self.dataset = load_dataset("json", data_files=dataset_path, split="all")
 
     def __len__(self) -> int:
         return len(self.dataset)
