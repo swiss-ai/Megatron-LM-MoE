@@ -3843,8 +3843,11 @@ def evaluate_and_print_results(
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-            ppl = math.exp(min(20, total_loss_dict[key].item()))
-            string += '{} PPL: {:.6E} | '.format(key, ppl)
+            # PPL = exp(value) only means something for a loss (not e.g. 'token accuracy').
+            is_loss = 'loss' in key
+            ppl = math.exp(min(20, total_loss_dict[key].item())) if is_loss else None
+            if is_loss:
+                string += '{} PPL: {:.6E} | '.format(key, ppl)
             if writer:
                 writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
                 writer.add_scalar(
@@ -3852,7 +3855,7 @@ def evaluate_and_print_results(
                     total_loss_dict[key].item(),
                     args.consumed_train_samples,
                 )
-                if args.log_validation_ppl_to_tensorboard:
+                if args.log_validation_ppl_to_tensorboard and is_loss:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples

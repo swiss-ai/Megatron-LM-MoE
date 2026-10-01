@@ -186,6 +186,16 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+        if args.log_token_accuracy and model is not None:
+            # Same [sum, count] form as 'lm loss', so it is reduced, printed and sent to
+            # TensorBoard/wandb the same way (train and validation).
+            gpt = get_attr_wrapped_model(model, '_token_correct', return_model_obj=True)
+            correct, gpt._token_correct = gpt._token_correct, None
+            if correct is not None:
+                num_correct = torch.sum(correct.view(-1) * loss_mask)
+                report['token accuracy'] = torch.cat(
+                    [num_correct.detach().view(1), num_tokens.float().view(1)]
+                )
         if args.context_parallel_size > 1 and not args.calculate_per_token_loss:
             # Normalize by the microbatch's token count over all CP ranks: packed
             # documents and padding do not split the valid tokens evenly. The data

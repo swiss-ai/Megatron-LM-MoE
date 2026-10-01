@@ -114,6 +114,9 @@ class GPTModel(LanguageModule):
 
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
+        # Per-token correctness [b, s] of the last forward with labels, read and cleared by
+        # the training loss function (config.log_token_accuracy).
+        self._token_correct = None
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
         self.post_process = post_process
@@ -710,9 +713,41 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
+        if self.config.log_token_accuracy:
+            self._token_correct = self._compute_token_correct(labels, logits)
+
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    @torch.no_grad()
+    def _compute_token_correct(self, labels: Tensor, logits: Tensor) -> Tensor:
+        """1.0 where argmax(logits) == label, else 0.0, as [b, s].
+
+        Works on vocab-parallel logits without gathering them: a token is correct when the
+        logit of its label is the maximum over the whole vocabulary (ties count as correct).
+
+        Args:
+            labels (Tensor): [b, s] target token ids.
+            logits (Tensor): [s, b, v] logits, v = full or this TP rank's vocab shard.
+        """
+        labels = labels.transpose(0, 1)
+        vocab_local = logits.size(-1)
+        max_logit = logits.max(dim=-1).values.float()
+        tp_group = self.pg_collection.tp
+        if vocab_local != self.vocab_size and tp_group is not None and tp_group.size() > 1:
+            start = torch.distributed.get_rank(group=tp_group) * vocab_local
+            local = labels - start
+            in_shard = (local >= 0) & (local < vocab_local)
+            label_logit = logits.gather(-1, local.clamp(0, vocab_local - 1).unsqueeze(-1))
+            label_logit = label_logit.squeeze(-1).float().masked_fill(~in_shard, float('-inf'))
+            torch.distributed.all_reduce(max_logit, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+            torch.distributed.all_reduce(label_logit, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+        else:
+            # Masked positions may carry out-of-range ids; they are dropped by the loss mask.
+            label_logit = logits.gather(-1, labels.clamp(0, vocab_local - 1).unsqueeze(-1))
+            label_logit = label_logit.squeeze(-1).float()
+        return (label_logit >= max_logit).float().transpose(0, 1).contiguous()
 
     @torch.inference_mode()
     def compute_mtp_single_step(

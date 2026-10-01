@@ -424,6 +424,10 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    log_token_accuracy: bool = False
+    """Also report next-token accuracy (argmax of the logits == label) over the loss-masked
+    tokens, as 'token accuracy' next to 'lm loss' (train and validation, stdout/TB/wandb)."""
+
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
