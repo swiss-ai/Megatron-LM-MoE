@@ -567,13 +567,17 @@ def append_to_progress_log(string, barrier=True):
     if barrier:
         torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
-        with open_file(progress_log_filename, 'a') as f:
-            job_id = os.getenv('SLURM_JOB_ID', '')
-            num_gpus = args.world_size
-            f.write(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
-                f"# GPUs: {num_gpus}\t{string}\n"
-            )
+        # A progress-log write failure (e.g. a filesystem hiccup) must not crash training.
+        try:
+            with open_file(progress_log_filename, 'a') as f:
+                job_id = os.getenv('SLURM_JOB_ID', '')
+                num_gpus = args.world_size
+                f.write(
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
+                    f"# GPUs: {num_gpus}\t{string}\n"
+                )
+        except Exception as e:
+            print(f"WARNING: failed to append to progress log: {e!r}", flush=True)
 
 
 def get_blend_and_blend_per_split(args):

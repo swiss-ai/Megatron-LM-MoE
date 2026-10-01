@@ -817,12 +817,20 @@ def get_start_time_from_progress_log():
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
-            world_size_in_line = _get_field(line_tokens[2], int)
-            if line_tokens[3] == "Saved checkpoint":
-                latest_num_floating_point_operations = _get_field(line_tokens[7], float)
-            elif line_tokens[3] == "Saving async checkpoint":
+            # Skip blank, truncated (e.g. a line still being appended) or otherwise malformed
+            # lines instead of crashing the run over a logging file.
+            try:
+                world_size_in_line = _get_field(line_tokens[2], int)
+                event = line_tokens[3]
+                if event in ("Saved checkpoint", "Saving async checkpoint"):
+                    event_flops = _get_field(line_tokens[7], float)
+            except (IndexError, ValueError):
+                continue
+            if event == "Saved checkpoint":
+                latest_num_floating_point_operations = event_flops
+            elif event == "Saving async checkpoint":
                 # Checkpoint hasn't committed yet, so store for now in a different variable.
-                latest_num_floating_point_operations_uncommitted = _get_field(line_tokens[7], float)
+                latest_num_floating_point_operations_uncommitted = event_flops
             elif line_tokens[3] == "Saved async checkpoint":
                 # Checkpoint has committed, so can update latest_num_floating_point_operations to
                 # value from latest 'Saving async checkpoint' message.
@@ -841,9 +849,9 @@ def get_start_time_from_progress_log():
                 if start_time is None:
                     start_time = line_tokens[0]
                     start_num_floating_point_operations = latest_num_floating_point_operations
-    assert (
-        start_time is not None and start_num_floating_point_operations is not None
-    ), "Should have seen at least one 'Starting job' entry with same world_size"
+    if start_time is None or start_num_floating_point_operations is None:
+        # No usable 'Starting job' entry with this world size; callers treat this as unknown.
+        return None, None
     print_rank_0(f"megatron.training.get_start_time_from_progress_log: "
                  f"{start_time=}, {start_num_floating_point_operations=}")
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), start_num_floating_point_operations
@@ -2616,22 +2624,34 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     if args.save is None:
         return
 
-    # Compute job throughput.
-    # args.num_floating_point_operations_so_far keeps track of floating-point operations
-    # completed at the start of job.
-    global _TRAIN_START_TIME
-    job_throughput = (
-        num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
-    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+    # Only rank 0 writes the progress log, so only rank 0 reads it and computes throughputs.
+    # Other ranks reading the file while rank 0 appends to it raced on a half-written line
+    # and crashed the run. A logging failure must never take down training, so any error
+    # here degrades to NaN throughputs. All ranks still reach append_to_progress_log's
+    # barrier below, keeping the collective matched.
+    job_throughput = float('nan')
+    cumulative_throughput = float('nan')
+    if torch.distributed.get_rank() == 0:
+        try:
+            # Compute job throughput.
+            # args.num_floating_point_operations_so_far keeps track of floating-point
+            # operations completed at the start of job.
+            global _TRAIN_START_TIME
+            job_throughput = (
+                num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
+            ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
 
-    # Compute cumulative throughput since jobs of this world size were launched.
-    # `get_start_time_from_progress_log` returns start time and number of floating-point
-    # operations of first job of this world size.
-    start_time, start_num_floating_point_operations = get_start_time_from_progress_log()
-    elapsed_time = (datetime.now() - start_time).total_seconds()
-    cumulative_throughput = (
-        num_floating_point_operations_so_far - start_num_floating_point_operations
-    ) / (elapsed_time * 10**12 * args.world_size)
+            # Compute cumulative throughput since jobs of this world size were launched.
+            # `get_start_time_from_progress_log` returns start time and number of
+            # floating-point operations of first job of this world size.
+            start_time, start_num_floating_point_operations = get_start_time_from_progress_log()
+            if start_time is not None:
+                elapsed_time = (datetime.now() - start_time).total_seconds()
+                cumulative_throughput = (
+                    num_floating_point_operations_so_far - start_num_floating_point_operations
+                ) / (elapsed_time * 10**12 * args.world_size)
+        except Exception as e:
+            print(f"WARNING: failed to compute throughputs from progress log: {e!r}", flush=True)
 
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
