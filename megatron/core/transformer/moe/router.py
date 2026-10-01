@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
+    marin_qb_histogram_update,
     pop_routing_oob_accum,
     qb_dual_update,
     router_gating_linear,
@@ -355,13 +356,15 @@ class TopKRouter(Router):
     def quantile_balancing(
         self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
-        """Apply average or histogram quantile-balancing routing.
+        """Apply the configured quantile-balancing routing estimator.
 
         The average methods gather TP/CP values and accumulate one quantile per
         microbatch for later averaging. ``legacy_average`` uses raw logits for
         compatibility with older QB checkpoints, while ``average`` uses bounded
         router scores. The histogram method performs no forward-pass communication:
         it accumulates local counts that are pooled once at the batch boundary.
+        ``marin_histogram`` uses raw logits and a live global histogram per forward,
+        then token-weights its quantiles across microbatches at the batch boundary.
         """
         assert (
             not self.config.moe_router_fusion
@@ -391,21 +394,38 @@ class TopKRouter(Router):
             # This backwards compatibility should probably be removed in 1 or 2 months from this git blame
             qb_scores = (
                 logits_fp32
-                if self.config.moe_router_quantile_balancing_method == 'legacy_average'
+                if self.config.moe_router_quantile_balancing_method in (
+                    'legacy_average', 'marin_histogram'
+                )
                 else scores
             )
             biased_scores = qb_scores - self.qb_beta
             use_histogram = (
                 self.config.moe_router_quantile_balancing_method == 'histogram'
             )
-            if should_update_beta and use_histogram:
+            use_marin = self.config.moe_router_quantile_balancing_method == 'marin_histogram'
+            if should_update_beta and (use_histogram or use_marin):
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
                 indices = biased_scores.topk(self.topk, dim=1).indices
 
             if should_update_beta:
-                if use_histogram:
+                if use_marin:
+                    if self.tp_dp_cp_group is None:
+                        raise RuntimeError("marin_histogram requires a TP+DP+CP process group")
+                    beta_local, token_count = marin_qb_histogram_update(
+                        qb_scores,
+                        topk_result.values[:, -1],
+                        self.qb_beta,
+                        self.topk,
+                        self.config.moe_router_quantile_balancing_marin_num_bins,
+                        group=self.tp_dp_cp_group,
+                        padding_mask=padding_mask,
+                    )
+                    self.qb_beta_accum.add_(beta_local * token_count)
+                    self.qb_beta_count.add_(token_count)
+                elif use_histogram:
                     # Hand the mask down instead of compacting the rows here:
                     # scores[~padding_mask] lowers to nonzero(), which synchronizes the
                     # device and makes the shape data-dependent, so the router can no
@@ -1154,7 +1174,9 @@ class InferenceTopKRouter(TopKRouter):
         precomputed_indices = None
         if self.qb_beta is not None:
             logits_fp32 = logits.to(dtype=torch.float32)
-            if self.config.moe_router_quantile_balancing_method == 'legacy_average':
+            if self.config.moe_router_quantile_balancing_method in (
+                'legacy_average', 'marin_histogram'
+            ):
                 qb_scores = logits_fp32
             elif self.score_function == "sigmoid":
                 qb_scores = torch.sigmoid(logits_fp32)

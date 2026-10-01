@@ -1028,7 +1028,7 @@ class TransformerConfig(ModelParallelConfig):
     no memory: the bias is replaced by the latest global-batch estimate each step."""
 
     moe_router_quantile_balancing_method: Literal[
-        'average', 'legacy_average', 'histogram'
+        'average', 'legacy_average', 'histogram', 'marin_histogram'
     ] = 'histogram'
     """Quantile estimator used by quantile balancing. "average" averages independently computed
     microbatch/rank quantiles in sigmoid/softmax score space. "legacy_average" preserves the
@@ -1038,6 +1038,14 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_quantile_balancing_num_bins: int = 1000
     """Number of uniform bins per expert used by histogram quantile balancing."""
+
+    moe_router_quantile_balancing_marin_num_bins: int = 10000
+    """Bins for marin_histogram: raw-logit margins with a live global min/max grid.
+    Each forward pools a histogram over TP+DP+CP. With gradient accumulation,
+    token-weighted microbatch quantiles are averaged at the optimizer-step boundary;
+    this is not the quantile of the entire accumulated batch. Expert combination
+    weights still use moe_router_score_function. Adds three forward collectives.
+    """
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
@@ -1938,14 +1946,16 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         if "quantile_balancing" in self.moe_router_load_balancing_type:
-            valid_qb_methods = {'average', 'legacy_average', 'histogram'}
+            valid_qb_methods = {'average', 'legacy_average', 'histogram', 'marin_histogram'}
             if self.moe_router_quantile_balancing_method not in valid_qb_methods:
                 raise ValueError(
                     "moe_router_quantile_balancing_method must be 'average', "
-                    "'legacy_average', or 'histogram'"
+                    "'legacy_average', 'histogram', or 'marin_histogram'"
                 )
             if self.moe_router_quantile_balancing_num_bins <= 0:
                 raise ValueError("moe_router_quantile_balancing_num_bins must be positive")
+            if self.moe_router_quantile_balancing_marin_num_bins <= 0:
+                raise ValueError("moe_router_quantile_balancing_marin_num_bins must be positive")
             if (
                 self.num_moe_experts is not None
                 and self.moe_router_topk >= self.num_moe_experts

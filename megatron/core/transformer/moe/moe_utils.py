@@ -236,6 +236,72 @@ def qb_dual_update(
     return indices, beta_local
 
 
+def marin_qb_histogram_update(
+    logits: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+    num_bins: int = 10000,
+    *,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Marin's live-range upper-quantile estimator, in subtractive-beta convention.
+
+    Reference: marin-community/marin@12d8b6f,
+    experiments/grug/moe_hero_ep/model.py::_qb_beta_hist.
+    Pool raw-logit margins over a single forward's TP+DP+CP token shards. The
+    caller holds beta fixed through accumulation and token-weights these estimates.
+    No margins survive this call. A None group is the single-process CPU path.
+    """
+    assert logits.ndim == 2 and alpha.shape == logits.shape[:1]
+    assert beta.shape == logits.shape[1:] and 0 < topk < logits.shape[1]
+    assert num_bins > 0
+    assert padding_mask is None or padding_mask.shape == alpha.shape
+    with torch.no_grad():
+        margins = logits.detach().float() - alpha.detach().float().unsqueeze(1)
+        valid = (
+            torch.ones_like(alpha, dtype=torch.bool)
+            if padding_mask is None else ~padding_mask.bool()
+        )
+        # Empty shards still join collectives. numel() checks metadata, not device data.
+        if margins.numel() == 0:
+            lo, hi = margins.new_tensor(float('inf')), margins.new_tensor(-float('inf'))
+        elif padding_mask is None:
+            lo, hi = margins.amin(), margins.amax()
+        else:
+            lo = margins.masked_fill(~valid[:, None], float('inf')).amin()
+            hi = margins.masked_fill(~valid[:, None], -float('inf')).amax()
+        if group is not None:
+            torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
+            torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
+        # All-padding forwards preserve beta. Keep the grid finite without a CPU sync.
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        hi = torch.where(torch.isfinite(hi), hi, lo)
+        span = (hi - lo).clamp_min(1e-6)
+        width = span / num_bins
+        safe_margins = torch.where(valid[:, None], margins, lo)
+        bins = ((safe_margins - lo) / width).long().clamp_(0, num_bins - 1)
+        experts = torch.arange(logits.shape[1], device=logits.device) * num_bins
+        indices = (bins + experts).flatten()
+        counts = torch.zeros(logits.shape[1] * num_bins, dtype=torch.int64, device=logits.device)
+        weights = valid[:, None].expand_as(bins).reshape(-1).to(torch.int64)
+        counts.scatter_add_(0, indices, weights)
+        counts = counts.reshape(logits.shape[1], num_bins)
+        if group is not None:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+        token_count = counts[0].sum()
+        target = token_count.to(torch.float32) * topk / logits.shape[1]
+        cumulative = counts.flip(-1).cumsum(-1).flip(-1)
+        crossing = ((cumulative >= target).sum(-1) - 1).clamp(0, num_bins - 1)
+        above = cumulative.gather(-1, crossing[:, None]).squeeze(-1)
+        in_bin = counts.gather(-1, crossing[:, None]).squeeze(-1)
+        estimate = lo + width * (
+            crossing + (above - target) / in_bin.clamp_min(1)
+        )
+        return torch.where(token_count > 0, estimate, beta), token_count
+
+
 def compute_qb_histogram(
     scores: torch.Tensor,
     alpha: torch.Tensor,
