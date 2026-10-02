@@ -26,6 +26,7 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import freeze_norm_gain_at_identity
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -374,6 +375,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        if self.config.fixed_pre_norm_gain:
+            # Standalone pre-norms have no learnable gain. A pre-norm fused into the attention /
+            # MLP input projection is handled where that projection is built.
+            for norm in (
+                self.input_layernorm,
+                self.pre_cross_attn_layernorm,
+                self.pre_mlp_layernorm,
+            ):
+                freeze_norm_gain_at_identity(norm, self.config.layernorm_zero_centered_gamma)
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
         # import here to avoid circular import

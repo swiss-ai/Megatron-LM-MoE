@@ -415,6 +415,7 @@ class KimiDeltaAttention(GatedDeltaNet):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
+        self._freeze_fused_input_norm_gain()
         # Keep the first-stage projection fused for the forward GEMM, but expose
         # the six reference matrices so Muon/MuonMD orthogonalize them separately.
         self.in_proj.weight.is_kda_in_proj = True

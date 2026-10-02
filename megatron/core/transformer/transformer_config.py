@@ -363,6 +363,16 @@ class TransformerConfig(ModelParallelConfig):
     `layernorm_zero_centered_gamma` is set (effective gain = `1 + weight`), the gain is zeroed via
     `weight = -1` so the effective gain is still 0."""
 
+    fixed_pre_norm_gain: bool = False
+    """If True, the pre-norms (the norm applied to a sublayer's input: `input_layernorm`,
+    `pre_mlp_layernorm`, `pre_cross_attn_layernorm`, the Mamba layer norm, and the norm fused into
+    the attention/KDA/GDN input projection or the dense MLP `linear_fc1`) have no learnable gain:
+    `RMSNorm(x) = x / rms(x)` (`LayerNorm(x) = (x - mean) / std`). The gain (and LayerNorm bias)
+    is kept as a non-trainable parameter pinned at its identity value (`0` with
+    `layernorm_zero_centered_gamma`, else `1`), so the checkpoint layout is unchanged; a value
+    loaded from a checkpoint is overridden with the identity. Post-norms (`sandwich_norm`), QK
+    norms and the final norm are not affected."""
+
     scale_embeddings_by_sqrt_hidden: bool = False
     """If True, multiply the output of the embedding by ``sqrt(hidden_size)``. Combined with an
     embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the

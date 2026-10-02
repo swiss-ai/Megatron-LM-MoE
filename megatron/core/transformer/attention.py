@@ -36,6 +36,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.utils import freeze_norm_gain_at_identity
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -1491,6 +1492,13 @@ class SelfAttention(Attention):
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
         )
+        if self.config.fixed_pre_norm_gain:
+            # The layer's input norm fused into the QKV projection (no-op if not fused).
+            freeze_norm_gain_at_identity(
+                self.linear_qkv,
+                self.config.layernorm_zero_centered_gamma,
+                attr_prefix="layer_norm_",
+            )
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = submodules.q_layernorm(

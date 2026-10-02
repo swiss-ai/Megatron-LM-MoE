@@ -24,6 +24,64 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def freeze_norm_gain_at_identity(
+    module: torch.nn.Module, zero_centered_gamma: bool, attr_prefix: str = ""
+) -> bool:
+    """Pin the learnable gain of a normalization at its identity value and stop training it.
+
+    Works on a standalone norm (``weight`` / ``bias``) and, with ``attr_prefix="layer_norm_"``, on
+    a module with a fused input norm such as Transformer Engine's ``LayerNormLinear``
+    (``layer_norm_weight`` / ``layer_norm_bias``). The gain stays a parameter, so the checkpoint
+    layout is unchanged, but it is excluded from training (``requires_grad=False``) and a value
+    loaded from a checkpoint is overridden with the identity: ``0`` for a zero-centered gain
+    (effective gain ``1 + weight``), ``1`` otherwise; a LayerNorm bias is pinned at ``0``.
+
+    Args:
+        module: The norm, or the module holding the fused norm.
+        zero_centered_gamma: Whether the norm computes its gain as ``1 + weight``.
+        attr_prefix: Prefix of the gain attributes on ``module``.
+
+    Returns:
+        True if ``module`` has such a gain, False otherwise (e.g. an ``IdentityOp``).
+    """
+    weight = getattr(module, f"{attr_prefix}weight", None)
+    if not isinstance(weight, torch.Tensor):
+        return False
+    bias = getattr(module, f"{attr_prefix}bias", None)
+    if not isinstance(bias, torch.Tensor):
+        bias = None
+    identity = 0.0 if zero_centered_gamma else 1.0
+
+    def _is_identity() -> bool:
+        ok = bool(torch.all(weight == identity))
+        if bias is not None:
+            ok = ok and bool(torch.all(bias == 0))
+        return ok
+
+    def _reset() -> None:
+        with torch.no_grad():
+            weight.fill_(identity)
+            if bias is not None:
+                bias.zero_()
+
+    _reset()
+    weight.requires_grad_(False)
+    if bias is not None:
+        bias.requires_grad_(False)
+
+    def _load_state_dict_post_hook(mod, incompatible_keys):
+        if not _is_identity():
+            logger.warning(
+                "fixed_pre_norm_gain: the loaded checkpoint holds a non-identity gain for %s; "
+                "it is overridden with the identity.",
+                type(mod).__name__,
+            )
+            _reset()
+
+    module.register_load_state_dict_post_hook(_load_state_dict_post_hook)
+    return True
+
+
 def cat_with_oom_fallback(sub_state_dict):
     """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
     # Detach first: the fused-parameter shards (e.g. KDA in_proj, offloaded expert

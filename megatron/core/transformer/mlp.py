@@ -54,6 +54,7 @@ from megatron.core.fusions.fused_bias_sssglu import (
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import freeze_norm_gain_at_identity
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
@@ -249,6 +250,13 @@ class MLP(MegatronModule):
             tp_group=tp_group,
             stride=fc1_stride,
         )
+        if self.config.fixed_pre_norm_gain:
+            # The pre-MLP norm fused into linear_fc1 (no-op if not fused, e.g. for experts).
+            freeze_norm_gain_at_identity(
+                self.linear_fc1,
+                self.config.layernorm_zero_centered_gamma,
+                attr_prefix="layer_norm_",
+            )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))

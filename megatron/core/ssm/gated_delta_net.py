@@ -38,6 +38,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     cat_with_oom_fallback,
     ensure_metadata_has_dp_cp_group,
+    freeze_norm_gain_at_identity,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -243,6 +244,7 @@ class GatedDeltaNet(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
+        self._freeze_fused_input_norm_gain()
 
         # Conv1d for QKV: Q is per-token (1*qk), K is per-Householder (n*qk),
         # V is per-Householder (n*v).
@@ -428,6 +430,16 @@ class GatedDeltaNet(MegatronModule):
                         device=torch.cuda.current_device(),
                     ).uniform_(*self.A_init_range)
                     self.A_log.data.copy_(torch.log(A))
+
+    def _freeze_fused_input_norm_gain(self) -> None:
+        """With `fixed_pre_norm_gain`, pin the layer input norm fused into `in_proj` at identity.
+
+        No-op when the input norm is not fused into `in_proj` or the option is off.
+        """
+        if self.config.fixed_pre_norm_gain:
+            freeze_norm_gain_at_identity(
+                self.in_proj, self.config.layernorm_zero_centered_gamma, attr_prefix="layer_norm_"
+            )
 
     @classmethod
     def _cu_seqlens_as_int64(cls, cu_seqlens: Tensor) -> Tensor:

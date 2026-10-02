@@ -22,6 +22,7 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import freeze_norm_gain_at_identity
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
 
@@ -89,6 +90,8 @@ class MambaLayer(GraphableMegatronModule):
             pp_layer_offset=pp_layer_offset,
         )
         self.norm = submodules.norm(self.config, self.config.hidden_size)
+        if self.config.fixed_pre_norm_gain:
+            freeze_norm_gain_at_identity(self.norm, self.config.layernorm_zero_centered_gamma)
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 

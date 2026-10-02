@@ -2370,6 +2370,7 @@ def _add_network_size_args(parser):
         "polynorm",
         "sandwich_norm",
         "post_attn_norm_zero_init",
+        "fixed_pre_norm_gain",
         "keel",
         "keel_alpha",
     ]
@@ -2544,6 +2545,14 @@ def _add_network_size_args(parser):
                        'contributes nothing at init (x = x + 0*Norm(Attn(Norm(x)))); the model '
                        'starts as a stack of MLP/MoE blocks, which can help MoE routing. Requires '
                        '--sandwich-norm; only the post-attention norm is zeroed.')
+    group.add_argument('--fixed-pre-norm-gain', action='store_true',
+                       help='Remove the learnable gain from the pre-norms (input, pre-MLP and '
+                       'pre-cross-attention norms, the Mamba layer norm, and the norm fused into '
+                       'the attention/KDA/GDN input projection or the dense MLP fc1): '
+                       'RMSNorm(x) = x / rms(x). The gain stays in the checkpoint as a frozen '
+                       'parameter at its identity value and is reset to it after a checkpoint '
+                       'load. Post-norms (--sandwich-norm), QK norms and the final norm keep '
+                       'their gain.')
     group.add_argument('--keel', action='store_true',
                        help='Use the KEEL Highway-style Post-LN architecture '
                        '(arXiv:2601.19895): x = LN_post(alpha * x + Sublayer(LN_pre(x))). '
