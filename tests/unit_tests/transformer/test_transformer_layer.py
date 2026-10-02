@@ -566,3 +566,126 @@ class TestFixedPreNormGainTransformerLayer:
         layer.load_state_dict(state_dict)
         for name, gain in self._pre_norm_gains(layer).items():
             assert torch.all(gain == 1), name
+
+
+def _have_kda_kernels():
+    try:
+        from megatron.core.ssm.kimi_delta_attention import HAVE_KDA
+    except ImportError:
+        return False
+    return HAVE_KDA
+
+
+@pytest.mark.skipif(
+    not _have_kda_kernels(), reason="The installed FLA does not provide KDA kernels."
+)
+class TestFixedPreNormGainHybridBlock:
+    """--fixed-pre-norm-gain on the hybrid block used by the KDA / latent-MoE runs: KDA layers
+    (input norm fused into in_proj) interleaved with global attention layers (input norm fused
+    into linear_qkv), a first dense layer (pre-MLP norm fused into linear_fc1), latent MoE layers
+    with a shared expert (standalone pre-MLP norm), QK norms and sandwich norms. Construction only;
+    requires GPU + Transformer Engine + the KDA kernels."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_layers(fixed_pre_norm_gain):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
+        from megatron.core.transformer.spec_utils import build_module
+
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=256,
+            num_attention_heads=8,
+            experimental_attention_variant="kda",
+            linear_attention_freq=[1, 1, 1, 0],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            attention_output_gate=True,
+            qk_layernorm=True,
+            num_moe_experts=2,
+            moe_layer_freq=[0, 1, 1, 1],
+            moe_router_topk=2,
+            moe_router_violation_metrics=[],
+            moe_latent_size=64,
+            moe_shared_expert_intermediate_size=64,
+            normalization="RMSNorm",
+            sandwich_norm=True,
+            fixed_pre_norm_gain=fixed_pre_norm_gain,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            pipeline_dtype=torch.bfloat16,
+            transformer_impl="transformer_engine",
+            use_cpu_initialization=True,
+        )
+        block_spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+        return [
+            build_module(layer_spec, config=config, layer_number=i + 1)
+            for i, layer_spec in enumerate(block_spec.layer_specs)
+        ]
+
+    @staticmethod
+    def _pre_norm_gains(layers):
+        kda0, kda1, _, attn3 = layers
+        return {
+            "0.in_proj.layer_norm_weight": kda0.self_attention.in_proj.layer_norm_weight,
+            "0.linear_fc1.layer_norm_weight": kda0.mlp.linear_fc1.layer_norm_weight,
+            "1.in_proj.layer_norm_weight": kda1.self_attention.in_proj.layer_norm_weight,
+            "1.pre_mlp_layernorm.weight": kda1.pre_mlp_layernorm.weight,
+            "3.linear_qkv.layer_norm_weight": attn3.self_attention.linear_qkv.layer_norm_weight,
+            "3.pre_mlp_layernorm.weight": attn3.pre_mlp_layernorm.weight,
+        }
+
+    @staticmethod
+    def _other_norm_gains(layers):
+        kda0, kda1, _, attn3 = layers
+        return {
+            "0.out_norm.weight": kda0.self_attention.out_norm.weight,
+            "0.post_self_attn_layernorm.weight": kda0.post_self_attn_layernorm.weight,
+            "0.post_mlp_layernorm.weight": kda0.post_mlp_layernorm.weight,
+            "1.post_mlp_layernorm.weight": kda1.post_mlp_layernorm.weight,
+            "3.q_layernorm.weight": attn3.self_attention.q_layernorm.weight,
+            "3.k_layernorm.weight": attn3.self_attention.k_layernorm.weight,
+            "3.post_self_attn_layernorm.weight": attn3.post_self_attn_layernorm.weight,
+        }
+
+    def test_layout(self):
+        layers = self._build_layers(fixed_pre_norm_gain=True)
+        # The patterns put KDA + dense first, KDA + MoE next, global attention + MoE last.
+        assert isinstance(layers[0].pre_mlp_layernorm, IdentityOp)
+        assert not isinstance(layers[1].pre_mlp_layernorm, IdentityOp)
+        assert hasattr(layers[3].self_attention, "linear_qkv")
+        # Experts and the shared expert have no fused norm, so nothing is pinned there.
+        shared = layers[1].mlp.shared_experts
+        assert not hasattr(shared.linear_fc1, "layer_norm_weight")
+
+    def test_default_keeps_gains_trainable(self):
+        layers = self._build_layers(fixed_pre_norm_gain=False)
+        gains = {**self._pre_norm_gains(layers), **self._other_norm_gains(layers)}
+        for name, gain in gains.items():
+            assert gain.requires_grad, name
+
+    def test_pre_norm_gains_pinned(self):
+        layers = self._build_layers(fixed_pre_norm_gain=True)
+        for name, gain in self._pre_norm_gains(layers).items():
+            assert not gain.requires_grad, name
+            assert torch.all(gain == 1), name
+        for name, gain in self._other_norm_gains(layers).items():
+            assert gain.requires_grad, name
+
+        reference = self._build_layers(fixed_pre_norm_gain=False)
+        for layer, ref in zip(layers, reference):
+            assert [n for n, _ in layer.named_parameters()] == [
+                n for n, _ in ref.named_parameters()
+            ]
