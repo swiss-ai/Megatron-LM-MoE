@@ -4,13 +4,17 @@
 
 import pickle
 from copy import deepcopy
-from dataclasses import fields
+from dataclasses import fields, replace
 
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.transformer.moe.expert_checkpoint_utils import (
+    make_legacy_offloading_load_factory,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -121,3 +125,60 @@ class TestCPUTensors:
                 assert file.exists()
                 file_size = file.stat().st_size
                 assert file_size < 10_000, file.name
+
+
+class TestLegacyOffloadingCPUStaging:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _factory(target, prepend_axis_num, gated):
+        if prepend_axis_num:
+            canonical = ShardedTensor.from_rank_offsets(
+                "layers.0.mlp.experts.linear_fc1.weight",
+                target,
+                (0, 0, 1),
+                replica_id=Utils.rank,
+                prepend_axis_num=1,
+            )
+        else:
+            canonical = ShardedTensor.from_rank_offsets(
+                "layers.0.mlp.experts.0.linear_fc1.weight", target, replica_id=Utils.rank
+            )
+        return make_legacy_offloading_load_factory(canonical, "linear_fc1", gated=gated)
+
+    @pytest.mark.parametrize("prepend_axis_num", [0, 1])
+    @pytest.mark.parametrize("gated", [False, True])
+    def test_dcp_loads_legacy_layout_through_cpu_staging(
+        self, tmp_path_dist_ckpt, prepend_axis_num, gated
+    ):
+        out_features = 16 if gated else 8
+        expected = torch.arange(out_features * 5, dtype=torch.bfloat16, device="cuda").view(
+            out_features, 5
+        )
+        target = torch.full_like(expected, -1)
+        factory = self._factory(target, prepend_axis_num, gated)
+        templates = factory.build()
+        expected_parts = torch.chunk(expected, 2, dim=-2) if gated else (expected,)
+        source_shards = [
+            replace(template, data=part.t().contiguous(), dtype=part.dtype)
+            for template, part in zip(templates, expected_parts)
+        ]
+        checkpoint_dir = tmp_path_dist_ckpt / (
+            f"legacy-prepend{prepend_axis_num}-gated{int(gated)}"
+        )
+        if Utils.rank == 0:
+            checkpoint_dir.mkdir()
+        torch.distributed.barrier()
+        save({"value": source_shards}, checkpoint_dir, async_sharded_save=False)
+
+        loaded = load({"value": factory}, checkpoint_dir)["value"]
+
+        assert loaded.device.type == "cpu"
+        assert loaded.dtype == torch.bfloat16
+        assert torch.equal(loaded, expected.cpu())
+        target.copy_(loaded)
+        assert torch.equal(target, expected)

@@ -123,6 +123,17 @@ class ValidationConfig:
        included in the list.
     """
 
+    eval_global_batch_size: int | None = None
+    """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
+    Must be divisible by (eval_micro_batch_size * data_parallel_size).
+    """
+
+    eval_micro_batch_size: int | None = None
+    """Micro batch size to use during evaluation. If not set, defaults to micro_batch_size.
+    Changing this affects per-device memory usage during eval and the number of microbatches per
+    eval step.
+    """
+
 
 @dataclass(kw_only=True)
 class SchedulerConfig:
@@ -566,3 +577,91 @@ class CheckpointConfig:
                 "nvidia-resiliency-ext is not installed. "
                 "Please, install nvidia-resiliency-ext to enable async save."
             )
+
+
+@dataclass(kw_only=True)
+class TokenizerConfig:
+    """Configuration settings for the tokenizers."""
+
+    vocab_size: int = None
+    """Size of vocab before EOD or padding."""
+
+    padded_vocab_size: int = None
+    """Vocabulary size of the model (padded to be divisible by tensor model parallel size).
+    If not provided, it will be automatically calculated from vocab-size."""
+
+    pad_vocab_size: bool = True
+    """Whether to pad vocab size of the model automatically if padded_vocab_size is not provided."""
+
+    vocab_file: str = None
+    """Path to the vocab file."""
+
+    merge_file: str = None
+    """Path to the BPE merge file."""
+
+    vocab_extra_ids: int = 0
+    """Number of additional vocabulary tokens. They are used for span masking in the T5 model."""
+
+    tokenizer_type: Literal[
+        "BertWordPieceLowerCase", "BertWordPieceCase", "GPT2BPETokenizer",
+        "SentencePieceTokenizer", "GPTSentencePieceTokenizer", "HuggingFaceTokenizer",
+        "Llama2Tokenizer", "TikTokenizer", "MultimodalTokenizer", "NullTokenizer",
+        "NullMultimodalTokenizer", "SFTTokenizer",
+    ] = None
+    """What type of tokenizer to use."""
+
+    tokenizer_model: str = None
+    """Path to the tokenizer model."""
+
+    metadata_path: str | None = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-metadata"]}}
+    )
+    """Path to the tokenizer metadata file in json format."""
+
+    special_tokens: Optional[list[str]] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}}
+    )
+    """List of additional special tokens."""
+
+    tiktoken_pattern: Literal["v1", "v2"] = None
+    """Which tiktoken pattern to use. Options: [v1, v2]."""
+
+    tiktoken_num_special_tokens: int = 1000
+    """Number of special tokens in tiktoken tokenizer."""
+
+    # Retained for compatibility with fork callers and tokenizer launchers.
+    tiktoken_special_tokens: Optional[list[str]] = None
+    """List of tiktoken special tokens."""
+
+    tokenizer_sentencepiece_legacy: bool = False
+    """SentencePiece tokenizer wrapper legacy behavior."""
+
+    tokenizer_sentencepiece_ignore_extra_whitespaces: bool = True
+    """Whether to ignore extra whitespaces in the input text while encoding."""
+
+    tokenizer_hf_no_use_fast: bool = False
+    """Whether to use fast HuggingFace tokenizer."""
+
+    tokenizer_hf_no_include_special_tokens: bool = False
+    """Converting text to ids will not include special for HuggingFace tokenizer."""
+
+    # Keep the old positive spellings available to config/legacy callers.
+    tokenizer_hf_use_fast: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--tokenizer-hf-use-fast"], "action": "store_true"}})
+    tokenizer_hf_include_special_tokens: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--tokenizer-hf-include-special-tokens"], "action": "store_true"}})
+
+    trust_remote_code: bool = False
+    """Whether or not to allow PreTrainedTokenizer to execute remote code."""
+
+    null_tokenizer_eod_id: int = None
+    """EOD token id for NullTokenizer. Defaults to `vocab_size - 1`."""
+
+    null_tokenizer_pad_id: int = -1
+    """Pad token id for NullTokenizer. Defaults to -1 (no pad token)."""
+
+    chat_template: Optional[str] = None
+    """Custom chat template in jinja format for conversation formatting."""
+
+    # These options are consumed by fork multimodal/SFT tokenizer callers.
+    tokenizer_prompt_format: str | None = None
+    image_tag_type: str | None = None
+    force_system_message: bool = False

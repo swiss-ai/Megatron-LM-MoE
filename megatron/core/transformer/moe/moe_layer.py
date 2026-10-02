@@ -26,7 +26,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
-    InferenceCUDAGraphTokenDispatcher,
+    InferenceAllGatherDispatcherBase,
+    NCCLAllGatherDispatcher,
+    NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -361,12 +363,12 @@ class MoELayer(BaseMoELayer):
         which is swapped in during CUDA-graphed forward passes.
         """
 
-        assert self.config.moe_token_dispatcher_type == "alltoall", (
-            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
-            f"got '{self.config.moe_token_dispatcher_type}'"
-        )
         self.is_inference_cuda_graphed_iteration = False
-        self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
+        dispatcher_type = getattr(self.config, "inference_moe_token_dispatcher_type", "nccl")
+        dispatcher_cls = (
+            NVLSAllGatherVDispatcher if dispatcher_type == "nvls" else NCCLAllGatherDispatcher
+        )
+        self._inference_token_dispatcher = dispatcher_cls(
             self.num_local_experts,
             self.local_expert_indices,
             config=self.config,
@@ -452,6 +454,11 @@ class MoELayer(BaseMoELayer):
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
+        if isinstance(self.token_dispatcher, InferenceAllGatherDispatcherBase):
+            dispatched_hidden, dispatched_probs = self.token_dispatcher.token_dispatch(
+                hidden_states, probs
+            )
+            return dispatched_hidden, None, dispatched_probs
         return self.token_dispatcher.token_dispatch(hidden_states, hidden_states_sf, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
@@ -624,7 +631,7 @@ class MoELayer(BaseMoELayer):
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                # like cuda_graph_modules=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 

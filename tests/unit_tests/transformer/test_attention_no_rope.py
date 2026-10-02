@@ -90,22 +90,18 @@ class TestParallelAttentionWithNoRope:
         # For self-attention, rotary_pos_emb needs to be a tuple of (q_pos_emb, k_pos_emb)
         rotary_pos_emb = (rotary_pos_emb, rotary_pos_emb)
 
-        # Test with layer 3 which should skip RoPE
-        self.parallel_attention.layer_number = 3
-        # Run forward pass without RoPE
+        # Layer numbers are 1-indexed; layer 4 should skip RoPE.
+        self.parallel_attention.layer_number = 4
         output_without_rope, _ = self.parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
         )
 
-        # Test with layer 0 which should NOT skip RoPE
-        self.parallel_attention.layer_number = 0
-        # Run forward pass with RoPE (but should be skipped for this layer)
+        # Layer 3 should retain RoPE.
+        self.parallel_attention.layer_number = 3
         output_with_rope, bias = self.parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
         )
 
-        # Verify RoPE was skipped for this layer
-        # If RoPE was skipped, outputs should be the same
         assert not torch.allclose(
             output_without_rope, output_with_rope
         ), "Outputs are expected to be different."
@@ -116,6 +112,82 @@ class TestParallelAttentionWithNoRope:
         assert output_with_rope.shape[1] == micro_batch_size
         assert output_with_rope.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
+
+    @pytest.mark.parametrize(
+        ("no_rope_freq", "layer_number"),
+        [
+            pytest.param([1] * 8, 1, id="all-nope"),
+            pytest.param([0, 1, 0, 1, 0, 1, 0, 1], 2, id="mixed-nope-layer"),
+        ],
+    )
+    def test_no_rope_clears_all_rotary_inputs(self, monkeypatch, no_rope_freq, layer_number):
+        """NoPE layers must clear standard and precomputed rotary inputs."""
+        config = self.parallel_attention.config
+        config.no_rope_freq = no_rope_freq
+        config.__post_init__()
+        self.parallel_attention.layer_number = layer_number
+        self.parallel_attention.cuda()
+
+        sequence_length = 8
+        hidden_states = torch.randn(
+            sequence_length, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        rotary = torch.randn(sequence_length, 1, 1, config.kv_channels, device="cuda")
+        combined = torch.randn(sequence_length, 2 * config.kv_channels, device="cuda")
+        adjusted_rotary = {}
+        original_adjust = self.parallel_attention._adjust_key_value_for_inference
+
+        def capture_adjusted_rotary(*args, **kwargs):
+            adjusted_rotary["values"] = args[4:8]
+            return original_adjust(*args, **kwargs)
+
+        monkeypatch.setattr(
+            self.parallel_attention, "_adjust_key_value_for_inference", capture_adjusted_rotary
+        )
+
+        self.parallel_attention(
+            hidden_states,
+            None,
+            rotary_pos_emb=(rotary, rotary),
+            rotary_pos_cos=rotary,
+            rotary_pos_sin=rotary,
+            rotary_pos_cos_sin=combined,
+        )
+
+        assert adjusted_rotary["values"] == (None, None, None, None)
+
+    @pytest.mark.parametrize(
+        ("no_rope_freq", "layer_number"),
+        [
+            pytest.param(None, 1, id="ordinary-rope"),
+            pytest.param([0] * 8, 1, id="all-zero-pattern"),
+            pytest.param([0, 1, 0, 1, 0, 1, 0, 1], 1, id="mixed-rope-layer"),
+        ],
+    )
+    def test_rope_layer_preserves_fused_rotary_table(self, monkeypatch, no_rope_freq, layer_number):
+        """RoPE layers must retain the combined table for fused application."""
+        config = self.parallel_attention.config
+        config.no_rope_freq = no_rope_freq
+        config.__post_init__()
+        self.parallel_attention.layer_number = layer_number
+        self.parallel_attention.cuda()
+
+        hidden_states = torch.randn(8, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        combined = torch.randn(8, 2 * config.kv_channels, device="cuda")
+        adjusted_rotary = {}
+        original_adjust = self.parallel_attention._adjust_key_value_for_inference
+
+        def capture_adjusted_rotary(*args, **kwargs):
+            adjusted_rotary["combined"] = args[7]
+            return original_adjust(*args, **kwargs)
+
+        monkeypatch.setattr(
+            self.parallel_attention, "_adjust_key_value_for_inference", capture_adjusted_rotary
+        )
+
+        self.parallel_attention(hidden_states, None, rotary_pos_cos_sin=combined)
+
+        assert adjusted_rotary["combined"] is combined
 
     def test_invalid_no_rope_freq_pattern(self):
         """Test invalid no_rope patterns raise appropriate errors."""

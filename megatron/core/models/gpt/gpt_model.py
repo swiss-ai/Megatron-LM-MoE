@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -58,6 +58,9 @@ class GPTModel(LanguageModule):
             Include an output layer (used with pipeline parallelism). Defaults to True.
         fp16_lm_cross_entropy (bool, optional):
             Defaults to False.
+        logit_dtype (torch.dtype, optional):
+            Dtype for the output-layer GEMM result. Defaults to None, which uses
+            the hidden-state dtype.
         parallel_output (bool, optional):
             Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
@@ -92,6 +95,7 @@ class GPTModel(LanguageModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
@@ -118,6 +122,7 @@ class GPTModel(LanguageModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
@@ -222,6 +227,7 @@ class GPTModel(LanguageModule):
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if self.post_process:
@@ -258,6 +264,7 @@ class GPTModel(LanguageModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:
@@ -410,13 +417,8 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            and inference_context is not None
+            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
@@ -722,6 +724,8 @@ class GPTModel(LanguageModule):
         position_ids: Tensor,
         depth: int,
         runtime_gather_output: bool = True,
+        eager: bool = False,
+        cache_key=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 

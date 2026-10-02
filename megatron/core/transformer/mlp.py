@@ -1,23 +1,16 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import gc
 import logging
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional, Protocol, cast
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import (
-    ReplicaId,
-    ShardedStateDict,
-    ShardedTensorFactory,
-)
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_bias_geglu import (
     bias_geglu_impl,
     quick_gelu,
@@ -53,6 +46,12 @@ from megatron.core.fusions.fused_bias_sssglu import (
 )
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.expert_checkpoint_utils import (
+    EXPERT_CKPT_HAS_TE_EXTRA_STATE_KEY,
+    apply_swiglu_sharded_factory,
+    is_legacy_offloading_checkpoint,
+    make_legacy_offloading_load_factory,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -203,6 +202,7 @@ class MLP(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.is_expert = is_expert
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
@@ -545,101 +545,38 @@ class MLP(MegatronModule):
         """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        # Load-only compatibility for checkpoints saved by OffloadingExpertsMLP before
+        # it adopted the canonical Sequential/TE expert keys and [out, in] layout.
+        legacy_offloading = self.is_expert and is_legacy_offloading_checkpoint(metadata)
+        has_te_extra_state = (metadata or {}).get(
+            EXPERT_CKPT_HAS_TE_EXTRA_STATE_KEY, True
+        )
+        if legacy_offloading:
+            assert not self.config.add_bias_linear, (
+                "Legacy offloading checkpoints contain expert weights only and cannot initialize "
+                "biased SequentialMLP experts."
+            )
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
-            if self.config.gated_linear_unit and name == "linear_fc1":
+            if legacy_offloading and name in ("linear_fc1", "linear_fc2"):
+                key = f"{prefix}{name}.weight"
+                if key in sub_sd:
+                    sub_sd[key] = make_legacy_offloading_load_factory(
+                        sub_sd[key],
+                        name,
+                        gated=(name == "linear_fc1" and self.config.gated_linear_unit),
+                    )
+            elif self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
                         sub_sd[k] = apply_swiglu_sharded_factory(
                             v, sharded_offsets, singleton_local_shards
                         )
+            if not has_te_extra_state:
+                sub_sd = {k: v for k, v in sub_sd.items() if '_extra_state' not in k}
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
     def backward_dw(self):
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
-
-
-# pylint: disable=missing-function-docstring
-def apply_swiglu_sharded_factory(
-    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
-):
-    # We must split the tensor into 2 parts, each sharded separately.
-    # This requires a ShardedTensorFactory which `chunk`s during saving
-    # and `cat`s during loading
-
-    swiglu_shard_axis = 0
-    prepend_axis_num = len(sharded_offsets)
-    original_shape = original_sh_ten.local_shape
-    original_numel = int(np.prod(original_shape))
-    local_axis_size = original_shape[swiglu_shard_axis]
-    assert (
-        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
-    )
-    rank_offset = (
-        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
-    )
-    axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        if singleton_local_shards:
-            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
-            offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
-            w_key = f'{key}_w'
-            v_key = f'{key}_v'
-        else:
-            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
-            offset_v = (
-                swiglu_shard_axis + prepend_axis_num,
-                rank_offset + axis_frag,
-                axis_frag * 2,
-            )
-            w_key = key
-            v_key = key
-
-        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
-        return [
-            ShardedTensor.from_rank_offsets(
-                w_key,
-                tensor_w,
-                *sharded_offsets,
-                offset_w,
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            ),
-            ShardedTensor.from_rank_offsets(
-                v_key,
-                tensor_v,
-                *sharded_offsets,
-                offset_v,
-                replica_id=replica_id,
-                prepend_axis_num=prepend_axis_num,
-            ),
-        ]
-
-    def sh_ten_merge_fn(sub_state_dict):
-        with torch.no_grad():
-            try:
-                return torch.cat(sub_state_dict)
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                logger.warning(
-                    f"CUDA OutOfMemoryError encountered during tensors merging."
-                    f" Switching to CPU merge. (Error: {e})"
-                )
-                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
-                gc.collect()
-                torch.cuda.empty_cache()
-                return merged_sub_state_dict
-
-    return ShardedTensorFactory(
-        original_sh_ten.key,
-        original_sh_ten.data,
-        sh_ten_build_fn,
-        sh_ten_merge_fn,
-        original_sh_ten.replica_id,
-        flattened_range=original_sh_ten.flattened_range,
-    )

@@ -488,7 +488,7 @@ def is_flashinfer_min_version(version, check_equality=True):
         return False
     if check_equality:
         return flashinfer_version >= PkgVersion(version)
-    return flashinver_version > PkgVersion(version)
+    return flashinfer_version > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -1045,8 +1045,9 @@ def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
 
 
 def get_data_parallel_group_if_dtensor(
-    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
-) -> Optional["ProcessGroup"]:
+    tensor: Union[torch.Tensor, "DTensor"],
+    data_parallel_group: "torch.distributed.ProcessGroup" = None,
+) -> Optional["torch.distributed.ProcessGroup"]:
     """Gets the data parallel group of the given tensor if it is a DTensor."""
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         current_group = tensor.device_mesh.get_group()
@@ -2633,3 +2634,8 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
+    """Round value up to the nearest positive multiple."""
+    return math.ceil(value / multiple) * multiple

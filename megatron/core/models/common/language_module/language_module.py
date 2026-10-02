@@ -21,7 +21,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -62,6 +63,17 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+
+    def _setup_mtp_cuda_graphs(self):
+        """Wrap ``compute_mtp_single_step`` with an inline CUDA graph manager."""
+        if self.config.cuda_graph_impl == "local":
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -144,8 +156,8 @@ class LanguageModule(MegatronModule):
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_scope')
-                        and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+                        hasattr(self.config, 'cuda_graph_impl')
+                        and self.config.cuda_graph_impl == "full_iteration"
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -154,7 +166,7 @@ class LanguageModule(MegatronModule):
                         raise AssertionError(
                             f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
                             f"but found version {current_version}. Please upgrade TransformerEngine "
-                            f"or set cuda_graph_scope to a value other than 'full_iteration'."
+                            f"or set cuda_graph_impl to a value other than 'full_iteration'."
                         )
 
                     loss = te_parallel_cross_entropy(

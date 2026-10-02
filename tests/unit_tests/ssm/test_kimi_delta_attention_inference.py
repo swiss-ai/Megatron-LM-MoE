@@ -519,11 +519,11 @@ class TestKimiDeltaAttentionInference:
         assert torch.all(slots >= 0)
         assert slots[0] != slots[1]
         torch.testing.assert_close(
-            context.kda_metadata.batch_indices_prefill[:2], slots, rtol=0, atol=0
+            context.kda_metadata.batch_indices_prefill[:2].cpu(), slots.cpu(), rtol=0, atol=0
         )
         assert context.kda_metadata.cu_seqlens_list == [0, 5, 8]
         torch.testing.assert_close(
-            context.token_to_input_ids[:8], torch.cat(prompts), rtol=0, atol=0
+            context.token_to_input_ids[:8], torch.cat(prompts).cpu(), rtol=0, atol=0
         )
         assert context.kda_metadata.batch_indices_prefill[2:].eq(-1).all()
         assert context.use_cuda_graphs_for_non_decode_steps
@@ -567,7 +567,7 @@ class TestKimiDeltaAttentionInference:
         )
         context.initialize_attention_state()
         torch.testing.assert_close(
-            context.kda_metadata.batch_indices_decode[:2], slots, rtol=0, atol=0
+            context.kda_metadata.batch_indices_decode[:2].cpu(), slots.cpu(), rtol=0, atol=0
         )
         assert context.kda_metadata.batch_indices_decode[2:].eq(-1).all()
 
@@ -606,7 +606,9 @@ class TestKimiDeltaAttentionInference:
         context.cuda_graph_batch_dimensions_list = [
             InferenceBatchDimensions(token_count=2, decode_req_count=2)
         ]
-        context.add_dummy_requests_for_expert_parallel_step()
+        context.add_dummy_requests_for_expert_parallel_step(
+            context.cuda_graph_batch_dimensions_list[0]
+        )
         dummy_slots = context.kda_metadata.request_to_mamba_state_idx[:2]
         assert context.mamba_metadata is None
         assert (dummy_slots >= 0).all()
