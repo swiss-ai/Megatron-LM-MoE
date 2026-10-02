@@ -410,3 +410,159 @@ class TestSandwichNormTransformerLayer:
         out_sandwiched, _ = sandwiched(hidden_states=hidden_states, attention_mask=attention_mask)
 
         assert not torch.allclose(out_baseline, out_sandwiched)
+
+
+def test_freeze_norm_gain_at_identity():
+    """Unit-test the helper behind --fixed-pre-norm-gain (CPU only, no model parallel / TE)."""
+    from megatron.core.transformer.utils import freeze_norm_gain_at_identity
+
+    norm = torch.nn.LayerNorm(8)
+    with torch.no_grad():
+        norm.weight.fill_(2.0)
+        norm.bias.fill_(0.5)
+    assert freeze_norm_gain_at_identity(norm, zero_centered_gamma=False)
+    assert torch.all(norm.weight == 1) and torch.all(norm.bias == 0)
+    assert not norm.weight.requires_grad and not norm.bias.requires_grad
+
+    # The norm is now the gain-free formula.
+    x = torch.randn(4, 8)
+    torch.testing.assert_close(norm(x), torch.nn.functional.layer_norm(x, (8,), eps=norm.eps))
+
+    # The gain is a constant: a value loaded from a checkpoint is overridden with the identity.
+    norm.load_state_dict({"weight": torch.full((8,), 3.0), "bias": torch.full((8,), 0.25)})
+    assert torch.all(norm.weight == 1) and torch.all(norm.bias == 0)
+
+    # Fused norm + linear (prefixed attributes) with a zero-centered gain: identity is 0, and the
+    # linear weight stays trainable.
+    class FusedNormLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_norm_weight = torch.nn.Parameter(torch.full((8,), 0.7))
+            self.weight = torch.nn.Parameter(torch.randn(8, 8))
+
+    fused = FusedNormLinear()
+    assert freeze_norm_gain_at_identity(fused, zero_centered_gamma=True, attr_prefix="layer_norm_")
+    assert torch.all(fused.layer_norm_weight == 0) and not fused.layer_norm_weight.requires_grad
+    assert fused.weight.requires_grad
+
+    # Nothing to pin on a module without a gain.
+    assert not freeze_norm_gain_at_identity(IdentityOp(), zero_centered_gamma=False)
+
+
+class TestFixedPreNormGainTransformerLayer:
+    """Integration tests for the --fixed-pre-norm-gain option (requires GPU + Transformer Engine).
+
+    Layers are built with RMSNorm, QK norms and sandwich norms so that every kind of norm is
+    present: the pre-norms must lose their gain, all other norms must keep theirs.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_layer(fixed_pre_norm_gain, num_experts=None):
+        moe_kwargs = {}
+        if num_experts:
+            moe_kwargs = dict(
+                num_moe_experts=num_experts,
+                moe_router_topk=2,
+                moe_router_violation_metrics=[],
+                add_bias_linear=False,
+            )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            normalization="RMSNorm",
+            qk_layernorm=True,
+            sandwich_norm=True,
+            fixed_pre_norm_gain=fixed_pre_norm_gain,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            use_cpu_initialization=True,
+            **moe_kwargs,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=num_experts, qk_layernorm=True, sandwich_norm=True
+        )
+        return TransformerLayer(config, submodules)
+
+    @staticmethod
+    def _pre_norm_gains(layer):
+        """The pre-norm gains of a layer: fused into linear_qkv, and fused into the dense
+        linear_fc1 or standalone before the MoE."""
+        linear_qkv = layer.self_attention.linear_qkv
+        gains = {"self_attention.linear_qkv.layer_norm_weight": linear_qkv.layer_norm_weight}
+        if isinstance(layer.pre_mlp_layernorm, IdentityOp):
+            gains["mlp.linear_fc1.layer_norm_weight"] = layer.mlp.linear_fc1.layer_norm_weight
+        else:
+            gains["pre_mlp_layernorm.weight"] = layer.pre_mlp_layernorm.weight
+        return gains
+
+    @staticmethod
+    def _other_norm_gains(layer):
+        return {
+            "self_attention.q_layernorm.weight": layer.self_attention.q_layernorm.weight,
+            "self_attention.k_layernorm.weight": layer.self_attention.k_layernorm.weight,
+            "post_self_attn_layernorm.weight": layer.post_self_attn_layernorm.weight,
+            "post_mlp_layernorm.weight": layer.post_mlp_layernorm.weight,
+        }
+
+    @pytest.mark.parametrize("num_experts", [None, 2])
+    def test_default_keeps_gains_trainable(self, num_experts):
+        layer = self._build_layer(fixed_pre_norm_gain=False, num_experts=num_experts)
+        for gain in {**self._pre_norm_gains(layer), **self._other_norm_gains(layer)}.values():
+            assert gain.requires_grad
+
+    @pytest.mark.parametrize("num_experts", [None, 2])
+    def test_pre_norm_gains_pinned(self, num_experts):
+        layer = self._build_layer(fixed_pre_norm_gain=True, num_experts=num_experts)
+        for name, gain in self._pre_norm_gains(layer).items():
+            assert not gain.requires_grad, name
+            assert torch.all(gain == 1), name
+        for name, gain in self._other_norm_gains(layer).items():
+            assert gain.requires_grad, name
+
+        # Same parameters, same names: the checkpoint layout is unchanged.
+        reference = self._build_layer(fixed_pre_norm_gain=False, num_experts=num_experts)
+        assert [n for n, _ in layer.named_parameters()] == [
+            n for n, _ in reference.named_parameters()
+        ]
+
+    @pytest.mark.parametrize("num_experts", [None, 2])
+    def test_matches_unit_gain_layer(self, num_experts):
+        # A layer with pinned pre-norm gains computes the same function as the standard layer
+        # with the same weights and unit pre-norm gains, and the pinned gains receive no gradient.
+        sequence_length, micro_batch_size, hidden = 32, 2, 12
+        hidden_states = torch.rand((sequence_length, micro_batch_size, hidden)).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        reference = self._build_layer(fixed_pre_norm_gain=False, num_experts=num_experts).cuda()
+        with torch.no_grad():
+            for gain in self._pre_norm_gains(reference).values():
+                gain.fill_(1.0)
+        out_reference, _ = reference(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        layer = self._build_layer(fixed_pre_norm_gain=True, num_experts=num_experts).cuda()
+        layer.load_state_dict(reference.state_dict())
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        torch.testing.assert_close(output, out_reference)
+
+        output.float().sum().backward()
+        for name, gain in self._pre_norm_gains(layer).items():
+            assert gain.grad is None, name
+        for name, gain in self._other_norm_gains(layer).items():
+            assert gain.grad is not None, name
+
+    def test_loaded_gain_is_overridden(self):
+        layer = self._build_layer(fixed_pre_norm_gain=True)
+        state_dict = layer.state_dict()
+        for name in self._pre_norm_gains(layer):
+            state_dict[name] = torch.full_like(state_dict[name], 2.0)
+        layer.load_state_dict(state_dict)
+        for name, gain in self._pre_norm_gains(layer).items():
+            assert torch.all(gain == 1), name
