@@ -11,6 +11,21 @@ column gains, so LayerNorm is not enabled for this option. Column gains supply l
 input scaling. Sandwich/post norms, QK norms, KDA/GDN output norms and the final
 model norm retain their affine parameters.
 
+## Optional KDA output norm
+
+Also enable `--non-affine-kda-output-norm` to remove the per-head RMSNorm gain
+before KDA's `out_proj`. This is independent of `--non-affine-pre-norm`, and
+requires KDA, RMSNorm, and MuonMD with column gains. The sigmoid output gate
+commutes with the gain, so `out_proj`'s column gains can absorb it (repeated
+across value heads). QK and sandwich norms remain affine.
+
+For the fused output path, FLA's `FusedRMSNormGated(elementwise_affine=False)`
+preserves norm/gate fusion and skips gain loads, multiplication and gain-gradient
+reductions. This API is supported by the container's pinned FLA v0.5.2. Scalar
+or disabled gate modes use the parameter-free norm with the existing gate logic.
+No additional recomputation or matrix replay is introduced. GPU throughput
+remains to be benchmarked; normalization and gate work remain.
+
 Supported sites are transformer input and pre-MLP norms for standard self-attention
 and KDA/GDN: either standalone, or fused into the following QKV/input/FC1 matrix.
 "QKV" here identifies the input prenorm fused into the QKV projection; it does

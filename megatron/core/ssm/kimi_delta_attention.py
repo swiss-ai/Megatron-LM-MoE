@@ -602,26 +602,22 @@ class KimiDeltaAttention(GatedDeltaNet):
         self._use_fused_output_norm_gate = (
             HAVE_FUSED_RMSNORM_GATED
             and self.config.normalization == "RMSNorm"
-            and not self.config.layernorm_zero_centered_gamma
+            and (
+                not self.config.layernorm_zero_centered_gamma
+                or self.config.non_affine_kda_output_norm
+            )
             and self.config.linear_attention_use_output_gate
             and self.config.linear_attention_output_gate_form == "per_channel"
         )
-        if self._use_fused_output_norm_gate:
-            self.out_norm = FusedRMSNormGated(
-                self.value_head_dim,
-                activation="sigmoid",
-                eps=self.config.layernorm_epsilon,
-                device=torch.cuda.current_device(),
-                dtype=self.config.params_dtype,
-            )
-            # This scale is replicated across TP ranks, just like Megatron's
-            # regular output RMSNorm scale. Preserve its sequence-parallel
-            # gradient-reduction marker after replacing the backend norm.
-            setattr(
-                self.out_norm.weight,
-                "sequence_parallel",
-                self.config.sequence_parallel,
-            )
+        from megatron.core.transformer.non_affine_norm import build_kda_output_norm
+
+        self.out_norm = build_kda_output_norm(
+            self.config,
+            self.value_head_dim,
+            self.out_norm,
+            fused_norm_cls=FusedRMSNormGated if self._use_fused_output_norm_gate else None,
+            device=torch.cuda.current_device() if self._use_fused_output_norm_gate else None,
+        )
 
         # Checkpoint the chunk_kda core (`--recompute-modules linear_attn`).
         # Disjoint from `qkv` above: that one recomputes the PRODUCER of q/k/v

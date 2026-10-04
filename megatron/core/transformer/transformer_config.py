@@ -371,6 +371,11 @@ class TransformerConfig(ModelParallelConfig):
     LayerNormLinear. This is opt-in and intended for column-gain MuonMD training.
     Checkpoints must use the same setting; learned affine gains are not migrated."""
 
+    non_affine_kda_output_norm: bool = False
+    """Remove KDA's per-head output RMSNorm gain, absorbed by out_proj column gains.
+    Preserves FLA's fused RMSNorm/sigmoid gate when available. Separate from
+    non_affine_pre_norm; QK norms and sandwich norms are unaffected."""
+
     scale_embeddings_by_sqrt_hidden: bool = False
     """If True, multiply the output of the embedding by ``sqrt(hidden_size)``. Combined with an
     embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the
@@ -1481,6 +1486,10 @@ class TransformerConfig(ModelParallelConfig):
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+        if self.non_affine_kda_output_norm:
+            if self.experimental_attention_variant != "kda" or self.normalization != "RMSNorm":
+                raise ValueError("non_affine_kda_output_norm requires KDA with RMSNorm")
 
         if self.non_affine_pre_norm:
             if self.normalization != "RMSNorm" or self.multi_latent_attention:

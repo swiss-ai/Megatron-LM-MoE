@@ -1573,12 +1573,12 @@ def validate_args(args, defaults={}):
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
-    if args.non_affine_pre_norm:
+    if args.non_affine_pre_norm or args.non_affine_kda_output_norm:
         assert args.optimizer == 'md_decoupling', (
-            '--non-affine-pre-norm requires MuonMD (--optimizer md_decoupling)'
+            'Non-affine norm options require MuonMD (--optimizer md_decoupling)'
         )
         assert args.hypersphere_gains_mode in ('col', 'rowcol'), (
-            '--non-affine-pre-norm requires column gains in the following matrices '
+            'Non-affine norm options require column gains in the following matrices '
             '(--hypersphere-gains-mode col or rowcol)'
         )
 
@@ -2380,6 +2380,7 @@ def _add_network_size_args(parser):
         "sandwich_norm",
         "post_attn_norm_zero_init",
         "non_affine_pre_norm",
+        "non_affine_kda_output_norm",
         "keel",
         "keel_alpha",
     ]
@@ -2559,6 +2560,10 @@ def _add_network_size_args(parser):
                        'QK and final norms affine. CUDA uses parameter-free Triton kernels; '
                        'TE norm-linear projections become norm + TE Linear. Intended for '
                        'MuonMD with column gains. Requires checkpoints with the same setting.')
+    group.add_argument('--non-affine-kda-output-norm', action='store_true',
+                       help='Remove the KDA output RMSNorm gain; the following out_proj '
+                       'column gains supply the scaling. Preserves FLA norm/gate fusion. '
+                       'Requires KDA, RMSNorm, and MuonMD with column gains.')
     group.add_argument('--keel', action='store_true',
                        help='Use the KEEL Highway-style Post-LN architecture '
                        '(arXiv:2601.19895): x = LN_post(alpha * x + Sublayer(LN_pre(x))). '

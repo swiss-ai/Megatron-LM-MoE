@@ -109,6 +109,25 @@ class NonAffineNorm(torch.nn.Module):
         return output.to(x.dtype)
 
 
+def build_kda_output_norm(config, hidden_size, existing_norm, fused_norm_cls=None, device=None):
+    """Remove the redundant output gain without splitting FLA's fused gate kernel."""
+    if fused_norm_cls is not None:
+        norm = fused_norm_cls(
+            hidden_size,
+            elementwise_affine=not config.non_affine_kda_output_norm,
+            activation="sigmoid",
+            eps=config.layernorm_epsilon,
+            device=device,
+            dtype=config.params_dtype,
+        )
+        if norm.weight is not None:
+            norm.weight.sequence_parallel = config.sequence_parallel
+        return norm
+    if config.non_affine_kda_output_norm:
+        return NonAffineNorm(config, hidden_size)
+    return existing_norm
+
+
 def build_pre_norm(builder, config, hidden_size, eps=None, **kwargs):
     """Replace only an explicitly identified pre-norm; leave IdentityOp intact."""
     from megatron.core.transformer.identity_op import IdentityOp

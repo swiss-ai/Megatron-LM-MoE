@@ -422,7 +422,8 @@ class TestNonAffinePreNormTransformerLayer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_kda_latent_moe_prenorm_sites(self):
+    @pytest.mark.parametrize("non_affine_output", [False, True])
+    def test_kda_latent_moe_prenorm_sites(self, non_affine_output):
         from megatron.core.extensions.transformer_engine import TENonAffineNormColumnParallelLinear
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_transformer_block_with_experimental_attention_variant_spec,
@@ -442,6 +443,7 @@ class TestNonAffinePreNormTransformerLayer:
             moe_router_violation_metrics=[], moe_latent_size=64,
             moe_shared_expert_intermediate_size=64, normalization="RMSNorm",
             sandwich_norm=True, non_affine_pre_norm=True, qk_layernorm=True,
+            non_affine_kda_output_norm=non_affine_output,
             add_bias_linear=False, use_cpu_initialization=True,
             pipeline_dtype=torch.bfloat16, transformer_impl="transformer_engine",
         )
@@ -453,7 +455,11 @@ class TestNonAffinePreNormTransformerLayer:
         assert isinstance(kda.mlp.linear_fc1, TENonAffineNormColumnParallelLinear)
         assert isinstance(moe.pre_mlp_layernorm, NonAffineNorm)
         assert not hasattr(kda.self_attention.in_proj, "layer_norm_weight")
-        assert kda.self_attention.out_norm.weight.requires_grad
+        if non_affine_output:
+            assert list(kda.self_attention.out_norm.parameters()) == []
+            assert "self_attention.out_norm.weight" not in kda.state_dict()
+        else:
+            assert kda.self_attention.out_norm.weight.requires_grad
         assert moe.self_attention.q_layernorm.weight.requires_grad
         assert moe.self_attention.k_layernorm.weight.requires_grad
         assert kda.post_self_attn_layernorm.weight.requires_grad
