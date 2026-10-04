@@ -34,6 +34,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.non_affine_norm import build_pre_norm_linear
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
@@ -1479,7 +1480,8 @@ class SelfAttention(Attention):
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
-        self.linear_qkv = submodules.linear_qkv(
+        self.linear_qkv = build_pre_norm_linear(
+            submodules.linear_qkv,
             self.config.hidden_size,
             self.linear_qkv_out_dim,
             config=self.config,

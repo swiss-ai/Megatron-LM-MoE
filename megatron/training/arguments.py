@@ -1573,6 +1573,15 @@ def validate_args(args, defaults={}):
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
+    if args.non_affine_pre_norm:
+        assert args.optimizer == 'md_decoupling', (
+            '--non-affine-pre-norm requires MuonMD (--optimizer md_decoupling)'
+        )
+        assert args.hypersphere_gains_mode in ('col', 'rowcol'), (
+            '--non-affine-pre-norm requires column gains in the following matrices '
+            '(--hypersphere-gains-mode col or rowcol)'
+        )
+
     if args.optimizer == 'md_decoupling':
         if args.hypersphere_mode == "none":
             args.hypersphere_mode = None
@@ -2370,6 +2379,7 @@ def _add_network_size_args(parser):
         "polynorm",
         "sandwich_norm",
         "post_attn_norm_zero_init",
+        "non_affine_pre_norm",
         "keel",
         "keel_alpha",
     ]
@@ -2544,6 +2554,11 @@ def _add_network_size_args(parser):
                        'contributes nothing at init (x = x + 0*Norm(Attn(Norm(x)))); the model '
                        'starts as a stack of MLP/MoE blocks, which can help MoE routing. Requires '
                        '--sandwich-norm; only the post-attention norm is zeroed.')
+    group.add_argument('--non-affine-pre-norm', action='store_true',
+                       help='Remove pre-norm gain and bias parameters entirely. Keeps sandwich, '
+                       'QK and final norms affine. CUDA uses parameter-free Triton kernels; '
+                       'TE norm-linear projections become norm + TE Linear. Intended for '
+                       'MuonMD with column gains. Requires checkpoints with the same setting.')
     group.add_argument('--keel', action='store_true',
                        help='Use the KEEL Highway-style Post-LN architecture '
                        '(arXiv:2601.19895): x = LN_post(alpha * x + Sublayer(LN_pre(x))). '

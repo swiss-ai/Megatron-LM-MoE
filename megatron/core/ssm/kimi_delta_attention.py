@@ -402,7 +402,9 @@ class KimiDeltaAttention(GatedDeltaNet):
 
         # Rebuild in_proj with the new output dim. Uses the same submodule spec
         # as GDN; the parent's instance is replaced.
-        self.in_proj = build_module(
+        from megatron.core.transformer.non_affine_norm import build_pre_norm_linear
+
+        self.in_proj = build_pre_norm_linear(
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,

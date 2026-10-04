@@ -23,6 +23,7 @@ from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.non_affine_norm import build_pre_norm
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -311,7 +312,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
-        self.input_layernorm = submodules.input_layernorm(
+        self.input_layernorm = build_pre_norm(
+            submodules.input_layernorm,
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -369,7 +371,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
         # [Module 7: Pre MLP] Optional Layernorm before MLP
-        self.pre_mlp_layernorm = submodules.pre_mlp_layernorm(
+        self.pre_mlp_layernorm = build_pre_norm(
+            submodules.pre_mlp_layernorm,
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,

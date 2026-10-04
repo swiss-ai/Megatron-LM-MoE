@@ -363,6 +363,14 @@ class TransformerConfig(ModelParallelConfig):
     `layernorm_zero_centered_gamma` is set (effective gain = `1 + weight`), the gain is zeroed via
     `weight = -1` so the effective gain is still 0."""
 
+    non_affine_pre_norm: bool = False
+    """Remove affine parameters from transformer input and pre-MLP norms for
+    standard self-attention and KDA/GDN. Includes the equivalent fused projection norms.
+    Post/sandwich, QK, internal attention, and final norms keep their gains. TE
+    projections use an affine-free Triton norm followed by TE Linear, rather than
+    LayerNormLinear. This is opt-in and intended for column-gain MuonMD training.
+    Checkpoints must use the same setting; learned affine gains are not migrated."""
+
     scale_embeddings_by_sqrt_hidden: bool = False
     """If True, multiply the output of the embedding by ``sqrt(hidden_size)``. Combined with an
     embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the
@@ -1473,6 +1481,18 @@ class TransformerConfig(ModelParallelConfig):
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+        if self.non_affine_pre_norm:
+            if self.normalization != "RMSNorm" or self.multi_latent_attention:
+                raise ValueError(
+                    "non_affine_pre_norm currently requires RMSNorm and standard/KDA/GDN "
+                    "attention; LayerNorm bias cannot be absorbed by column gains"
+                )
+            if self.inference_fuse_tp_communication:
+                raise ValueError(
+                    "non_affine_pre_norm is incompatible with "
+                    "inference_fuse_tp_communication, which requires affine norm parameters"
+                )
 
         if self.sandwich_norm and self.inference_fuse_tp_communication:
             raise ValueError(

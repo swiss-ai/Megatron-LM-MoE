@@ -1244,6 +1244,24 @@ class TEColumnParallelLinear(TELinear):
             super().backward_dw()
 
 
+class TENonAffineNormColumnParallelLinear(TEColumnParallelLinear):
+    """Parameter-free pre-norm followed by TE's column-parallel linear.
+
+    TE LayerNormLinear requires affine tensors. This path deliberately uses a
+    separate affine-free normalization kernel; it preserves the linear's parameter
+    names, TP/sequence-parallel communication, and delayed weight gradients.
+    """
+
+    def __init__(self, input_size, output_size, *, config, **kwargs):
+        from megatron.core.transformer.non_affine_norm import NonAffineNorm
+
+        super().__init__(input_size, output_size, config=config, **kwargs)
+        self.pre_norm = NonAffineNorm(config, input_size)
+
+    def forward(self, x):
+        return super().forward(self.pre_norm(x))
+
+
 class TERowParallelLinear(TELinear):
     """Wrapper for the Transformer-Engine's `Linear` layer
     but specialized similar to megatron's `RowParallelLinear` layer."""
@@ -2146,6 +2164,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
         @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
+            config = kwargs.get("config", args[0] if args else None)
+            if config is not None and config.non_affine_pre_norm:
+                raise ValueError("non_affine_pre_norm is incompatible with TE operation fuser")
             super().__init__(*args, **kwargs)
 
             # Fused implementation

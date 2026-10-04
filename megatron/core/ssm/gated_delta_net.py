@@ -34,6 +34,7 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.non_affine_norm import build_pre_norm_linear
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     cat_with_oom_fallback,
@@ -230,7 +231,7 @@ class GatedDeltaNet(MegatronModule):
                 "For FP8, the innermost dimension of the GDN layer input projection "
                 f"output tensor must be a multiple of {fp8_align_size}."
             )
-        self.in_proj = build_module(
+        self.in_proj = build_pre_norm_linear(
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,

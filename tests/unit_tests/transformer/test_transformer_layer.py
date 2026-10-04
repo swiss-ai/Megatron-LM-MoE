@@ -410,3 +410,100 @@ class TestSandwichNormTransformerLayer:
         out_sandwiched, _ = sandwiched(hidden_states=hidden_states, attention_mask=attention_mask)
 
         assert not torch.allclose(out_baseline, out_sandwiched)
+
+
+class TestNonAffinePreNormTransformerLayer:
+    """Check actual TE projection replacement and untouched non-pre-norm gains."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_kda_latent_moe_prenorm_sites(self):
+        from megatron.core.extensions.transformer_engine import TENonAffineNormColumnParallelLinear
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
+        from megatron.core.ssm.kimi_delta_attention import HAVE_KDA
+        from megatron.core.transformer.non_affine_norm import NonAffineNorm
+        from megatron.core.transformer.spec_utils import build_module
+
+        if not HAVE_KDA:
+            pytest.skip("FLA KDA kernels required")
+        config = TransformerConfig(
+            num_layers=2, hidden_size=256, num_attention_heads=8,
+            experimental_attention_variant="kda", linear_attention_freq=[1, 0],
+            linear_conv_kernel_dim=4, linear_key_head_dim=64, linear_value_head_dim=64,
+            linear_num_key_heads=4, linear_num_value_heads=4,
+            num_moe_experts=2, moe_layer_freq=[0, 1], moe_router_topk=2,
+            moe_router_violation_metrics=[], moe_latent_size=64,
+            moe_shared_expert_intermediate_size=64, normalization="RMSNorm",
+            sandwich_norm=True, non_affine_pre_norm=True, qk_layernorm=True,
+            add_bias_linear=False, use_cpu_initialization=True,
+            pipeline_dtype=torch.bfloat16, transformer_impl="transformer_engine",
+        )
+        spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+        layers = [build_module(s, config=config, layer_number=i + 1)
+                  for i, s in enumerate(spec.layer_specs)]
+        kda, moe = layers
+        assert isinstance(kda.self_attention.in_proj, TENonAffineNormColumnParallelLinear)
+        assert isinstance(kda.mlp.linear_fc1, TENonAffineNormColumnParallelLinear)
+        assert isinstance(moe.pre_mlp_layernorm, NonAffineNorm)
+        assert not hasattr(kda.self_attention.in_proj, "layer_norm_weight")
+        assert kda.self_attention.out_norm.weight.requires_grad
+        assert moe.self_attention.q_layernorm.weight.requires_grad
+        assert moe.self_attention.k_layernorm.weight.requires_grad
+        assert kda.post_self_attn_layernorm.weight.requires_grad
+        assert moe.post_mlp_layernorm.weight.requires_grad
+
+    @pytest.mark.parametrize("num_experts", [None, 2])
+    @pytest.mark.parametrize("zero_centered", [False, True])
+    def test_parameters_and_forward_backward(self, num_experts, zero_centered):
+        from megatron.core.extensions.transformer_engine import TENonAffineNormColumnParallelLinear
+        from megatron.core.transformer.non_affine_norm import NonAffineNorm
+
+        def build(enabled):
+            config = TransformerConfig(
+                num_layers=2, hidden_size=64, num_attention_heads=4,
+                normalization="RMSNorm", qk_layernorm=True, sandwich_norm=True,
+                non_affine_pre_norm=enabled, layernorm_zero_centered_gamma=zero_centered,
+                num_moe_experts=num_experts, moe_router_topk=2,
+                moe_router_violation_metrics=[], add_bias_linear=False,
+                hidden_dropout=0.0, attention_dropout=0.0, use_cpu_initialization=True,
+            )
+            spec = get_gpt_layer_with_transformer_engine_submodules(
+                num_experts=num_experts, qk_layernorm=True, sandwich_norm=True
+            )
+            return TransformerLayer(config, spec).cuda()
+
+        reference, layer = build(False), build(True)
+        assert isinstance(layer.self_attention.linear_qkv, TENonAffineNormColumnParallelLinear)
+        assert not hasattr(layer.self_attention.linear_qkv, "layer_norm_weight")
+        if num_experts:
+            assert isinstance(layer.pre_mlp_layernorm, NonAffineNorm)
+            assert list(layer.pre_mlp_layernorm.parameters()) == []
+        else:
+            assert isinstance(layer.mlp.linear_fc1, TENonAffineNormColumnParallelLinear)
+            assert not hasattr(layer.mlp.linear_fc1, "layer_norm_weight")
+        # Copy matrix/non-pre-norm parameters; only old affine pre-norm keys are discarded.
+        result = layer.load_state_dict(reference.state_dict(), strict=False)
+        assert result.missing_keys == []
+        assert all("layer_norm_weight" in key or key == "pre_mlp_layernorm.weight"
+                   for key in result.unexpected_keys)
+        x = torch.randn(16, 2, 64, device="cuda", requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_()
+        mask = torch.zeros(1, 1, 16, 16, device="cuda", dtype=torch.bool)
+        actual, _ = layer(hidden_states=x, attention_mask=mask)
+        expected, _ = reference(hidden_states=ref_x, attention_mask=mask)
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+        dy = torch.randn_like(actual)
+        actual.backward(dy)
+        expected.backward(dy)
+        torch.testing.assert_close(x.grad, ref_x.grad, atol=5e-4, rtol=5e-4)
+        for norm in (layer.self_attention.q_layernorm, layer.self_attention.k_layernorm,
+                     layer.post_self_attn_layernorm, layer.post_mlp_layernorm):
+            assert norm.weight.requires_grad
+            assert norm.weight.grad is not None

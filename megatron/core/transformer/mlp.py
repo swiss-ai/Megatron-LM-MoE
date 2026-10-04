@@ -53,6 +53,7 @@ from megatron.core.fusions.fused_bias_sssglu import (
 )
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.non_affine_norm import build_pre_norm_linear
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -236,7 +237,8 @@ class MLP(MegatronModule):
         # shared_experts.
         use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
-        self.linear_fc1 = submodules.linear_fc1(
+        self.linear_fc1 = build_pre_norm_linear(
+            submodules.linear_fc1,
             self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
             ffn_hidden_size,
             config=self.config,
