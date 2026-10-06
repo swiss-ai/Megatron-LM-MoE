@@ -911,6 +911,16 @@ def pop_routing_oob_accum(device: torch.device) -> Optional[torch.Tensor]:
     return val
 
 
+def scaled_softsign(x: torch.Tensor) -> torch.Tensor:
+    """Softsign rescaled from (-1, 1) to (0, 1): 0.5 + 0.5 * x / (1 + |x|).
+
+    A router score function like sigmoid (monotone, value 0.5 at 0, range (0, 1)), but its
+    gradient 0.5 / (1 + |x|)^2 decays polynomially rather than exponentially, so large router
+    logits keep a nonzero gradient instead of saturating.
+    """
+    return 0.5 + 0.5 * x / (1 + x.abs())
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -936,8 +946,8 @@ def topk_routing_with_score_function(
         group_topk (int, optional): Number of selected groups for each token. Defaults to None.
         scaling_factor (float, optional): Scaling factor of routing score in top-k selection.
                                          Defaults to None.
-        score_function (str, optional): The score function to use. Can be either "softmax" or
-                                        "sigmoid". Defaults to "softmax".
+        score_function (str, optional): The score function to use. Can be "softmax", "sigmoid"
+                                        or "scaled-softsign". Defaults to "softmax".
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
@@ -1064,8 +1074,9 @@ def topk_routing_with_score_function(
             else:
                 scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
-    elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float()).type_as(logits)
+    elif score_function in ("sigmoid", "scaled-softsign"):
+        score_fn = torch.sigmoid if score_function == "sigmoid" else scaled_softsign
+        scores = score_fn(logits.float()).type_as(logits)
         if precomputed_indices is not None:
             top_indices = precomputed_indices
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
@@ -1116,7 +1127,8 @@ def compute_routing_scores_for_aux_loss(
     Args:
         logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
         topk (int): The number of top-k indices to compute.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): The score function to use. Can be "softmax", "sigmoid" or
+            "scaled-softsign".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
@@ -1139,6 +1151,9 @@ def compute_routing_scores_for_aux_loss(
         elif score_function == "sigmoid":
             # Cast logits to float32 before sigmoid for stability
             scores = torch.sigmoid(logits.to(torch.float32))
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        elif score_function == "scaled-softsign":
+            scores = scaled_softsign(logits.to(torch.float32))
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")

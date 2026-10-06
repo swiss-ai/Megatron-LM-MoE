@@ -1002,8 +1002,11 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'scaled-softsign'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid" or "scaled-softsign".
+    "scaled-softsign" is 0.5 + 0.5 * x / (1 + |x|): a sigmoid-like score in (0, 1) whose
+    gradient decays polynomially instead of saturating. It follows the sigmoid path (top-k
+    weights normalized over the selected experts) and is not supported by moe_router_fusion."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -2632,10 +2635,20 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "scaled-softsign",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports the sigmoid or "
+                "scaled-softsign score function. Please set --moe-router-score-function "
+                "sigmoid or scaled-softsign."
+            )
+
+        if self.moe_router_score_function == "scaled-softsign" and self.moe_router_fusion:
+            raise ValueError(
+                "--moe-router-score-function scaled-softsign is not supported by the fused "
+                "Transformer Engine router kernels. Disable --moe-router-fusion."
             )
 
         if self.num_moe_experts and self.fp8:

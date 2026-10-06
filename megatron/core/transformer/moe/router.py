@@ -24,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
     qb_dual_update,
     router_gating_linear,
     save_to_aux_losses_tracker,
+    scaled_softsign,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
@@ -393,6 +394,8 @@ class TopKRouter(Router):
             logits_fp32 = logits.detach().to(dtype=torch.float32)
             if self.score_function == "sigmoid":
                 scores = torch.sigmoid(logits_fp32)
+            elif self.score_function == "scaled-softsign":
+                scores = scaled_softsign(logits_fp32)
             elif self.score_function == "softmax":
                 scores = torch.softmax(logits_fp32, dim=-1)
             else:
@@ -412,12 +415,11 @@ class TopKRouter(Router):
                 self.config.moe_router_quantile_balancing_method == 'histogram'
             )
             use_marin = self.config.moe_router_quantile_balancing_method == 'marin_histogram'
-            if should_update_beta and (use_histogram or use_marin):
             compute_drop_priority = (
                 self.config.moe_expert_capacity_factor is not None
                 and self.config.moe_token_drop_policy == "probs"
             )
-            if (should_update_beta and use_histogram) or compute_drop_priority:
+            if (should_update_beta and (use_histogram or use_marin)) or compute_drop_priority:
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
@@ -1142,7 +1144,8 @@ class TopKRouter(Router):
         if log_router_input:
             # Selected-expert statistics: the raw logits that actually feed the gates.
             router_input_logging.record_selected(
-                layer_index, logits, probs, routing_map, padding_mask
+                layer_index, logits, probs, routing_map, padding_mask,
+                score_function=self.score_function,
             )
 
         return probs, routing_map
@@ -1187,9 +1190,9 @@ class InferenceTopKRouter(TopKRouter):
             f"InferenceTopKRouter requires moe_router_num_groups=None, "
             f"got {config.moe_router_num_groups}"
         )
-        assert config.moe_router_score_function in ["sigmoid", "softmax"], (
+        assert config.moe_router_score_function in ["sigmoid", "scaled-softsign", "softmax"], (
             f"InferenceTopKRouter requires moe_router_score_function in "
-            f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+            f"['sigmoid', 'scaled-softsign', 'softmax'], got '{config.moe_router_score_function}'"
         )
 
         super().__init__(config=config, pg_collection=pg_collection)
@@ -1248,6 +1251,8 @@ class InferenceTopKRouter(TopKRouter):
                 qb_scores = logits_fp32
             elif self.score_function == "sigmoid":
                 qb_scores = torch.sigmoid(logits_fp32)
+            elif self.score_function == "scaled-softsign":
+                qb_scores = scaled_softsign(logits_fp32)
             elif self.score_function == "softmax":
                 qb_scores = torch.softmax(logits_fp32, dim=-1)
             else:

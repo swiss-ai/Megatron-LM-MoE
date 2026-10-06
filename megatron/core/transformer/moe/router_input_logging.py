@@ -29,6 +29,8 @@ whose level logit-space QB leaves free.
 - ``sel_logit_mean`` / ``sel_logit_max``: raw logits of the dispatched experts.
 - ``sel_gate_sat_frac``: share of dispatched entries with sigmoid(z) > 0.99 (z > ln 99), plus
   ``sel_gate_frac_gt_{50,75,90}`` for sigmoid(z) > 0.5 / 0.75 / 0.9 (z > 0 / ln 3 / ln 9).
+  With the scaled-softsign score function the same gate values are thresholded instead
+  (z > 49 for 0.99; z > 0 / 1 / 4 for 0.5 / 0.75 / 0.9), so the fractions stay comparable.
 - ``combine_cv_mean``: mean over tokens of std/mean of the token's combine weights; 0 when all
   selected experts get the same weight (what saturated gates produce).
 
@@ -55,6 +57,10 @@ _N_FIELDS = _ARGMAX_CHANNEL + 1
 _SAT_LOGIT = 4.59511985013459  # ln(99): sigmoid(z) > 0.99
 # Extra gate thresholds: sigmoid(z) > p  <=>  z > ln(p / (1 - p)).
 _GATE_THRESHOLDS = ((0.5, 0.0), (0.75, 1.0986122886681098), (0.9, 2.1972245773362196))
+# The same gate values under scaled softsign 0.5 + 0.5 * z / (1 + |z|): for p >= 0.5,
+# gate(z) > p  <=>  z > u / (1 - u) with u = 2p - 1.
+_SOFTSIGN_SAT_LOGIT = 49.0  # gate(z) > 0.99
+_SOFTSIGN_GATE_THRESHOLDS = ((0.5, 0.0), (0.75, 1.0), (0.9, 4.0))
 _S_CNT_GATE = 7  # .. 7 + len(_GATE_THRESHOLDS)
 _S_N_SUM = _S_CNT_GATE + len(_GATE_THRESHOLDS)
 _S_MAX_LSE, _S_MAX_LOGIT = _S_N_SUM, _S_N_SUM + 1
@@ -130,10 +136,15 @@ def record_selected(
     probs: torch.Tensor,
     routing_map: torch.Tensor,
     padding_mask: Optional[torch.Tensor],
+    score_function: str = "sigmoid",
 ) -> None:
     """Accumulate selected-expert statistics for one router forward (after routing)."""
     if not _active or (_layers is not None and layer not in _layers):
         return
+    if score_function == "scaled-softsign":
+        sat_logit, gate_thresholds = _SOFTSIGN_SAT_LOGIT, _SOFTSIGN_GATE_THRESHOLDS
+    else:
+        sat_logit, gate_thresholds = _SAT_LOGIT, _GATE_THRESHOLDS
     num_experts = logits.shape[-1]
     logits = logits.detach().reshape(-1, num_experts).float()
     probs = probs.detach().reshape(-1, num_experts).float()
@@ -171,9 +182,9 @@ def record_selected(
             has_self.sum(),
             (logits * selectedf).sum(),
             selectedf.sum(),
-            ((logits > _SAT_LOGIT) & selected).sum().float(),
+            ((logits > sat_logit) & selected).sum().float(),
             (cv * has_self).sum(),
-            *[((logits > cut) & selected).sum().float() for _, cut in _GATE_THRESHOLDS],
+            *[((logits > cut) & selected).sum().float() for _, cut in gate_thresholds],
         ]
     ).to(torch.float64)
     acc[:_S_N_SUM] += sums
