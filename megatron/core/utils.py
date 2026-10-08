@@ -2044,7 +2044,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     seq_length = None
     # padding_mask is included because on a genuine middle PP stage every other entry
     # is None, and the cu_seqlens fallback below costs a device sync per microbatch.
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask', 'assistant_mask'):
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
@@ -2059,7 +2059,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     if batch.get('max_seqlen') is not None:
         batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask', 'assistant_mask'):
         if batch.get(key) is not None:
             batch[key] = batch[key].reshape(1, -1)
 
@@ -2142,11 +2142,25 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
+        sequence_length = next(
+            data.size(1)
+            for key, data in batch.items()
+            if key in {'tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'}
+            and data is not None
+        )
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+            cu_seqlens if cu_seqlens_padded is None else cu_seqlens_padded,
+            sequence_length,
+            cp_size,
+            cp_rank,
         )
         for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+            if data is None or key in {
+                'attention_mask',
+                'cu_seqlens',
+                'cu_seqlens_padded',
+                'max_seqlen',
+            }:
                 continue
             batch[key] = data.index_select(1, index)
 

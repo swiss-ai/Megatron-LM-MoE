@@ -46,6 +46,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.apertus_sft_dataset import ApertusSFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
@@ -71,8 +72,11 @@ stimer = StragglerDetector()
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch.
 
-    Packed sequence support (``--sft`` or ``--dataloader-inter-document-masking``):
-        When either is set, the dataset emits THD-format batches where multiple
+    Returns tokens, labels, loss weights, attention mask, position IDs, physical
+    padding mask, packed sequence parameters, and optional assistant-target mask.
+
+    Packed sequence support (``--sft``, ``--ap-sft``, or ``--dataloader-inter-document-masking``):
+        When any is set, the dataset emits THD-format batches where multiple
         sequences (SFT) or documents (inter-document masking) are concatenated into
         a single flat token tensor. The batch includes ``cu_seqlens`` (cumulative
         sequence lengths, shape ``[1, S+1]``) and ``max_seqlen`` (shape ``[1]``) that
@@ -100,14 +104,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    has_cu_seqlens = args.sft or args.dataloader_inter_document_masking
+    ap_sft = getattr(args, 'ap_sft', False)
+    has_cu_seqlens = args.sft or ap_sft or args.dataloader_inter_document_masking
     is_mtp = mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
     is_first_last = is_first_or_last_pipeline_stage(vp_stage)
 
     is_packed_sequence = has_cu_seqlens
-    has_bfd_padding = args.pretraining_packing_strategy == "bfd"
+    has_bfd_padding = args.pretraining_packing_strategy == "bfd" and not ap_sft
     if not is_first_last and not is_packed_sequence and not is_mtp and not has_bfd_padding:
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -128,18 +133,22 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
         ), "cu_seqlens must be (1, N) after flatten_batch_for_packed_sequences"
         cu_seqlens = cu_seqlens[0]
+        if cu_seqlens_padded is not None:
+            cu_seqlens_padded = cu_seqlens_padded[0]
         assert max_seqlen.dim() == 1
 
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen plus any MoE padding mask are needed; skip the full batch.
-    if not is_first_last and is_packed_sequence:
+    if not is_first_last and is_packed_sequence and not ap_sft:
         return None, None, None, None, None, batch.get('padding_mask'), PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=int(max_seqlen[0].item()),
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
-        )
+        ), None
 
     if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism
@@ -149,6 +158,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if (
             args.dataloader_inter_document_masking
             and not args.sft
+            and not ap_sft
             and parallel_state.get_context_parallel_world_size() > 1
         ):
             # cu_seqlens here come from EOD boundaries within each document, which
@@ -164,8 +174,14 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
-    padding_mask = batch.pop('padding_mask', None)
-    return (*batch.values(), padding_mask, packed_seq_params)
+    padding_mask = batch.get('padding_mask')
+    if not is_first_last and is_packed_sequence:
+        return None, None, None, None, None, padding_mask, packed_seq_params, None
+    return (
+        batch['tokens'], batch['labels'], batch['loss_mask'],
+        batch['attention_mask'], batch['position_ids'], padding_mask, packed_seq_params,
+        batch.get('assistant_mask'),
+    )
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -173,7 +189,8 @@ SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None,
+    assistant_mask: Optional[torch.Tensor] = None,
 ):
     """Loss function.
 
@@ -181,6 +198,7 @@ def loss_func(
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
+        assistant_mask: Output-target membership, independent of training weights.
 
     Returns:
         the loss scalar for this micro-batch
@@ -197,8 +215,17 @@ def loss_func(
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
 
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        if getattr(args, "ap_sft", False):
+            num_tokens = (loss_mask > 0).sum().detach().to(torch.int)
+        else:
+            num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+        if getattr(args, 'ap_sft', False) and assistant_mask is not None:
+            with torch.no_grad():
+                assistant_mask = assistant_mask.view(-1).bool()
+                assistant_sum = torch.where(assistant_mask, losses.detach(), 0).sum()
+                assistant_count = assistant_mask.sum()
+                report['assistant_loss'] = torch.stack([assistant_sum, assistant_count])
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -250,7 +277,10 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, padding_mask, packed_seq_params = get_batch(data_iterator, vp_stage)
+        (
+            tokens, labels, loss_mask, attention_mask, position_ids, padding_mask,
+            packed_seq_params, assistant_mask,
+        ) = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -265,7 +295,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     padding_mask=padding_mask,
                     packed_seq_params=packed_seq_params,
                 )
-                return schedule_plan, partial(loss_func, loss_mask, model=model)
+                return schedule_plan, partial(
+                    loss_func, loss_mask, model=model, assistant_mask=assistant_mask
+                )
             else:
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
@@ -273,7 +305,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(
+        loss_func, loss_mask, model=model, assistant_mask=assistant_mask
+    )
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
@@ -335,6 +369,12 @@ def core_gpt_dataset_config_from_args(args):
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "pretraining_packing_strategy": args.pretraining_packing_strategy,
         "max_docs_per_bin": args.max_docs_per_bin,
+        "sft_pack_samples": args.ap_sft_pack_samples,
+        "sft_packing_strategy": args.ap_sft_packing_strategy,
+        "max_docs_per_bin_sft": args.max_docs_per_bin_sft,
+        "sft_load_loss_mask": args.ap_sft_load_loss_mask,
+        "sft_report_assistant_loss": args.ap_sft_report_assistant_loss,
+        "sft_truncate_right": args.ap_sft_truncate_right,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "goldfish_loss": args.goldfish_loss,
         "goldfish_k": args.goldfish_k,
@@ -343,7 +383,7 @@ def core_gpt_dataset_config_from_args(args):
         # dataset derives the Goldfish exemption set from them.
         "tokenizer_extra_metadata": getattr(args, "tokenizer_extra_metadata", None),
     }
-    assert not (args.goldfish_loss and args.sft), (
+    assert not (args.goldfish_loss and (args.sft or args.ap_sft)), (
         "--goldfish-loss is not supported with --sft: SFTDataset builds its own loss "
         "mask and would silently skip goldfish dropping."
     )
@@ -382,9 +422,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
-
     is_packed_sequence = False
-    if args.sft:
+    if args.ap_sft:
+        dataset_type = ApertusSFTDataset
+        is_packed_sequence = True
+    elif args.sft:
         dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
     else:

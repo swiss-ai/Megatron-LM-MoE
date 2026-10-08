@@ -627,8 +627,8 @@ def get_blend_and_blend_per_split(args):
 def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
-    has_cu_seqlens = args.sft or getattr(args, 'dataloader_inter_document_masking', False)
-    has_bfd_padding = getattr(args, 'pretraining_packing_strategy', None) == 'bfd'
+    has_cu_seqlens = args.sft or getattr(args, 'ap_sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+    has_bfd_padding = getattr(args, 'pretraining_packing_strategy', None) == 'bfd' and not getattr(args, 'ap_sft', False)
     broadcast_bfd_padding = has_bfd_padding and mpu.get_tensor_model_parallel_world_size() > 1
 
     def _broadcast(item):
@@ -673,6 +673,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             ),
         }
 
+        if getattr(args, 'ap_sft', False):
+            batch['cu_seqlens_padded'] = data['cu_seqlens_padded'].cuda(non_blocking=True)
+            batch['padding_mask'] = data['padding_mask'].cuda(non_blocking=True)
+            if getattr(args, 'ap_sft_report_assistant_loss', False):
+                batch['assistant_mask'] = data['assistant_mask'].cuda(non_blocking=True)
+
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.shape[-1])
@@ -709,6 +715,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if has_cu_seqlens or args.hybrid_context_parallel:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast_max_seqlen(batch['max_seqlen'])
+                if getattr(args, 'ap_sft', False):
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                    _broadcast(batch['padding_mask'])
+                    _broadcast(batch.get('assistant_mask'))
             _broadcast(batch['local_cp_size'])
 
         elif mpu.is_pipeline_first_stage():
@@ -718,6 +728,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast_max_seqlen(batch['max_seqlen'])
+                if getattr(args, 'ap_sft', False):
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                    _broadcast(batch['padding_mask'])
+                    _broadcast(batch.get('assistant_mask'))
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -731,6 +745,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast_max_seqlen(batch['max_seqlen'])
+                if getattr(args, 'ap_sft', False):
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                    _broadcast(batch['padding_mask'])
+                    _broadcast(batch.get('assistant_mask'))
 
         elif has_cu_seqlens:
             # A genuine middle stage (neither first nor last): no tokens/labels/loss_mask
@@ -738,6 +756,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             # max_seqlen are still needed for packed-sequence masking.
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast_max_seqlen(batch['max_seqlen'])
+            if getattr(args, 'ap_sft', False):
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                _broadcast(batch['padding_mask'])
+                _broadcast(batch.get('assistant_mask'))
 
         elif has_bfd_padding:
             # A genuine middle PP stage needs only the compact BFD metadata.
@@ -797,6 +819,13 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         )
         cu_seqlens = None
         max_seqlen = None
+        cu_seqlens_padded = None
+        padding_mask = None
+        assistant_mask = (
+            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            if getattr(args, 'ap_sft', False)
+            and getattr(args, 'ap_sft_report_assistant_loss', False) else None
+        )
 
         local_cp_size = torch.empty(
             1,
@@ -841,6 +870,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if has_cu_seqlens or args.hybrid_context_parallel:
                 cu_seqlens = _broadcast_cu_seqlens()
                 max_seqlen = _broadcast_max_seqlen()
+                if getattr(args, 'ap_sft', False):
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                    padding_mask = torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+                    _broadcast(padding_mask)
+                    _broadcast(assistant_mask)
             _broadcast(local_cp_size)
 
         elif mpu.is_pipeline_first_stage():
@@ -853,6 +887,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 max_seqlen = _broadcast_max_seqlen()
+                if getattr(args, 'ap_sft', False):
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                    padding_mask = torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+                    _broadcast(padding_mask)
+                    _broadcast(assistant_mask)
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -869,6 +908,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 max_seqlen = _broadcast_max_seqlen()
+                if getattr(args, 'ap_sft', False):
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                    padding_mask = torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+                    _broadcast(padding_mask)
+                    _broadcast(assistant_mask)
 
         elif has_cu_seqlens:
             # A genuine middle stage (neither first nor last): no tokens/labels/loss_mask
@@ -881,6 +925,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
             cu_seqlens = _broadcast_cu_seqlens()
             max_seqlen = _broadcast_max_seqlen()
+            if getattr(args, 'ap_sft', False):
+                cu_seqlens_padded = _broadcast_cu_seqlens()
+                padding_mask = torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+                _broadcast(padding_mask)
+                _broadcast(assistant_mask)
 
         elif has_bfd_padding:
             tokens = None
@@ -902,6 +951,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
         }
+        if getattr(args, 'ap_sft', False):
+            batch['cu_seqlens_padded'] = cu_seqlens_padded
+            batch['padding_mask'] = padding_mask
+            if getattr(args, 'ap_sft_report_assistant_loss', False):
+                batch['assistant_mask'] = assistant_mask
 
     if has_bfd_padding:
         positions = torch.arange(args.seq_length, device=num_valid_tokens.device).unsqueeze(0)

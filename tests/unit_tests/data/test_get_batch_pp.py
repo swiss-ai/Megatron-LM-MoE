@@ -60,7 +60,8 @@ def _fake_batch(mbs, seq_length, doc_lengths):
 
 @pytest.mark.internal
 @pytest.mark.parametrize("mbs", [1, 2])
-def test_cu_seqlens_reaches_every_pipeline_stage(mbs):
+@pytest.mark.parametrize('ap_sft,report_assistant', [(False, False), (True, False), (True, True)])
+def test_cu_seqlens_reaches_every_pipeline_stage(mbs, ap_sft, report_assistant):
     # Read the launcher's world size, not torch.distributed's: this runs before
     # Utils.initialize_model_parallel has initialized the process group.
     world = Utils.world_size
@@ -69,16 +70,24 @@ def test_cu_seqlens_reaches_every_pipeline_stage(mbs):
     if world < 4 or world % tp != 0:
         pytest.skip(f"needs a world size divisible by {tp} and >= 4, got {world}")
 
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
-    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     seq_length, doc_lengths = 64, [17, 20, 27]
-    set_args(_Args(pp, mbs, seq_length))
+    args = _Args(pp, mbs, seq_length)
+    args.ap_sft = ap_sft
+    args.ap_sft_report_assistant_loss = report_assistant
+    args.dataloader_inter_document_masking = not ap_sft
+    set_args(args)
 
     # Only TP rank 0 of each stage has a dataloader, mirroring
     # is_dataset_built_on_rank for a packed batch.
     if mpu.get_tensor_model_parallel_rank() == 0:
         batch = _fake_batch(mbs, seq_length, doc_lengths)
+        if ap_sft:
+            batch['cu_seqlens_padded'] = batch['cu_seqlens'].clone()
+            batch['padding_mask'] = torch.zeros(mbs, seq_length, dtype=torch.bool)
+            batch['padding_mask'][:, -5:] = True
+            if report_assistant:
+                batch['assistant_mask'] = ~batch['padding_mask']
         data_iterator = iter([{k: v.cuda() for k, v in batch.items()}])
     else:
         data_iterator = None
@@ -92,6 +101,13 @@ def test_cu_seqlens_reaches_every_pipeline_stage(mbs):
         f"its attention layers unmasked"
     )
     assert got["max_seqlen"] is not None
+    if ap_sft:
+        assert torch.equal(got['cu_seqlens'], got['cu_seqlens_padded'])
+        expected_padding = torch.zeros(mbs, seq_length, dtype=torch.bool, device='cuda')
+        expected_padding[:, -5:] = True
+        assert torch.equal(got['padding_mask'], expected_padding.reshape(1, -1))
+        if report_assistant:
+            assert torch.equal(got['assistant_mask'], (~expected_padding).reshape(1, -1))
 
     # Every rank in the world must hold byte-identical cu_seqlens: across TP
     # (the broadcast) and across PP (every stage masks with the same boundaries).
