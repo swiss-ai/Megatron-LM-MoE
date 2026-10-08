@@ -1925,6 +1925,7 @@ def _pipeline_shape_args(args):
     is_packed = (
         getattr(args, 'dataloader_inter_document_masking', False)
         or getattr(args, 'sft', False)
+        or getattr(args, 'ap_sft', False)
     )
     if is_packed and args.micro_batch_size > 1:
         return args.seq_length * args.micro_batch_size, 1
@@ -2152,7 +2153,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     val,
                     group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
-                loss_reduced[key] = val[0] / val[1]
+                loss_reduced[key] = val[0] / val[1].clamp_min(1)
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -3885,7 +3886,7 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / denominator.clamp_min(1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])

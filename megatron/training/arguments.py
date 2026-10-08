@@ -1121,8 +1121,8 @@ def validate_args(args, defaults={}):
         # enabled; disable the flag to avoid a TP broadcast mismatch.
         if args.create_attention_mask_in_dataloader:
             args.create_attention_mask_in_dataloader = False
-        assert not args.sft, (
-            '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
+        assert not (args.sft or getattr(args, 'ap_sft', False)), (
+            '--dataloader-inter-document-masking and SFT both produce cu_seqlens; '
             'SFT packing already restricts attention to each packed sequence.'
         )
         assert args.context_parallel_size == 1, (
@@ -1135,10 +1135,28 @@ def validate_args(args, defaults={}):
             'parallelism yet.'
         )
 
+    assert not (args.sft and getattr(args, 'ap_sft', False)), (
+        '--sft and --ap-sft are mutually exclusive'
+    )
+    assert not getattr(args, 'ap_sft_report_assistant_loss', False) or getattr(args, 'ap_sft', False), (
+        '--ap-sft-report-assistant-loss requires --ap-sft'
+    )
+    if getattr(args, 'ap_sft', False):
+        assert args.calculate_per_token_loss, '--ap-sft requires --calculate-per-token-loss'
+        args.create_attention_mask_in_dataloader = False
+        for option in (
+            'hybrid_context_parallel', 'mtp_num_layers', 'modelopt_enabled',
+            'fim_data', 'goldfish_loss', 'dataloader_inter_document_masking',
+            'mock_data', 'use_legacy_models',
+            'dataloader_fast_cache_load', 'dataloader_defer_npy_index_mmap',
+        ):
+            assert not getattr(args, option, False), f'--ap-sft does not support {option}'
+        assert args.max_docs_per_bin_sft >= 0, '--max-docs-per-bin-sft must be nonnegative'
+
     # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
     # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
     if args.attention_backend == AttnBackend.auto and (
-        args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+        args.sft or getattr(args, 'ap_sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
     ):
         args.attention_backend = AttnBackend.flash
         if args.rank == 0:
@@ -1771,14 +1789,18 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-            if getattr(args, 'pretraining_packing_strategy', None) == 'bfd':
+            if (
+                getattr(args, 'ap_sft', False)
+                or getattr(args, 'pretraining_packing_strategy', None) == 'bfd'
+            ):
                 # Capture takes a routing padding_mask only for MoE layers that have already
                 # routed with one, which needs at least one real forward before the graphs
                 # are recorded. With no warmup step the graphs are captured unmasked and TE
                 # silently ignores the mask passed at replay, so fail here instead.
                 assert args.cuda_graph_warmup_steps > 0, (
-                    "--cuda-graph-warmup-steps must be > 0 with --pretraining-packing-strategy "
-                    "bfd and --cuda-graph-impl transformer_engine: with 0 the CUDA graphs are "
+                    "--cuda-graph-warmup-steps must be > 0 with --ap-sft or "
+                    "--pretraining-packing-strategy bfd when using "
+                    "--cuda-graph-impl transformer_engine: with 0 the CUDA graphs are "
                     "captured before any forward and the MoE routing padding mask is silently "
                     "dropped from every replay."
                 )
@@ -3963,6 +3985,18 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
+    group.add_argument('--ap-sft', action="store_true", help='Apertus-2 indexed SFT training')
+    group.add_argument('--ap-sft-pack-samples', action="store_true",
+                       help='Pack complete Apertus conversations into THD samples')
+    group.add_argument('--ap-sft-packing-strategy', choices=['greedy', 'bfd'], default='greedy')
+    group.add_argument('--max-docs-per-bin-sft', type=int, default=0)
+    group.add_argument('--ap-sft-load-loss-mask', action="store_true",
+                       help='Load sibling indexed loss_weights data')
+    group.add_argument('--ap-sft-report-assistant-loss', action='store_true',
+                       help='Report unweighted loss over Apertus output targets; '
+                            'requires Apertus control metadata in both loading modes')
+    group.add_argument('--ap-sft-truncate-right', action="store_true", default=True,
+                       help='Compatibility flag: Apertus SFT always truncates on the right')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
     return parser
