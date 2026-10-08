@@ -2045,7 +2045,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     seq_length = None
     # padding_mask is included because on a genuine middle PP stage every other entry
     # is None, and the cu_seqlens fallback below costs a device sync per microbatch.
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask', 'assistant_mask'):
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
@@ -2060,7 +2060,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     if batch.get('max_seqlen') is not None:
         batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask', 'assistant_mask'):
         if batch.get(key) is not None:
             batch[key] = batch[key].reshape(1, -1)
 
@@ -2226,15 +2226,28 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
-        total_tokens = next((data.size(1) for data in batch.values() if data is not None), None)
-        if total_tokens is None:
-            total_tokens = int(cu_seqlens_padded[-1].item())
-        index = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
+        cu_seqlens_for_cp = cu_seqlens if cu_seqlens_padded is None else cu_seqlens_padded
+        total_tokens = next(
+            (
+                data.size(1)
+                for key, data in batch.items()
+                if key in {'tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask', 'assistant_mask'}
+                and data is not None
+            ),
+            None,
+        )
+        if total_tokens is None:  # middle pipeline stage without token tensors
+            total_tokens = int(cu_seqlens_for_cp[-1].item())
+        index = tex.thd_get_partitioned_indices(cu_seqlens_for_cp, total_tokens, cp_size, cp_rank)
         for key, data in batch.items():
-            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+            if data is None or key in {
+                'attention_mask',
+                'cu_seqlens',
+                'cu_seqlens_padded',
+                'max_seqlen',
+            }:
                 continue
-            if data is not None:
-                batch[key] = data.index_select(1, index)
+            batch[key] = data.index_select(1, index)
 
     return batch, packed_seq_params
 
