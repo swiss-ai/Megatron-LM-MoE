@@ -68,3 +68,23 @@ Transformer Engine CUDA graphs require `--cuda-graph-warmup-steps` ≥ 1 so capt
 includes the MoE padding mask. Captured scopes must leave attention outside the
 graph: current TE attention/full-layer replay rejects packed-sequence metadata.
 CPU encoding/export tests pass; CUDA training remains unverified.
+
+## Exact epochs
+
+Use `--ap-sft --ap-sft-epochs 1 --calculate-per-token-loss` to train on every
+conversation in the **training split** exactly once. With packing, every pack is
+used once; packing and prefix truncation stay the same. `--ap-sft-epochs N`
+independently shuffles each epoch and fills its final global batch with dummy
+samples whose training/assistant masks are zero. Real samples are never repeated
+to fill a batch. For example, 1,000 samples with global batch 64 take 16 steps,
+including 24 dummy samples.
+
+This replaces `--train-iters`/`--train-samples`. Use the `single` loader (default),
+a fixed global batch divisible by micro-batch size × DP size, and training
+prefixes without explicit blend weights; stored token loss weights are supported.
+Multiple unweighted datasets are covered exhaustively;
+validation/test sizing is unchanged. Batch rampup, training phases, and automatic
+batch reduction are unsupported. LR settings use iteration-based flags; the
+schedule length is derived before optimizer setup. Consumed-sample counters
+include dummy slots, and resuming with the same data/config continues at the
+saved offset. Without this option, existing sample/iteration behavior remains.

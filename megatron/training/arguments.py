@@ -1047,7 +1047,7 @@ def validate_args(args, defaults={}):
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
-    if args.train_iters and not args.skip_train:
+    if (args.train_iters or getattr(args, 'ap_sft_epochs', None)) and not args.skip_train:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
         assert args.train_samples is None, \
@@ -1141,6 +1141,7 @@ def validate_args(args, defaults={}):
     assert not getattr(args, 'ap_sft_report_assistant_loss', False) or getattr(args, 'ap_sft', False), (
         '--ap-sft-report-assistant-loss requires --ap-sft'
     )
+    validate_apertus_sft_epochs(args)
     if getattr(args, 'ap_sft', False):
         assert args.calculate_per_token_loss, '--ap-sft requires --calculate-per-token-loss'
         args.create_attention_mask_in_dataloader = False
@@ -3982,10 +3983,31 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
         )
     return parser
 
+def validate_apertus_sft_epochs(args):
+    epochs = getattr(args, 'ap_sft_epochs', None)
+    if epochs is None:
+        return
+    assert getattr(args, 'ap_sft', False), '--ap-sft-epochs requires --ap-sft'
+    assert epochs > 0, '--ap-sft-epochs must be positive'
+    assert args.train_iters is None and args.train_samples is None, (
+        '--ap-sft-epochs replaces --train-iters and --train-samples'
+    )
+    assert args.dataloader_type == 'single', '--ap-sft-epochs requires --dataloader-type single'
+    for option in ('rampup_batch_size', 'phase_transition_iterations', 'skip_train',
+                   'perform_rl_step', 'decrease_batch_size_if_needed'):
+        assert not getattr(args, option, False), f'--ap-sft-epochs does not support {option}'
+    assert args.global_batch_size % (args.micro_batch_size * args.data_parallel_size) == 0, (
+        '--ap-sft-epochs requires a global batch divisible by micro-batch-size * DP size'
+    )
+
+
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--ap-sft', action="store_true", help='Apertus-2 indexed SFT training')
+    group.add_argument('--ap-sft-epochs', type=int, default=None,
+                       help='Train exactly N epochs of the training split; pad the final '
+                            'global batch of each epoch with zero-loss samples')
     group.add_argument('--ap-sft-pack-samples', action="store_true",
                        help='Pack complete Apertus conversations into THD samples')
     group.add_argument('--ap-sft-packing-strategy', choices=['greedy', 'bfd'], default='greedy')
