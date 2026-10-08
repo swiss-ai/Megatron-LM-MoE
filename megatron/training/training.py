@@ -1116,6 +1116,18 @@ def pretrain(
         checkpointing_context = {}
 
     # Model, optimizer, and learning rate.
+    if getattr(args, 'ap_sft_epochs', None) is not None:
+        from megatron.training.datasets.apertus_sft_epochs import prepare_apertus_sft_epochs
+
+        train_valid_test_dataset_provider = prepare_apertus_sft_epochs(
+            train_valid_test_dataset_provider, args
+        )
+        print_rank_0(
+            f'Apertus SFT: {args.ap_sft_epochs} exact epochs, '
+            f'{args.ap_sft_real_samples_per_epoch} real samples/packs and '
+            f'{args.ap_sft_samples_per_epoch - args.ap_sft_real_samples_per_epoch} '
+            f'zero-loss samples per epoch; {args.train_iters} iterations'
+        )
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
@@ -4088,7 +4100,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             # Build datasets.
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-            if args.skip_train:
+            if args.skip_train or (
+                getattr(args, 'ap_sft_epochs', None) is not None
+                and consumed_train_samples_in_current_phase == args.train_iters * args.global_batch_size
+            ):
                 train_dataloader = None
             else:
                 train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)

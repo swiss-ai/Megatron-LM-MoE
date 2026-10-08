@@ -421,6 +421,24 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     args = get_args()
 
     config = core_gpt_dataset_config_from_args(args)
+    if getattr(args, 'ap_sft_epochs', None) is not None:
+        training_blend = config.blend or (
+            config.blend_per_split[0] if config.blend_per_split else None
+        )
+        if training_blend is None or training_blend[1] is not None:
+            raise ValueError('--ap-sft-epochs requires training data without blend weights')
+        # The epoch-size probe builds only training; subsequent calls build only
+        # evaluation. Omit unused splits rather than creating empty blends.
+        if config.blend:
+            config.split_matrix = [
+                None if size == 0 else interval
+                for size, interval in zip(train_val_test_num_samples, config.split_matrix)
+            ]
+        else:
+            config.blend_per_split = [
+                None if size == 0 else blend
+                for size, blend in zip(train_val_test_num_samples, config.blend_per_split)
+            ]
 
     is_packed_sequence = False
     if args.ap_sft:
