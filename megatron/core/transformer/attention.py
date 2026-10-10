@@ -52,7 +52,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 from .utils import is_layer_window_attention
 
@@ -688,7 +688,7 @@ class Attention(MegatronModule, ABC):
 
             _, max_seqlen_q = inference_context.cu_query_lengths()
             use_uncompressed_mla = getattr(self.config, "cache_mla_latents", None) and (
-                max_seqlen_q > 1 or not HAVE_FMLA
+                not inference_context.is_decode_only() or not HAVE_FMLA
             )
             if use_uncompressed_mla:
                 # Use unabsorbed MLA attention for prefill/mixed mode, and as a
@@ -834,25 +834,25 @@ class Attention(MegatronModule, ABC):
             "sm_margin": 0,
         }
 
-        # Parse the expect argument names from the function signature
-        if inspect.isfunction(_flash_attn_forward):
-            sig = inspect.signature(_flash_attn_forward)
-        else:
-            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
-            sig = inspect.signature(_flash_attn_forward._init_fn)
+        # FA3's inference wrapper is vulnerable to dispatcher schema lifetime
+        # failures. Use the registered implementation directly for this
+        # inference-only path, while preserving the module-global op. The
+        # private `_init_fn` API is intentionally scoped to this wrapper.
+        fa3_forward = _flash_attn_forward
+        if isinstance(fa3_forward, torch._library.custom_ops.CustomOpDef):
+            fa3_forward = fa3_forward._init_fn
+        sig = inspect.signature(fa3_forward)
         valid_kwargs = set(sig.parameters.keys())
         final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
 
-        output_total, *unused = _flash_attn_forward(**final_kwargs)
+        output_total, *unused = fa3_forward(**final_kwargs)
 
         return output_total
 
     def _get_flash_attention_window_size(self) -> tuple[int, int]:
         """Return this layer's FlashAttention window, or unlimited attention."""
         if is_layer_window_attention(
-            self.config.window_size,
-            self.config.window_attn_skip_freq,
-            self.layer_number,
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
         ):
             assert self.config.window_size is not None
             return self.config.window_size
@@ -893,7 +893,7 @@ class Attention(MegatronModule, ABC):
 
         # Flash attn kernel. Without FlashMLA, MLA decode uses the same uncompressed
         # varlen fallback as prefill.
-        use_varlen_attention = max_seqlen_q > 1 or (
+        use_varlen_attention = not is_decode_only or (
             isinstance(self.config, MLATransformerConfig) and not HAVE_FMLA
         )
         if use_varlen_attention:
@@ -943,13 +943,20 @@ class Attention(MegatronModule, ABC):
             output_total = output_total.unsqueeze(1)
         else:  # decode only
             assert block_table is not None
+            # For speculative decoding, q arrives as (B*S, 1, H, D) where S is
+            # the number of tokens per request. Reshape to (B, S, H, D) so the
+            # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
+            num_requests = seqlens_k.shape[0]
+            tokens_per_request = q.shape[0] // num_requests
+            q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
+
             # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
                 assert HAVE_FMLA
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
-                seq_len_q = 1  # Sequence length is 1 for decode
+                seq_len_q = tokens_per_request
                 num_heads_q = self.num_attention_heads_per_partition
                 num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
 
@@ -990,6 +997,12 @@ class Attention(MegatronModule, ABC):
                         not self.batch_invariant_mode
                     ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
+
+            # Reshape back to (B*S, 1, H, D) for consistent output shape.
+            output_total = output_total.reshape(
+                num_requests * tokens_per_request, 1, *output_total.shape[2:]
+            )
+
         return output_total
 
     @staticmethod
@@ -1059,6 +1072,9 @@ class Attention(MegatronModule, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+            rotary_pos_cos = None
+            rotary_pos_sin = None
+            rotary_pos_cos_sin = None
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -1118,10 +1134,7 @@ class Attention(MegatronModule, ABC):
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
         recompute_qkv = (
-            self.recompute_qkv
-            and self.training
-            and inference_context is None
-            and split_qkv
+            self.recompute_qkv and self.training and inference_context is None and split_qkv
         )
 
         if recompute_qkv:
@@ -1219,7 +1232,6 @@ class Attention(MegatronModule, ABC):
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")

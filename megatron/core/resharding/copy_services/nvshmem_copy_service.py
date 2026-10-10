@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -20,9 +20,8 @@ class NVSHMEMCopyService(CopyService):
     def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
+        super().__init__(group=group)
 
-        self._group = group
-        self.rank = group.rank() if group is not None else dist.get_rank()
         self._remote = RemoteCopyService(group=group)
         # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
@@ -35,6 +34,11 @@ class NVSHMEMCopyService(CopyService):
 
         logger.info("NVSHMEMCopyService constructed")
 
+    def close(self) -> None:
+        if self._initialized:
+            self._remote.finalize()
+            self._initialized = False
+
     def _ensure_initialized(self):
         if not self._initialized:
             self._remote.init(log_level="INFO")
@@ -43,25 +47,19 @@ class NVSHMEMCopyService(CopyService):
                 "NVSHMEMCopyService initialized: PE %d / %d", self._remote.my_pe, self._remote.n_pes
             )
 
-    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
-        """
-        Basic CopyService API is not rich enough to drive the NVSHMEM planner
-        (it lacks a globally shared task identifier), so this method is kept
-        only for interface compatibility and should not be used directly.
+    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
+        if task_id is None:
+            raise RuntimeError(
+                "NVSHMEMCopyService requires a task_id for every transfer; got task_id=None"
+            )
+        self.submit_send_with_id(task_id, src_tensor, dest_rank)
 
-        The resharding path calls into NVSHMEMCopyService via the
-        submit_send_with_id/submit_recv_with_id helpers instead.
-        """
-        raise RuntimeError(
-            "NVSHMEMCopyService.submit_send() is not supported; "
-            "use submit_send_with_id(...) from execute_reshard_plan."
-        )
-
-    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
-        raise RuntimeError(
-            "NVSHMEMCopyService.submit_recv() is not supported; "
-            "use submit_recv_with_id(...) from execute_reshard_plan."
-        )
+    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int, task_id: Optional[int] = None):
+        if task_id is None:
+            raise RuntimeError(
+                "NVSHMEMCopyService requires a task_id for every transfer; got task_id=None"
+            )
+        self.submit_recv_with_id(task_id, dest_tensor, src_rank)
 
     #
     # New helper API used from execute_reshard_plan via monkey-patching:
@@ -158,7 +156,6 @@ class NVSHMEMCopyService(CopyService):
                             )
                         dst.copy_(src, non_blocking=True)
 
-            torch.cuda.current_stream().wait_stream(self._local_copy_stream)
             self._local_send_ops.clear()
             self._local_recv_ops.clear()
 
@@ -168,8 +165,13 @@ class NVSHMEMCopyService(CopyService):
         #  - schedule() has dist.all_gather_object() (torch distributed collective)
         #  - run() has nvshmem.core.barrier_all() (nvshmem collective)
         # This is critical for non-collocated refit where some ranks may have no work.
+        # Local copies on `_local_copy_stream` run concurrently with this remote
+        # NVSHMEM pipeline because the join below happens after `run()`.
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()
         self._remote.clear_requests()
+
+        # Join local-copy stream after remote pipeline so they overlapped.
+        torch.cuda.current_stream().wait_stream(self._local_copy_stream)
         logger.info("NVSHMEMCopyService: NVSHMEM transfers complete")

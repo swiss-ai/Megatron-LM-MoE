@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 import socket
+import time
 from collections import deque
 from enum import Enum, auto
 from multiprocessing import Event
@@ -14,7 +15,7 @@ from multiprocessing.connection import Connection
 import numpy as np
 import torch
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy, routes_on_prefix
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -55,8 +56,8 @@ class DataParallelInferenceCoordinator:
         `InferenceClient`, and performs a simple handshake.
     3.  **Request Forwarding**: It receives inference requests from clients, assigns a
         unique server-side request ID, tokenizes the prompt, and forwards the request
-        to one of the available data parallel rank using a round-robin scheduling
-        strategy.
+        to one of the available data parallel ranks using load-balanced (and,
+        when prefix caching is enabled, prefix-affinity-aware) routing.
     4.  **Response Routing**: It receives completed results from
         the data parallel ranks and routes them back to the original client that made the
         request.
@@ -67,7 +68,7 @@ class DataParallelInferenceCoordinator:
         router_socket (zmq.Socket): The central ZMQ ROUTER socket for all communication.
         data_parallel_size (int): The number of data parallel workers to expect.
         identities_of_data_parallel_ranks (deque): A deque holding the ZMQ
-            identities of connected TP-coordinators, used for round-robin scheduling.
+            identities of connected data parallel instances, used for request routing.
         request_id_to_client_id (dict): Maps server-side request IDs to the ZMQ
             identity of the client that initiated the request.
         request_id_to_client_request_id (dict): Maps server-side request IDs to the
@@ -94,9 +95,10 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
-        prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_routing_alpha: float = 1.0,
+        prefix_cache_ttl_seconds: float = 300.0,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
     ):
@@ -109,12 +111,12 @@ class DataParallelInferenceCoordinator:
 
         Args:
             pipe_connection (Connection): A connecting pipe to the parent process.
-            data_parallel_size (int): The number of TP-coordinator workers that are
+            data_parallel_size (int): The number of data parallel instances that are
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
-            prefix_caching_routing_alpha (float): Weight for prefix-aware routing score:
-                score = alpha * match + (1 - alpha) * normalized_load.
+            prefix_caching_routing_alpha (float): Relative-load penalty coefficient:
+                score = normalized_prefix_depth - alpha * relative_load.
             max_requests (int): Max concurrent requests per rank, used to
                 compute normalized_load for prefix-aware scoring.
         """
@@ -133,7 +135,7 @@ class DataParallelInferenceCoordinator:
         # This is the central router socket
         # 1. data parallel ranks connect to this socket to register themselves
         # 2. Users connect to this socket and submit their requests. We transmit them to
-        #    data parallel ranks in a round robin fashion
+        #    data parallel ranks according to the configured routing policy
         # 3. data parallel ranks return completed requests to this socket. We route them back to
         #    the user that had submitted the request originally.
 
@@ -170,6 +172,7 @@ class DataParallelInferenceCoordinator:
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
+        self.removed_engine_identities = set()
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
             identity, _ = self.router_socket.recv_multipart()
@@ -182,13 +185,15 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks = deque(
                 sorted(self.identities_of_data_parallel_ranks)
             )
-        self._round_robin_idx = 0
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
+        self.client_request_to_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
+        self.removed_engine_identities = set()
 
         self.next_request_id = 0
+        self.known_clients = set()
         self.tokenizer = tokenizer
         self.state = self.CoordinatorState.RUNNING
 
@@ -197,6 +202,7 @@ class DataParallelInferenceCoordinator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+        self.prefix_cache_ttl_seconds = prefix_cache_ttl_seconds
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
 
@@ -215,25 +221,23 @@ class DataParallelInferenceCoordinator:
         self._identities_list = list(sorted_identities)  # rank_index → identity
         self._pending_counts = np.zeros(n_ranks, dtype=np.int32)
 
-        # Hash → {rank_idx: timestamp} dict for prefix cache affinity routing.
-        # Each key is a block hash; each value maps rank indices to assignment
-        # timestamps (positive int).  Missing entries are implicitly zero.
-        self._hash_table: dict[int, dict[int, int]] = {}
-        self._hash_assignment_counter = 0
+        # Hash → {rank_idx: touch_time}, with monotonic timestamps.
+        self._hash_table: dict[int, dict[int, float]] = {}
+        self._hash_expiry: deque = deque()
 
-    def get_next_data_parallel_rank(self):
+    def get_least_loaded_data_parallel_rank(self):
         """
-        Selects the next data parallel rank using round-robin scheduling.
+        Selects the data parallel rank with the fewest in-flight requests.
+
+        Ties are broken by lowest rank index for deterministic behavior.
 
         Returns:
-            bytes: The ZMQ identity of the next data parallel rank to receive a request.
+            bytes: The ZMQ identity of the least-loaded data parallel rank.
         """
-        identities = self.identities_of_data_parallel_ranks
-        if not identities:
+        if not self._identities_list:
             raise RuntimeError("No engines connected")
-        idx = self._round_robin_idx % len(identities)
-        self._round_robin_idx = idx + 1
-        return identities[idx]
+        best_idx = int(np.argmin(self._pending_counts))
+        return self._identities_list[best_idx]
 
     def _register_rank_identity(self, identity):
         """Register a new rank identity in the scoring data structures.
@@ -256,22 +260,56 @@ class DataParallelInferenceCoordinator:
         )
 
     def _remove_engine(self, identity):
-        """Remove a disconnected engine from the routing pool."""
+        """Remove a disconnected engine from all routing bookkeeping.
+        Called both during shutdown and when an engine becomes unreachable mid-operation
+        (e.g. zmq.EHOSTUNREACH in _send_to_engine). The O(n) index-shifting and hash-table
+        rebuild are acceptable because the number of connected engines is small; optimize
+        only if dynamic registration/deregistration at high engine counts becomes a use case.
+        """
         self.identities_of_data_parallel_ranks.remove(identity)
+        self.removed_engine_identities.add(identity)
+        idx = self.identity_to_rank_index.pop(identity, None)
+        if idx is None:
+            return
+        self._identities_list.pop(idx)
+        self._pending_counts = np.delete(self._pending_counts, idx)
+        # Shift indices for engines that came after the removed slot.
+        for ident in self.identity_to_rank_index:
+            if self.identity_to_rank_index[ident] > idx:
+                self.identity_to_rank_index[ident] -= 1
+        # Drop hash-table entries for the removed rank; shift indices above it.
+        new_hash_table = {}
+        for h, rank_ts in self._hash_table.items():
+            # h is hash index
+            # rank_ts is a dict mapping rank_idx → timestamp
+            new_row = {}
+            for r, ts in rank_ts.items():
+                if r == idx:
+                    # skip this rank as it is removed
+                    continue
+                new_r = r - 1 if r > idx else r
+                new_row[new_r] = ts
+            if new_row:
+                new_hash_table[h] = new_row
+        self._hash_table = new_hash_table
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, payload):
-        """Send payload to an engine, removing it from the pool if unreachable.
+    def _send_to_engine(self, identity, frames):
+        """Send a message to an engine, removing it from the pool if unreachable.
+
+        Args:
+            identity: ZMQ identity of the target engine.
+            frames (list): Raw frames to send, metadata frame first.
 
         Returns:
             True if the send succeeded, False if the engine was unreachable and removed.
         """
         try:
-            self.router_socket.send_multipart([identity, payload])
+            self.router_socket.send_multipart([identity, *frames])
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
@@ -282,14 +320,16 @@ class DataParallelInferenceCoordinator:
     def compute_request_hashes(self, prompt):
         """Compute block hashes for a prompt on CPU.
 
+        Callers decide whether hashes are wanted at all: computing them requires
+        the decoded prompt, and decoding it is the cost the caller is usually
+        trying to avoid. See handle_submit_request.
+
         Args:
             prompt: Either a string (to be tokenized) or a list of token IDs.
 
         Returns:
             List of integer block hashes, or empty list if prefix caching is disabled.
         """
-        if not self.enable_prefix_caching or self.block_size_tokens is None:
-            return []
         if isinstance(prompt, str):
             tokens = self.tokenizer.tokenize(prompt)
         else:
@@ -300,11 +340,8 @@ class DataParallelInferenceCoordinator:
     def get_best_data_parallel_rank(self, request_hashes):
         """Select the best DP rank based on prefix cache affinity and load.
 
-        Uses a scoring function: score = alpha * match + (1 - alpha) * normalized_load
-        where *match* is a policy-dependent affinity score in [0, 1] (binary for
-        ``first_prefix_block``, normalized prefix depth for ``longest_prefix``)
-        and normalized_load = free_slots / max_requests (higher means more free
-        capacity).
+        Uses score = cache_score - alpha * relative_load, with reusable prefix
+        depth normalized by prompt blocks and load measured against the fleet mean.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -312,25 +349,25 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
-        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.ROUND_ROBIN:
-            return self.get_next_data_parallel_rank()
+        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
+            return self.get_least_loaded_data_parallel_rank()
 
+        # Without prefix caching (or when the request has no hashes to match on)
+        # fall back to load-balanced routing.
         if not self.enable_prefix_caching or not request_hashes:
-            return self.get_next_data_parallel_rank()
+            return self.get_least_loaded_data_parallel_rank()
 
-        match, recency = self._match_vector(request_hashes)
-
-        alpha = self.prefix_caching_routing_alpha
-
-        # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
-        free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
-        scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
-
-        # Tiebreak: highest score, then highest recency, then lowest rank index.
+        self._expire_rank_hashes(time.monotonic())
+        prefix_blocks = self._prefix_depth_vector(request_hashes)
+        if not prefix_blocks.any():
+            return self.get_least_loaded_data_parallel_rank()
+        cache_score = prefix_blocks / len(request_hashes)
         n_ranks = len(self._identities_list)
-        order = np.lexsort((np.arange(n_ranks), -recency, -scores))
-        best_idx = int(order[0])
-        return self._identities_list[best_idx]
+        mean_load = float(self._pending_counts.mean()) if n_ranks else 0.0
+        relative_load = (self._pending_counts - mean_load) / max(1.0, mean_load)
+        scores = cache_score - self.prefix_caching_routing_alpha * relative_load
+        order = np.lexsort((np.arange(n_ranks), self._pending_counts, -scores))
+        return self._identities_list[int(order[0])]
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.
@@ -340,38 +377,74 @@ class DataParallelInferenceCoordinator:
             request_hashes: List of block hashes assigned to this rank.
         """
         rank_idx = self.identity_to_rank_index[rank_identity]
-        self._hash_assignment_counter += 1
-        ts = self._hash_assignment_counter
+        # One timestamp for the whole call keeps the expiry queue sorted.
+        now = time.monotonic()
         for h in request_hashes:
-            self._hash_table.setdefault(h, {})[rank_idx] = ts
+            self._hash_table.setdefault(h, {})[rank_idx] = now
+            self._hash_expiry.append((now, h))
+        # Swept here rather than on a timer: the coordinator is a single event
+        # loop with nothing else to run it, and expiry only needs to keep pace
+        # with the traffic that grows the table.
+        self._expire_rank_hashes(now)
 
-    def _match_vector(self, hashes):
-        """Return ``(match, recency)`` vectors of shape ``(n_ranks,)``.
+    def _expire_rank_hashes(self, now):
+        """Drop hash entries no request has touched for the TTL.
 
-        *match* is binary depth: ``(depth + 1) / len(hashes)`` for ranks that
-        have the deepest cached block, 0 otherwise.  *recency* is the raw
-        assignment timestamp for each matching rank (0 for non-matching ranks).
+        The coordinator's table is a guess about what each engine still holds: it
+        sees blocks being routed, never blocks being evicted. Left alone the guess
+        only gets staler, and the coordinator keeps sending requests to a rank for
+        a prefix it dropped long ago, paying a cold prefill and passing up a rank
+        that could have served it.
 
-        For ``FIRST_PREFIX_BLOCK`` the caller already truncates *hashes* to a
-        single element, so the same logic yields a binary 0/1 match score.
+        The queue is insertion-ordered, so expired entries form a prefix of it and
+        the sweep stops at the first live one -- the cost is what it evicts, not
+        the size of the table. An entry re-routed since it was queued carries a
+        newer timestamp than the queue entry and is left alone, which is what
+        makes a stale duplicate harmless.
         """
-        n_ranks = len(self._identities_list)
-        n = len(hashes)
-        zeros = np.zeros(n_ranks, dtype=np.float64)
-        if n == 0:
-            return zeros, zeros.copy()
-        for i in range(n - 1, -1, -1):
-            row = self._hash_table.get(hashes[i])
+        ttl = self.prefix_cache_ttl_seconds
+        while self._hash_expiry:
+            ts, h = self._hash_expiry[0]
+            if now - ts <= ttl:
+                break
+            self._hash_expiry.popleft()
+            row = self._hash_table.get(h)
             if row is None:
                 continue
-            rank_idxs = np.fromiter(row.keys(), dtype=np.intp)
+            for rank_idx in [r for r, touched in row.items() if touched <= ts]:
+                del row[rank_idx]
+            if not row:
+                del self._hash_table[h]
+
+    def _prefix_depth_vector(self, hashes):
+        """Return each rank's contiguous prefix depth, in blocks.
+
+        Prefix cache
+        reuse requires an unbroken chain from the first block -- each block hash
+        chains the previous one's digest -- so a rank only benefits up to its
+        first miss. Walking forward and dropping ranks as they miss gives each
+        rank its true depth, and the loop exits as soon as no rank is left.
+
+        Counting forward also refuses to credit a rank for a deep block whose
+        prefix has been evicted: that KV cannot be reused, because reaching it
+        requires the blocks before it.
+
+        """
+        n_ranks = len(self._identities_list)
+        depth = np.zeros(n_ranks, dtype=np.int64)
+        alive = np.ones(n_ranks, dtype=bool)
+        for h in hashes:
+            row = self._hash_table.get(h)
+            if row is None:
+                break
             present = np.zeros(n_ranks, dtype=bool)
+            rank_idxs = np.fromiter(row.keys(), dtype=np.intp, count=len(row))
             present[rank_idxs] = True
-            recency = np.zeros(n_ranks, dtype=np.float64)
-            recency[rank_idxs] = np.fromiter(row.values(), dtype=np.float64)
-            if present.any():
-                return present.astype(np.float64) * ((i + 1.0) / n), recency
-        return zeros, zeros.copy()
+            alive &= present
+            if not alive.any():
+                break
+            depth += alive
+        return depth.astype(np.float64)
 
     def start(self):
         """
@@ -384,18 +457,23 @@ class DataParallelInferenceCoordinator:
         control signals, or processing replies from the engines.
         """
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
-        known_clients = set()
+        known_clients = self.known_clients
         while True:
-            sender_identity, serialized_payload = self.router_socket.recv_multipart()
+            # Messages are one or more frames. frames[0] is the metadata frame:
+            # a header plus whatever the coordinator needs to route the message.
+            # Any later frames are opaque payload bodies, forwarded without ever
+            # being decoded here -- that is what keeps this loop's cost
+            # independent of prompt length.
+            sender_identity, *frames = self.router_socket.recv_multipart()
 
             # Allow for re-registration if connecting to a running coordinator.
-            if serialized_payload == b"":
+            if frames[0] == b"":
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
                     self._register_rank_identity(sender_identity)
                 continue
 
-            deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
+            deserialized_payload = msgpack.unpackb(frames[0], raw=False)
             header = Headers(deserialized_payload[0])
 
             if header == Headers.CONNECT:
@@ -424,28 +502,37 @@ class DataParallelInferenceCoordinator:
                     continue
                 # this is a message from a client.
                 # route it to a data parallel rank
-                client_request_id, prompt, sampling_params = deserialized_payload[1:]
+                if len(frames) != 4 or len(deserialized_payload) != 4:
+                    logging.error("Coordinator: malformed framed SUBMIT_REQUEST")
+                    continue
+                client_request_id, sampling_params, media_meta = deserialized_payload[1:]
+                if media_meta is not None:
+                    raise ValueError("Multimodal submissions are not supported by this coordinator")
                 # map client request_id to server request_id
                 # necessary because multiple clients might have the same request_id.
                 request_id = self.next_request_id
                 self.next_request_id += 1
                 self.request_id_to_client_id[request_id] = sender_identity
                 self.request_id_to_client_request_id[request_id] = client_request_id
+                self.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
-                # Serialize prompt.
-                if isinstance(prompt, (str, list)):
-                    pass
-                elif isinstance(prompt, torch.Tensor):
-                    prompt = prompt.tolist()
-                else:
-                    raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
-
-                payload = msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-                    use_bin_type=True,
-                )
-
-                request_hashes = self.compute_request_hashes(prompt)
+                payload = [
+                    msgpack.packb(
+                        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, None],
+                        use_bin_type=True,
+                    ),
+                    frames[1],
+                    frames[3],
+                ]
+                request_hashes = []
+                if self.enable_prefix_caching and routes_on_prefix(
+                    self.prefix_caching_coordinator_policy
+                ):
+                    request_hashes = msgpack.unpackb(frames[2], raw=False)
+                    if request_hashes is None:
+                        request_hashes = self.compute_request_hashes(
+                            msgpack.unpackb(frames[1], raw=False)
+                        )
                 if (
                     self.prefix_caching_coordinator_policy
                     == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
@@ -462,6 +549,7 @@ class DataParallelInferenceCoordinator:
                     logging.error("Coordinator: no reachable engines for request %d", request_id)
                     del self.request_id_to_client_id[request_id]
                     del self.request_id_to_client_request_id[request_id]
+                    del self.client_request_to_request_id[(sender_identity, client_request_id)]
                     return
 
                 self.request_id_to_rank[request_id] = next_identity
@@ -476,6 +564,15 @@ class DataParallelInferenceCoordinator:
                             "num_hashes": len(request_hashes),
                         }
                     )
+
+            elif header == Headers.SUBMIT_REQUEST_WITH_KV:
+                if self._handle_submit_request_with_kv(
+                    sender_identity, deserialized_payload, frames[1:]
+                ):
+                    return
+
+            elif header == Headers.RELEASE_KV:
+                self._handle_release_kv(sender_identity, deserialized_payload)
 
             elif header in (
                 Headers.PAUSE,
@@ -525,41 +622,58 @@ class DataParallelInferenceCoordinator:
                 # Broadcast the control signal if we're in a good state.
                 # Forward the full deserialized payload so that data-bearing
                 # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
-                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
-                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+                self._broadcast_to_engines(deserialized_payload)
 
                 # STOP affects engines; reset coordinator to RUNNING to allow future engines.
                 if header == Headers.STOP:
                     self.state = self.CoordinatorState.RUNNING
 
             elif header == Headers.ENGINE_REPLY:
-                # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_requests = deserialized_payload[1]
+                self._handle_engine_reply(sender_identity, deserialized_payload, frames[1:])
 
-                for finished_request in finished_requests:
-                    self.detokenize(finished_request)
-                    fid = finished_request["request_id"]
-                    client_identity = self.request_id_to_client_id[fid]
-                    client_request_identity = self.request_id_to_client_request_id[fid]
-                    del self.request_id_to_client_id[fid]
-                    del self.request_id_to_client_request_id[fid]
-                    assigned_rank = self.request_id_to_rank.pop(fid, None)
-                    if assigned_rank is not None:
-                        idx = self.identity_to_rank_index.get(assigned_rank)
-                        if idx is not None:
-                            assert self._pending_counts[idx] >= 1
-                            self._pending_counts[idx] -= 1
-
+            elif header == Headers.ENGINE_REPLY_PARTIAL:
+                # Route token deltas without releasing request mappings or in-flight load.
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    assert (
+                        sender_identity in self.removed_engine_identities
+                    ), f"ENGINE_REPLY_PARTIAL from never-connected sender {sender_identity!r}"
+                    logging.warning(
+                        "Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity
+                    )
+                    continue
+                if len(deserialized_payload[1]) != len(frames) - 1:
+                    raise ValueError("ENGINE_REPLY_PARTIAL metadata/body count mismatch")
+                for request_id, body in zip(deserialized_payload[1], frames[1:]):
+                    client_identity = self.request_id_to_client_id[request_id]
+                    client_request_id = self.request_id_to_client_request_id[request_id]
+                    # Partial tokens are detokenized by the client-facing streaming layer.
                     self.router_socket.send_multipart(
                         [
                             client_identity,
-                            msgpack.packb(
-                                [header.value, client_request_identity, finished_request],
-                                use_bin_type=True,
-                            ),
+                            msgpack.packb([header.value, client_request_id], use_bin_type=True),
+                            body,
                         ]
+                    )
+
+            elif header == Headers.ABORT_REQUEST:
+                if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring abort from unknown client.")
+                    continue
+                client_request_id = int(deserialized_payload[1])
+                request_id = self.client_request_to_request_id.get(
+                    (sender_identity, client_request_id)
+                )
+                if request_id is None:
+                    continue
+                assigned_rank = self.request_id_to_rank.get(request_id)
+                if assigned_rank is not None:
+                    self._send_to_engine(
+                        assigned_rank,
+                        [
+                            msgpack.packb(
+                                [Headers.ABORT_REQUEST.value, request_id], use_bin_type=True
+                            )
+                        ],
                     )
 
             elif header == Headers.SHUTDOWN:
@@ -575,6 +689,93 @@ class DataParallelInferenceCoordinator:
             else:
                 raise UnknownHeaderError(header)
 
+    def _broadcast_to_engines(self, payload):
+        broadcast_payload = msgpack.packb(payload, use_bin_type=True)
+        for identity in list(self.identities_of_data_parallel_ranks):
+            self._send_to_engine(identity, [broadcast_payload])
+
+    def _handle_submit_request_with_kv(self, sender_identity, payload, bodies):
+        """Route a client-supplied KV handoff to a decode engine."""
+        if sender_identity not in self.known_clients:
+            logging.info(
+                "Received SUBMIT_REQUEST_WITH_KV from unknown client %s; ignoring.", sender_identity
+            )
+            return
+        if len(payload) != 4 or len(bodies) != 2:
+            logging.error(
+                "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload with %d fields",
+                len(payload) - 1,
+            )
+            return
+
+        client_request_id, sampling_params, kv_meta = payload[1:]
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        self.request_id_to_client_id[request_id] = sender_identity
+        self.request_id_to_client_request_id[request_id] = client_request_id
+        self.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
+
+        engine_payload = [
+            msgpack.packb(
+                [Headers.SUBMIT_REQUEST_WITH_KV.value, request_id, sampling_params, kv_meta],
+                use_bin_type=True,
+            ),
+            *bodies,
+        ]
+        for _ in range(len(self.identities_of_data_parallel_ranks)):
+            next_identity = self.get_least_loaded_data_parallel_rank()
+            if self._send_to_engine(next_identity, engine_payload):
+                break
+        else:
+            logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
+            del self.request_id_to_client_id[request_id]
+            del self.request_id_to_client_request_id[request_id]
+            del self.client_request_to_request_id[(sender_identity, client_request_id)]
+            return True
+
+        self.request_id_to_rank[request_id] = next_identity
+        self._pending_counts[self.identity_to_rank_index[next_identity]] += 1
+
+    def _handle_release_kv(self, sender_identity, payload):
+        """Broadcast release of prefill blocks retained for a completed handoff."""
+        if sender_identity not in self.known_clients:
+            logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
+            return
+        self._broadcast_to_engines([Headers.RELEASE_KV.value, int(payload[1])])
+
+    def _handle_engine_reply(self, sender_identity, payload, bodies):
+        """Deliver queued final replies, including those from a removed engine."""
+        if sender_identity not in self.identities_of_data_parallel_ranks:
+            assert (
+                sender_identity in self.removed_engine_identities
+            ), f"ENGINE_REPLY from never-connected sender {sender_identity!r}"
+            logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
+        if len(payload[1]) != len(bodies):
+            raise ValueError("ENGINE_REPLY metadata/body count mismatch")
+        for (fid, needs_detokenize), body in zip(payload[1], bodies):
+            if needs_detokenize:
+                finished_request = msgpack.unpackb(body, raw=False)
+                self.detokenize(finished_request)
+                body = msgpack.packb(finished_request, use_bin_type=True)
+            client_identity = self.request_id_to_client_id.pop(fid)
+            client_request_identity = self.request_id_to_client_request_id.pop(fid)
+            del self.client_request_to_request_id[(client_identity, client_request_identity)]
+            assigned_rank = self.request_id_to_rank.pop(fid, None)
+            if assigned_rank is not None:
+                idx = self.identity_to_rank_index.get(assigned_rank)
+                if idx is not None:
+                    assert self._pending_counts[idx] >= 1
+                    self._pending_counts[idx] -= 1
+            self.router_socket.send_multipart(
+                [
+                    client_identity,
+                    msgpack.packb(
+                        [Headers.ENGINE_REPLY.value, client_request_identity], use_bin_type=True
+                    ),
+                    body,
+                ]
+            )
+
     def detokenize(self, finished_request):
         """
         Detokenizes the generated tokens in the finished request.
@@ -586,7 +787,14 @@ class DataParallelInferenceCoordinator:
             finished_request (dict): The serialized merged request containing the
                 generated tokens to be detokenized. It is modified in place.
         """
-        if finished_request["prompt"] is None:
+        # Defaults to True, matching SamplingParams: params serialized before
+        # this field existed still expect detokenization.
+        if not (finished_request.get("sampling_params", {}) or {}).get(
+            "detokenize_generations", True
+        ):
+            return
+
+        if finished_request["prompt"] is None and finished_request.get("prompt_tokens") is not None:
             finished_request["prompt"] = TextGenerationController.detokenize(
                 self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
             )
@@ -612,9 +820,10 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
-        prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_routing_alpha: float = 1.0,
+        prefix_cache_ttl_seconds: float = 300.0,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
     ):
@@ -629,7 +838,7 @@ class DataParallelInferenceCoordinator:
             ready_event (Event): A threading or multiprocessing event object that is set()
                 once the coordinator is ready to accept connections.
             inference_coordinator_port (int): The port to bind to.
-            data_parallel_size (int): The number of expected TP-coordinators.
+            data_parallel_size (int): The number of expected data parallel instances.
             deterministic_mode (bool): Whether to enable deterministic scheduling.
             block_size_tokens (Optional[int]): Token block size for prefix caching hashing.
             enable_prefix_caching (bool): Whether prefix caching is enabled.
@@ -649,6 +858,7 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+            prefix_cache_ttl_seconds=prefix_cache_ttl_seconds,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
         )

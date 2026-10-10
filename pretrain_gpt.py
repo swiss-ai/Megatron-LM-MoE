@@ -17,7 +17,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=FutureWarning)
 
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -45,10 +45,11 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -291,7 +292,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     )
 
 
-def core_gpt_dataset_config_from_args(args):
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     # Use the same tokenizer instance from which set_global_variables extracted
     # tokenizer_extra_metadata; rebuilding here can diverge for stateful/custom tokenizers.
     tokenizer = get_tokenizer()
@@ -431,18 +432,22 @@ if __name__ == "__main__":
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    setattr(train_valid_test_datasets_provider, "is_distributed", True)
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    args = parse_and_validate_args(
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
+    model_cfg = gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
+        full_config,
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )

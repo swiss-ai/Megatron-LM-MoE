@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -13,7 +14,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
@@ -205,6 +206,42 @@ class TestLayerWiseOptimizer:
             pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
+
+    def test_rejects_partial_intra_dp_group_before_sharding(self):
+        """LayerWise rejects DDP groups smaller than its full-DP shard group."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        full_dp_size = get_pg_size(pg_collection.dp_cp)
+        assert full_dp_size > 1
+        partial_group = Mock()
+        partial_group.size.return_value = full_dp_size // 2
+        pg_collection.intra_dp_cp = partial_group
+
+        with (
+            patch.object(LayerWiseDistributedOptimizer, "shard_params") as shard_params,
+            patch.object(ChainedOptimizer, "__init__", return_value=None) as chained_init,
+            pytest.raises(
+                AssertionError,
+                match="LayerWiseDistributedOptimizer does not support.*optimizer_instances",
+            ),
+        ):
+            LayerWiseDistributedOptimizer([], OptimizerConfig(), pg_collection)
+
+        shard_params.assert_not_called()
+        chained_init.assert_not_called()
+
+    def test_accepts_full_dp_intra_group(self):
+        """The normal one-instance full DP layout still reaches LayerWise setup."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.intra_dp_cp = pg_collection.dp_cp
+
+        with (
+            patch.object(LayerWiseDistributedOptimizer, "shard_params") as shard_params,
+            patch.object(ChainedOptimizer, "__init__", return_value=None) as chained_init,
+        ):
+            LayerWiseDistributedOptimizer([], OptimizerConfig(), pg_collection)
+
+        shard_params.assert_called_once()
+        chained_init.assert_called_once()
 
     def create_reference_model(self, model):
         """Create a reference model by cloning the current model."""

@@ -363,6 +363,20 @@ class FullyShardedDataParallel(_BaseDataParallel):
         _load_rng_state_dict(broadcast_list[0])
 
 
+# Upstream renamed this implementation to V1; retain the original class identity.
+FullyShardedDataParallelV1 = FullyShardedDataParallel
+
+
+class FullyShardedDataParallelV2:
+    """Import compatibility only; the MFSDP V2 backend is not implemented in this fork."""
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Megatron-FSDP V2 is not supported in this fork. "
+            "Use FullyShardedDataParallelV1 or FullyShardedDataParallel instead."
+        )
+
+
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()

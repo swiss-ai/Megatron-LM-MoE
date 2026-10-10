@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
 from typing import Optional, Tuple
 
@@ -10,7 +11,6 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -41,6 +41,14 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    def refresh_cache(self) -> None:
+        """Refresh state derived from parameters after an in-place weight refit.
+
+        Refit bypasses the normal checkpoint-load and train/eval lifecycles. Modules
+        that cache values derived from parameters can override this method; the refit
+        receiver calls it after all parameter and buffer transfers have completed.
+        """
 
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
@@ -169,10 +177,7 @@ class GraphableMegatronModule(MegatronModule):
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
-        if (
-            config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in config.cuda_graph_scope
-        ):
+        if config.cuda_graph_impl == "local":
             if hasattr(self, "create_mcore_cudagraph_manager"):
                 self.create_mcore_cudagraph_manager(config)
             else:

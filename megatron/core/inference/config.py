@@ -1,14 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+import warnings
+from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+WandbModule = Any
 
 
 @dataclass
@@ -50,7 +53,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -122,9 +125,7 @@ class KDAInferenceStateConfig:
         if not kda_layers:
             return None
 
-        conv_states_shape, recurrent_states_shape = kda_layers[0][
-            1
-        ].kda_state_shapes_per_request()
+        conv_states_shape, recurrent_states_shape = kda_layers[0][1].kda_state_shapes_per_request()
 
         return cls(
             kda_layer_map={layer_number: i for i, (layer_number, _) in enumerate(kda_layers)},
@@ -160,8 +161,26 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     FIRST_PREFIX_BLOCK = "first_prefix_block"
     """Route to the rank that has the first block hash cached. O(ranks) check."""
 
-    ROUND_ROBIN = "round_robin"
-    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
+    LOAD_BALANCED = "load_balanced"
+    """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
+
+
+def routes_on_prefix(policy) -> bool:
+    """Whether `policy` needs per-request block hashes to make a routing decision.
+
+    Frontends call this to decide whether hashing a prompt is worth anything: under
+    LOAD_BALANCED the coordinator discards the hashes, so computing them is pure
+    overhead on the request path. Kept beside the enum so a new prefix-aware policy
+    only has to be added in one place.
+
+    Accepts the enum, its string value, or None (no policy configured).
+    """
+    if policy is None:
+        return False
+    return PrefixCachingCoordinatorPolicy(policy) in (
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+    )
 
 
 class KVCacheManagementMode(str, Enum):
@@ -175,6 +194,74 @@ class KVCacheManagementMode(str, Enum):
 
     RECOMPUTE = "recompute"
     """Deallocate large tensors and recompute them from scratch during allocation."""
+
+
+class CudaGraphSizingDistribution(str, Enum):
+    """How CUDA graph token-count sizes are spaced when generating the captured graphs.
+
+    EXPONENTIAL — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
+    `log2(max_tokens)` total graphs.
+
+    LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
+    sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
+    Higher graph density at the top end.
+
+    HYBRID (default) — EXPONENTIAL for prefill and mixed graphs, LINEAR for decode-only graphs.
+    The two
+    serve different ranges: prefill token counts span the whole `cuda_graph_max_tokens` (thousands),
+    where log spacing keeps padding bounded at ~2x for a handful of graphs, while decode-only counts
+    are capped at `max_requests * (num_speculative_tokens + 1)` (tens), where halving is far too
+    coarse -- a 33-request step would pad up to a 64-request graph. Linear spacing there covers
+    every small request count densely for little extra capture cost.
+    """
+
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+    HYBRID = "hybrid"
+
+
+class AsyncScheduleMode(str, Enum):
+    """Async scheduling mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Resolve requests before preparing the next forward pass."""
+
+    ASYNC = "async"
+    """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
+
+
+@dataclass
+class ImageProcessingConfig:
+    """Import compatibility for NeMo; image preprocessing is not supported here."""
+
+    patch_dim: int
+    dynamic_resolution: bool = False
+    use_tiling: bool = False
+    pixel_shuffle: bool = False
+    spatial_merge_size: int = 1
+    dynamic_resolution_min_patches: int = 1
+    dynamic_resolution_max_patches: int = 128
+    vision_model_type: str = "radio"
+    pixel_mean: Optional[List[float]] = None
+    pixel_std: Optional[List[float]] = None
+
+    def __post_init__(self):
+        raise NotImplementedError("Image preprocessing is unsupported; use text-only inference.")
+
+
+@dataclass
+class VideoProcessingConfig:
+    """Import compatibility for NeMo; video preprocessing is not supported here."""
+
+    image_config: ImageProcessingConfig
+    num_frames: int = 8
+    temporal_patch_size: int = 1
+    frame_manifest_magic: Optional[bytes] = None
+    video_maintain_aspect_ratio: bool = True
+
+    def __post_init__(self):
+        raise NotImplementedError("Video preprocessing is unsupported; use text-only inference.")
 
 
 @dataclass
@@ -193,16 +280,18 @@ class InferenceConfig:
 
     buffer_size_gb: int = 20
     """
-    Buffer size reserved on the GPU for the KV cache.
+    On-GPU portion of the shared KV cache block pool.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
 
     paused_buffer_size_gb: Optional[int] = None
     """
-    Portion of buffer reserved for paused requests. Active requests are paused when there are not
-    enough active blocks available to continue generating a request. The total buffer size
-    (active + paused) depends on `unified_memory_level` (uvm):
+    Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    When the pool cannot satisfy new allocations, paused requests retain blocks only within this
+    budget and excess paused requests may be evicted. The total buffer size depends on
+    `unified_memory_level` (uvm):
         - uvm 0: buffer_size_gb (paused buffer is inclusive)
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
@@ -251,18 +340,48 @@ class InferenceConfig:
     # =================================
     num_cuda_graphs: Optional[int] = None
     """
-    Maximum number of cuda graphs to capture, where the cuda graph batch sizes range from 1 to
-    `max_requests`. Due to rounding, the actual number of cuda graphs may not equal this argument.
+    Maximum number of cuda graphs to capture.
+    Graph token counts are spaced from 1 up to a per-graph-type budget:
+      - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
+      - Prefill/mixed graphs are bounded by `cuda_graph_max_tokens` by default,
+        or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
+    Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
-    """ 
+    """
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
+    """
+
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
+    """
+    How CUDA graph token counts are spaced. HYBRID (default) applies EXPONENTIAL to prefill and
+    mixed graphs and LINEAR to decode-only graphs, since the two cover ranges that differ by
+    orders of magnitude. EXPONENTIAL halves from `cuda_graph_max_tokens` down to `tp_size`
+    (log-spaced, ~log2(max_tokens) graphs). LINEAR uses a range of linear strides (includes small
+    graphs + mid-range linearity + a bigger step size at the top end). Set EXPONENTIAL or LINEAR
+    explicitly to apply one distribution to both families.
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
     """
     Whether to use CUDA graphs for non-decode steps.
+    """
+
+    cuda_graph_all_prefills: bool = False
+    """
+    Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
+    When False (default), prefill/mixed graphs are bounded by `cuda_graph_max_tokens`.
+    When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
+    """
+
+    cuda_graph_max_tokens: int = 512
+    """
+    Token ceiling for the largest captured prefill/mixed CUDA graph.
+    This is a raw token count (not scaled by speculative decoding). The effective ceiling is
+    clamped to `[max_requests * (num_speculative_tokens + 1), max_tokens]` so it never falls
+    below the decode bound nor exceeds the token budget. Ignored when `cuda_graph_all_prefills`
+    is set, which extends capture to the full `max_tokens`.
     """
 
     static_kv_memory_pointers: bool = False
@@ -295,6 +414,21 @@ class InferenceConfig:
     """
 
     # =================================
+    # Text-only media compatibility
+    # =================================
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    """NeMo text-only compatibility; non-None image preprocessing is unsupported."""
+
+    video_preprocessing_config: Optional[VideoProcessingConfig] = None
+    """NeMo text-only compatibility; non-None video preprocessing is unsupported."""
+
+    vision_embedding_cache_max_bytes: Optional[int] = None
+    """Only None or zero (disabled) is supported; there is no vision embedding cache."""
+
+    allow_stale_multimodal_embeddings: bool = False
+    """Must remain disabled for text-only inference."""
+
+    # =================================
     # Engine config
     # =================================
     enable_chunked_prefill: bool = False
@@ -306,16 +440,14 @@ class InferenceConfig:
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
-    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
-        PrefixCachingEvictionPolicy.REF_ZERO
-    )
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = PrefixCachingEvictionPolicy.LRU
     """Eviction policy for prefix caching blocks. See `PrefixCachingEvictionPolicy` for options.
 
     Only applies when enable_prefix_caching is True.
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -323,17 +455,49 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
-    prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance.
-    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    prefix_caching_routing_alpha: float = 1.0
+    """How hard the coordinator penalises load when routing on prefix affinity:
+    score = cache_score - alpha * relative_load.
+
+    ``relative_load`` is a rank's in-flight count measured against the fleet mean, so it is
+    zero while ranks are even and grows only as they diverge. Both terms are normalized, which
+    makes alpha dimensionless: 0 is pure prefix affinity, and higher values divert to idle ranks
+    more readily as the fleet becomes lopsided. Must be non-negative; it is not a blend weight
+    and is not capped at 1.
+
+    At 1.0 a single request of imbalance across two ranks exactly cancels a full cache hit, so
+    affinity stops being decisive as soon as the fleet is uneven at all. The default keeps a hit
+    decisive against mild imbalance while still diverting to idle ranks once ranks genuinely
+    diverge. Larger fleets are less sensitive, since one request moves the mean less; the
+    16-engine runs this was tuned on ran at 1.0.
+
+    Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed there.
+
+    The coordinator sees blocks being routed but never blocks being evicted, so its view of
+    each engine's cache only gets staler. Entries untouched for this long are dropped. Too long
+    and it claims hits on blocks already evicted, routing for affinity and paying a cold prefill
+    anyway; too short and it forgets blocks the engine still holds.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
-    block boundaries are cached and reused across requests with matching prefixes."""
+    block boundaries are cached and reused across requests with matching prefixes.
+
+    This budget covers both buffers allocated by MambaSlotAllocator: the durable cache
+    (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
+    extraction scratch (intermediate_ssm_out/intermediate_conv_out). The scratch is
+    sized to the tighter of two per-step bounds,
+    ``min(ceil(max_tokens / block_size_tokens), 3 * max_requests)``, since a single
+    engine step can extract at most one state per block_size_tokens of its token budget
+    (and at most 3 per request). The scratch is reserved from this budget first, so a
+    smaller ``max_tokens`` (or ``max_requests``) shrinks the scratch and leaves more
+    durable cache slots."""
 
     # =================================
     # Logging config
@@ -360,10 +524,29 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
+    "flashinfer" is requested but the package is not installed."""
+
+    offset_sampling_seed_by_dp_rank: bool = True
+    """
+    If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
+    sampling RNG. This gives each DP rank a unique generation seed so that the same prompt
+    routed to different ranks produces different samples (important for RL training).
+    If False (or `ModelParallelConfig.deterministic_mode` / `--deterministic-mode` is
+    enabled), then all DP ranks share the same sampling / generation seed.
+    """
+
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    """Mode used to schedule dynamic batching inference work."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
+
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
-    consisting of the string label, the target dtype, and whether to store the data on GPU.
+    consisting of the string label and the target dtype.
     """
 
     use_synchronous_zmq_collectives: bool = False
@@ -372,9 +555,70 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
-    def __post_init__(self):
-        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+    disable_ep_consensus: bool = False
+    """If True, the engine skips the EP-group consensus all-reduce in
+    `run_engine_with_coordinator` and decides whether to step based on local
+    state alone. The rank still calls `controller.dummy_forward()` whenever
+    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
+    sync — without this, a peer running a real forward would deadlock waiting
+    on this rank's all-to-all participation. Trades off the consensus
+    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
+    """
+
+    nixl_backend: Literal["UCX", "UCCL"] = "UCX"
+    """NIXL plugin used by disaggregated KV handoff setup unless explicitly overridden."""
+
+    verbose: InitVar[bool] = False
+    """Whether to log detailed context configuration at initialization.
+    This is an InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool):
+        if self.image_preprocessing_config is not None:
+            raise NotImplementedError(
+                "image_preprocessing_config requires unsupported image inference."
+            )
+        if self.video_preprocessing_config is not None:
+            raise NotImplementedError(
+                "video_preprocessing_config requires unsupported video inference."
+            )
+        if self.vision_embedding_cache_max_bytes not in (None, 0):
+            raise NotImplementedError("vision_embedding_cache_max_bytes must be None or zero.")
+        if self.allow_stale_multimodal_embeddings is not False:
+            raise NotImplementedError("allow_stale_multimodal_embeddings must be False.")
+        self._verbose = verbose
+        self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
+        if self.nixl_backend not in ("UCX", "UCCL"):
             raise ValueError(
-                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"Unsupported nixl_backend {self.nixl_backend!r}; expected 'UCX' or 'UCCL'."
+            )
+        # Not capped at 1: alpha stopped being a blend weight when the score became
+        # cache_score - alpha * relative_load, and values above 1 are meaningful --
+        # they let load outweigh a full cache hit once ranks diverge.
+        if self.prefix_caching_routing_alpha < 0.0:
+            raise ValueError(
+                f"prefix_caching_routing_alpha must be non-negative, "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
+            )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError:
+                warnings.warn(
+                    "sampling_backend='flashinfer' was requested but the flashinfer "
+                    "package is not installed; falling back to sampling_backend='torch'."
+                )
+                self.sampling_backend = 'torch'

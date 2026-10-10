@@ -27,6 +27,9 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             sequence/token/batch offsets.
     """
 
+    multimodal_prompt_config = None
+    """Text-only prompt contract passed to NeMo's HTTP server setup."""
+
     @deprecate_args(*DEPRECATED_ARGS)
     def __init__(self, model: GPTModel, inference_context: Optional[BaseInferenceContext] = None):
         super().__init__(model, inference_context)

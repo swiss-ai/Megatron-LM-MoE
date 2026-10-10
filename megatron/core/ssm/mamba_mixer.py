@@ -347,6 +347,14 @@ class MambaMixer(MegatronModule):
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
             setattr(self.A_log, "partition_dim", 0)
+            # Persistent inference cache for -exp(A_log.float()). Allocated
+            # here (outside any later CUDA-graph capture) so its address
+            # lives in the default memory pool and stays valid across every
+            # graph capture and replay, including across RL train/eval
+            # cycles. Never freed -- the memory cost is ``nheads * 4B`` per
+            # layer (a few KB across a full model).
+            self._A_neg_exp_cache = torch.empty_like(A_log, dtype=torch.float32)
+            self._A_neg_exp_cache_stale = True
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -959,21 +967,34 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
             # Write intermediate states to pre-allocated output buffers
-            # All tensor ops, no Python loops, fully CUDA graph compatible
+            # All tensor ops, no Python loops, fully CUDA graph compatible.
+            # The destination buffers are sized to the global max_intermediate_count
+            # but we only fill the per-graph-bucket prefix; readers consult
+            # per_request_intermediate_counts to know the real count.
             if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                intermediate_ssm_out.copy_(intermediate_ssm_states)
+                n = intermediate_ssm_states.shape[0]
+                intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
 
                 # Vectorized conv state extraction
-                # intermediate_abs_positions: [max_intermediate_count]
                 # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
                 gather_positions = (
                     intermediate_abs_positions.unsqueeze(1).long()
                     + conv_gather_offsets.unsqueeze(0).long()
-                )  # [max_intermediate_count, d_conv]
+                )  # [n, d_conv]
+                # Clamp into the valid token range. Padding/warmup slots use the
+                # safe-default abs_position == d_conv, which yields gather indices
+                # [0..d_conv-1]; when the prefill sequence is shorter than d_conv
+                # (e.g. a small CUDA-graph warmup bucket with fewer than d_conv
+                # tokens), those indices overrun the token axis. Clamping keeps the
+                # gather in bounds. Real slots are always in range, so this is a
+                # no-op for them, and padding-slot results are never read (callers
+                # consult per_request_intermediate_counts).
+                seq_len = xBC_pre_conv.shape[1]
+                gather_positions = gather_positions.clamp_(0, seq_len - 1)
                 intermediate_conv = xBC_pre_conv[0, gather_positions, :]
-                # [max_intermediate_count, d_conv, conv_dim]
-                intermediate_conv_out.copy_(intermediate_conv.transpose(1, 2))
-                # [max_intermediate_count, conv_dim, d_conv]
+                # [n, d_conv, conv_dim]
+                intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))
+                # [n, conv_dim, d_conv]
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
@@ -1009,6 +1030,37 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, z)
 
         return y
+
+    @torch.no_grad()
+    def refresh_cache(self) -> None:
+        """Refresh the existing decode-cache storage from the current ``A_log``."""
+        self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+        self._A_neg_exp_cache_stale = False
+
+    def _get_decode_A_neg_exp(self) -> torch.Tensor:
+        """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
+
+        A_log is frozen during inference; recomputing it per token otherwise
+        launches three small elementwise kernels (float cast, exp, neg) that
+        rival ``selective_state_update`` itself in the decode profile. The
+        stride-0 expand view also triggers the kernel's TIE_HDIM fast path.
+        """
+        if self.training or torch.is_grad_enabled():
+            base = -torch.exp(self.A_log.float())
+            return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+        # Inference path. Refill when stale
+        if self._A_neg_exp_cache_stale:
+            self.refresh_cache()
+        return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def train(self, mode: bool = True):
+        """Mark the decode cache stale in training and refresh it for evaluation."""
+        if mode:
+            self._A_neg_exp_cache_stale = True
+        elif self._A_neg_exp_cache_stale:
+            # CUDA graph replay bypasses the Python lazy-refresh path.
+            self.refresh_cache()
+        return super().train(mode)
 
     def _ssm_decode(
         self,
@@ -1088,12 +1140,12 @@ class MambaMixer(MegatronModule):
             ],
             dim=-1,
         )
-        A = -torch.exp(self.A_log.float())
 
         # SSM step
         if selective_state_update is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
+            A = -torch.exp(self.A_log.float())
 
             x = x.squeeze(1)
             B = B.squeeze(1)
@@ -1149,7 +1201,7 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+            A = self._get_decode_A_neg_exp()
 
             # Incorporate sequence dimension in einops rearrengements
             dt = repeat(dt, "b s h -> b s h p", p=self.headdim)

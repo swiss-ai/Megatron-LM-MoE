@@ -123,13 +123,15 @@ class TestMarinQB(unittest.TestCase):
         cfg = SimpleNamespace(moe_router_fusion=False, moe_router_num_groups=None,
                               moe_router_group_topk=None, moe_router_quantile_balancing_method="marin_histogram",
                               moe_router_quantile_balancing_marin_num_bins=10000,
-                              moe_router_pre_softmax=False, moe_router_topk_scaling_factor=2.5)
+                              moe_router_pre_softmax=False, moe_router_topk_scaling_factor=2.5,
+                              moe_expert_capacity_factor=None,
+                              moe_router_quantile_balancing_freeze=False)
         beta = torch.tensor([0.2, 0.1, 0., -0.1])
         router = SimpleNamespace(config=cfg, tp_cp_group=None, tp_dp_cp_group=object(), training=True,
                                  score_function="sigmoid", topk=2, qb_beta=beta.clone(),
                                  qb_beta_accum=torch.zeros(4), qb_beta_count=torch.zeros((), dtype=torch.long))
         logits = torch.tensor([[106., 105., 100., 99.]]).repeat(8, 1)
-        weights, selected = route(router, logits)
+        weights, selected, _ = route(router, logits)
         expected = torch.zeros_like(selected).scatter_(1, (logits - beta).topk(2, dim=1).indices, True)
         sigmoid_selected = torch.zeros_like(selected).scatter_(1, (logits.sigmoid() - beta).topk(2, dim=1).indices, True)
         self.assertTrue(torch.equal(selected, expected))
@@ -160,7 +162,8 @@ class TestMarinQB(unittest.TestCase):
                                  qb_beta_count=torch.tensor(2))
         model = SimpleNamespace(modules=lambda: [module])
         config = SimpleNamespace(moe_router_quantile_balancing_method="marin_histogram",
-                                 moe_router_quantile_balancing_ema=0.)
+                                 moe_router_quantile_balancing_ema=0.,
+                                 moe_router_quantile_balancing_freeze=False)
         with patch.object(dist, "all_reduce", return_value=SimpleNamespace(wait=lambda: None)):
             finalize([model], config)
         torch.testing.assert_close(module.qb_beta, torch.tensor([-2., -1., 1., 2.]))

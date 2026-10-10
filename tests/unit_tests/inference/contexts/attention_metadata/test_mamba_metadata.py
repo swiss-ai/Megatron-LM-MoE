@@ -14,7 +14,14 @@ class TestMambaMetadata:
         """Fixture to initialize MambaMetadata with standard constraints."""
         max_requests = 16
         max_tokens = 2048
-        metadata = MambaMetadata(max_requests=max_requests, max_tokens=max_tokens)
+        # Per-step intermediate-state cap (token budget / block_size + margin);
+        # value is irrelevant to these update() tests, which don't extract state.
+        max_intermediate_count = 17
+        metadata = MambaMetadata(
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_intermediate_count=max_intermediate_count,
+        )
 
         # Manually allocate some slots to simulate a running state.
         # We assume request_id i maps to mamba_slot i for simplicity in assertions.
@@ -23,6 +30,59 @@ class TestMambaMetadata:
 
         yield metadata
         metadata.reset()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_decode_indices_dtype(self, dtype):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=16, max_intermediate_count=1, decode_indices_dtype=dtype
+        )
+
+        assert metadata._batch_indices_decode_buffer.dtype == dtype
+
+    def test_free_unbound_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+
+        slot = int(metadata.allocate_slot())
+        assert metadata.mamba_state_free_slot_count == 1
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 2
+        assert int(metadata.allocate_slot()) == slot
+
+    def test_allocated_slots_do_not_alias_free_slot_stack(self):
+        metadata = MambaMetadata(max_requests=3, max_tokens=4, max_intermediate_count=1)
+
+        slot_to_release = metadata.allocate_slot()
+        allocated_slot = metadata.allocate_slot()
+        metadata.free_slot(slot_to_release)
+
+        assert isinstance(allocated_slot, int)
+        assert allocated_slot == 1
+
+        metadata.reset()
+        slot_to_release = metadata.allocate_slot()
+        allocated_slots = metadata.batch_allocate_slots(2)
+        metadata.free_slot(slot_to_release)
+
+        assert torch.equal(allocated_slots, torch.tensor([0, 1], dtype=torch.int32))
+
+    def test_detached_live_slot_survives_request_cleanup(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        slot = int(metadata.allocate_slot())
+        metadata.request_to_mamba_state_idx[0] = slot
+
+        assert metadata.detach_state_slot(0) == slot
+        metadata.free_slots(torch.tensor([0], dtype=torch.int64))
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) != slot
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == slot
 
     def _run_update_test(
         self,
@@ -498,3 +558,66 @@ class TestMambaMetadata:
         expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
 
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+
+class TestMambaIntermediateChunkLayout:
+    @pytest.mark.parametrize(
+        "cu_seqlens,last_chunks,real_count,padded_count,expected_index",
+        [
+            # A two-token continuation straddles an original SSD boundary.
+            ([0, 2, 515], [1, 6], 2, 2, 5),
+            # Native aligned chunking retains its existing index.
+            ([0, 2, 515], [0, 5], 2, 2, 4),
+            # An empty sequence still occupies one zero-length chunk.
+            ([0, 0, 513], [0, 5], 2, 2, 4),
+            # No preceding request: the chunk range starts at zero.
+            ([0, 513], [4], 1, 1, 3),
+            # Padding adds empty chunks but must not shift real requests.
+            ([0, 2, 515, 515, 515], [1, 6, 7, 8], 2, 4, 5),
+        ],
+        ids=["partial-first", "aligned", "empty-first", "single", "padded"],
+    )
+    def test_snapshot_uses_actual_chunk_layout(
+        self, cu_seqlens, last_chunks, real_count, padded_count, expected_index
+    ):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=1024, max_intermediate_count=12, d_conv=4
+        )
+        # Supply the descriptors produced by the prefill chunk builder. The
+        # two-token partial-first case has two chunks, although ceil(2/128)=1.
+        metadata.last_chunk_indices = torch.tensor(
+            last_chunks, dtype=torch.int32, device=metadata.device
+        )
+        cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=metadata.device)
+        offsets = torch.zeros((real_count, 3), dtype=torch.int32)
+        counts = torch.zeros(real_count, dtype=torch.int32)
+        offsets[-1, 0] = 512
+        counts[-1] = 1
+
+        metadata._update_intermediate_metadata(
+            offsets, counts, real_count, padded_count, cu_seqlens_gpu=cu
+        )
+
+        assert metadata.intermediate_count == 1
+        assert metadata.intermediate_chunk_indices[0].item() == expected_index
+        assert metadata.intermediate_abs_positions[0].item() == cu_seqlens[real_count - 1] + 512
+        extent = padded_count * 3
+        assert metadata.intermediate_chunk_indices.numel() == extent
+        assert torch.all(metadata.intermediate_chunk_indices[1:] == 0)
+        assert torch.all(metadata.intermediate_abs_positions[1:] == 4)
+        chunk_ptr = metadata.intermediate_chunk_indices.data_ptr()
+        count_ptr = metadata.intermediate_real_count.data_ptr()
+
+        # The graph-facing scratch extent and addresses stay fixed when the
+        # next step has no snapshots; stale valid indices must be cleared.
+        counts.zero_()
+        metadata._update_intermediate_metadata(
+            offsets, counts, real_count, padded_count, cu_seqlens_gpu=cu
+        )
+        assert metadata.intermediate_count == 0
+        assert metadata.intermediate_real_count.item() == 0
+        assert metadata.intermediate_chunk_indices.numel() == extent
+        assert metadata.intermediate_chunk_indices.data_ptr() == chunk_ptr
+        assert metadata.intermediate_real_count.data_ptr() == count_ptr
+        assert torch.all(metadata.intermediate_chunk_indices == 0)
+        assert torch.all(metadata.intermediate_abs_positions == 4)

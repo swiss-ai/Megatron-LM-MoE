@@ -7,14 +7,15 @@ import torch
 import torch.nn as nn
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.moe.router import Router
+from megatron.core.utils import unwrap_model
 
 from .checkpointing import save_grads
-from .utils import unwrap_model
 
 
 def _get_linear_types():
     """Build tuple of linear layer types to capture gradients from."""
-    types = [nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear]
+    types = [nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear, Router]
 
     # Add Transformer Engine layers if available.
     try:

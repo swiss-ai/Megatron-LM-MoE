@@ -38,7 +38,8 @@ from megatron.core.fusions.fused_bias_ssglu import sslu, weighted_bias_ssglu_imp
 from megatron.core.fusions.fused_bias_sssglu import weighted_bias_sssglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -46,12 +47,15 @@ from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
     TEActivationFunctionBuilder,
-    apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
+)
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
+    NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.moe.experts_util import (
     grouped_swiglu_mlp_torch_ref,
@@ -73,9 +77,15 @@ from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     offloading_fp8_grouped_swiglu_mlp,
 )
 
-from megatron.core.transformer.moe.fp8_utils import (
+from megatron.core.transformer.moe.expert_checkpoint_utils import (
+    EXPERT_CKPT_HAS_TE_EXTRA_STATE_KEY,
+    apply_swiglu_sharded_factory,
     build_offloading_expert_sharded_tensor,
+    is_legacy_offloading_checkpoint,
     make_fused_experts_sharded_factory,
+    make_fused_offloading_experts_canonical_factory,
+    make_legacy_offloading_load_factory,
+    make_offloading_expert_canonical_factory,
 )
 
 from megatron.core.transformer.spec_utils import build_module
@@ -100,11 +110,7 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import (
-    InferenceGroupedGemmBackend,
-    mcore_fused_moe,
-    resolve_inference_grouped_gemm_backend,
-)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
 
@@ -700,6 +706,15 @@ class TEGroupedMLP(MegatronModule):
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        legacy_offloading = is_legacy_offloading_checkpoint(metadata)
+        has_te_extra_state = (metadata or {}).get(
+            EXPERT_CKPT_HAS_TE_EXTRA_STATE_KEY, True
+        )
+        if legacy_offloading:
+            assert not self.config.add_bias_linear, (
+                "Legacy offloading checkpoints contain expert weights only and cannot initialize "
+                "biased TEGroupedMLP experts."
+            )
         sharded_state_dict = {}
         for name, module in self._modules.items():
             module_sharded_offsets = sharded_offsets
@@ -722,7 +737,16 @@ class TEGroupedMLP(MegatronModule):
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', module_sharded_offsets, metadata, tp_group=self.tp_group
             )
-            if name == 'linear_fc1' and self.config.gated_linear_unit:
+            if name in ('linear_fc1', 'linear_fc2') and legacy_offloading:
+                for i in range(self.num_local_experts):
+                    key = f'{name}.weight{i}'
+                    if key in sub_sd:
+                        sub_sd[key] = make_legacy_offloading_load_factory(
+                            sub_sd[key],
+                            name,
+                            gated=(name == 'linear_fc1' and self.config.gated_linear_unit),
+                        )
+            elif name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
                 ep_axis = len(sharded_offsets)
@@ -739,6 +763,8 @@ class TEGroupedMLP(MegatronModule):
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
                             )
+            if not has_te_extra_state:
+                sub_sd = {k: v for k, v in sub_sd.items() if '_extra_state' not in k}
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:
@@ -763,10 +789,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
-    Supports three forward paths:
-    - Training: delegates to parent TEGroupedMLP
-    - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    Uses the explicit inference backend selected in the config. The TE backend delegates
+    to TEGroupedMLP with CPU expert token counts; FlashInfer and torch use optimized
+    inference paths. Non-TE backends delegate to TEGroupedMLP during training.
     """
 
     def __init__(
@@ -788,13 +813,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
 
-        self.is_inference_cuda_graphed_iteration = False
-
-        if HAVE_FLASHINFER:
-            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
-
-        self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
+        if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE:
+            if HAVE_FLASHINFER:
+                self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+
+            self._mcore_activation_type = self._resolve_mcore_activation_type()
+        self._nvls_dispatcher = getattr(config, "inference_moe_token_dispatcher_type", "nccl") == "nvls"
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -819,14 +844,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = False
-
+    # Later refits update these buffers, so create normal tensors without tracking gradients.
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
 
@@ -843,6 +863,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         intended for non-colocated inference.
         """
 
+        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
@@ -857,13 +878,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
                         f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
                         f"got {type(w).__name__}. Was quantize_model_to_mxfp8 called?"
                     )
+                validate_mxfp8_tensor(
+                    mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
+                )
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
-            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+            setattr(
+                self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
+            )
 
             # Redirect per-expert weight .data to views into the stacked buffer,
             # mirroring _build_concatenated_weights. This frees the original
@@ -922,7 +948,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
-        """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
+        """FlashInfer fused MoE kernel for optimized inference."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
         output = fused_moe.cutlass_fused_moe(
@@ -936,12 +962,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
+            output=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )[0]
         return output, None
 
-    def _mcore_fused_moe_forward(
-        self, hidden_states, probs, routing_map=None, tokens_per_expert=None, skip_permute=False
-    ):
+    def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
@@ -952,10 +977,28 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
-            tokens_per_expert=tokens_per_expert,
-            skip_permute=skip_permute,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+        )
+        return output, None
+
+    def _vllm_forward(self, hidden_states, probs, routing_map):
+        """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
+        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        output = vllm_fused_moe(
+            hidden_states,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+            activation_type=self._mcore_activation_type,
+            num_local_experts=self.num_local_experts,
+            local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            routing_map=routing_map,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
         )
         return output, None
 
@@ -966,22 +1009,23 @@ class InferenceGroupedMLP(TEGroupedMLP):
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward using the configured inference backend.
 
-        - Training: delegates to parent TEGroupedMLP.
-        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
-          is not used in this path; the FlashInfer kernel operates directly on
-          routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        The TE backend delegates directly to TEGroupedMLP, including in eval mode.
+        Other backends delegate to TEGroupedMLP during training; inference uses
+        FlashInfer or torch grouped_mm with GPU-resident offsets.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
             tokens_per_expert: [num_experts] number of tokens routed to each expert.
-                None when using the CUDA-graphed FlashInfer path.
+                Required for TE; unused by the optimized inference paths.
             permuted_probs: [num_tokens, topk] routing probabilities.
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
-                Required for the FlashInfer CUDA-graphed path, None otherwise.
+                Required for optimized inference; unused by TE.
         """
+
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE:
+            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         if self.training:
             assert (
@@ -1000,30 +1044,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
-        resolved_backend = resolve_inference_grouped_gemm_backend(
-            self.inference_grouped_gemm_backend,
-            self.is_inference_cuda_graphed_iteration,
-            is_mxfp8=self.config.fp8_recipe == "mxfp8",
-        )
-
-        if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
-            assert (
-                self.is_inference_cuda_graphed_iteration
-            ), "FlashInfer forward path is only used in CUDA-graphed inference iterations."
+            assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(
-                permuted_local_hidden_states,
-                permuted_probs,
-                routing_map=routing_map,
-                tokens_per_expert=tokens_per_expert,
-                skip_permute=(not self.is_inference_cuda_graphed_iteration),
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TE:
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+            assert routing_map is not None, "routing_map is required for vLLM forward pass."
+            assert not self.training, "vLLM forward path is only used in inference mode."
+            return self._vllm_forward(
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+            )
 
 
 class SequentialMLP(MegatronModule):
@@ -1183,7 +1219,6 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
-    
 
 
 class OffloadingExpertsMLP(MegatronModule):
@@ -1840,19 +1875,15 @@ class OffloadingExpertsMLP(MegatronModule):
         self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
     
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Maps local experts to global experts (interchangeable across variants).
+        """Maps local experts to the canonical Sequential/TE expert schema.
 
-        Both OffloadingExpertsMLP variants emit the same per-expert, expert-parallel
-        sharded layout under keys ``{prefix}experts.weight{1,2}`` in ``(in, out)``
-        orientation, so a checkpoint saved by one is loadable by the other:
-
-        - bf16 variant: per-expert params already ``(in, out)`` -> saved directly.
-        - inplace-fp8 variant: a single fused ``(num_local, out, in)`` master is
-          transposed per expert via a ``ShardedTensorFactory`` (one per fused
-          param, keyed by the real param name so ``load_state_dict`` maps it back).
+        New checkpoints use ``experts.linear_fc{1,2}.weight`` in TE's ``(out, in)``
+        orientation. A checkpoint marked ``legacy_offloading`` instead requests the previous
+        private ``experts.weight{1,2}`` schema for backward-compatible loading.
         """
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        legacy_offloading = is_legacy_offloading_checkpoint(metadata)
         assert self.tp_group.size() == 1, "OffloadingExpertsMLP assumes ETP size == 1"
 
         num_global_experts = self.ep_group.size() * self.num_local_experts
@@ -1870,49 +1901,71 @@ class OffloadingExpertsMLP(MegatronModule):
             )
             sharded_state_dict = {}
             for wname, fused_weight in (('weight1', self.weight1), ('weight2', self.weight2)):
-                sharded_state_dict[f'{prefix}{wname}'] = make_fused_experts_sharded_factory(
-                    fused_weight,
-                    prefix,
-                    wname,
-                    num_local_experts=self.num_local_experts,
-                    local_expert_indices_offset=local_expert_indices_offset,
-                    num_global_experts=num_global_experts,
-                    sharded_offsets=sharded_offsets,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                )
+                if legacy_offloading:
+                    factory = make_fused_experts_sharded_factory(
+                        fused_weight,
+                        prefix,
+                        wname,
+                        num_local_experts=self.num_local_experts,
+                        local_expert_indices_offset=local_expert_indices_offset,
+                        num_global_experts=num_global_experts,
+                        sharded_offsets=sharded_offsets,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                    )
+                else:
+                    linear_name = 'linear_fc1' if wname == 'weight1' else 'linear_fc2'
+                    factory = make_fused_offloading_experts_canonical_factory(
+                        fused_weight,
+                        prefix,
+                        wname,
+                        linear_name,
+                        num_local_experts=self.num_local_experts,
+                        local_expert_indices_offset=local_expert_indices_offset,
+                        num_global_experts=num_global_experts,
+                        sharded_offsets=sharded_offsets,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                        gated=(wname == 'weight1' and self.config.gated_linear_unit),
+                    )
+                sharded_state_dict[f'{prefix}{wname}'] = factory
             return sharded_state_dict
 
         sharded_state_dict = {}
         for i in range(self.num_local_experts):
             g_idx = local_expert_indices_offset + i
-            w1 = getattr(self, f'weight1_expert_{i}')
-            w2 = getattr(self, f'weight2_expert_{i}')
-
-            sharded_state_dict[f'{prefix}weight1_expert_{i}'] = (
-                build_offloading_expert_sharded_tensor(
-                    w1,
-                    prefix,
-                    'weight1',
-                    g_idx,
-                    sharded_offsets=sharded_offsets,
-                    num_global_experts=num_global_experts,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                    transpose=False,
-                )
-            )
-            sharded_state_dict[f'{prefix}weight2_expert_{i}'] = (
-                build_offloading_expert_sharded_tensor(
-                    w2,
-                    prefix,
-                    'weight2',
-                    g_idx,
-                    sharded_offsets=sharded_offsets,
-                    num_global_experts=num_global_experts,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                    transpose=False,
-                )
-            )
+            for weight_name, linear_name in (
+                ('weight1', 'linear_fc1'),
+                ('weight2', 'linear_fc2'),
+            ):
+                parameter_name = f'{weight_name}_expert_{i}'
+                weight = getattr(self, parameter_name)
+                if legacy_offloading:
+                    shard = build_offloading_expert_sharded_tensor(
+                        weight,
+                        prefix,
+                        weight_name,
+                        g_idx,
+                        sharded_offsets=sharded_offsets,
+                        num_global_experts=num_global_experts,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                        transpose=False,
+                    )
+                else:
+                    shard = make_offloading_expert_canonical_factory(
+                        weight,
+                        prefix,
+                        parameter_name,
+                        linear_name,
+                        global_expert_idx=g_idx,
+                        num_global_experts=num_global_experts,
+                        sharded_offsets=sharded_offsets,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                        gated=(
+                            linear_name == 'linear_fc1' and self.config.gated_linear_unit
+                        ),
+                    )
+                sharded_state_dict[f'{prefix}{parameter_name}'] = shard
         return sharded_state_dict

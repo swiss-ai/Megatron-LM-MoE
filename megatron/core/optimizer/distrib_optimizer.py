@@ -48,18 +48,23 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..distributed.param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    group_params_for_buffers,
+    partition_buckets,
+)
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
-    _propagate_routing_attrs,
     _zero_grad_group_helper,
+    copy_optimizer_param_metadata,
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
+from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
 
@@ -190,6 +195,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
         data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
 
+        # The layout records how many shards it was built for. That count has to match the group
+        # the reduce-scatter and all-gather run over, which is the intra-instance group when
+        # there are several optimizer instances. If the layout was sized by a larger group, the
+        # trailing shards of every bucket belong to no rank: those params are never updated and
+        # drop out of grad-norm, num-zeros and params-norm, which sum over owned shards only.
+        num_optimizer_shards = param_and_grad_buffer.num_optimizer_shards
+        assert num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size, (
+            f"Parameter layout was built for {num_optimizer_shards} optimizer shards but the "
+            f"buffer's data-parallel group has {data_parallel_world_size} ranks. Size the layout "
+            f"by the group the optimizer shards over."
+        )
+
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
         assert (
@@ -221,6 +238,133 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data = {"param_map": param_range_map}
 
         return data
+
+    @staticmethod
+    def _compute_per_buffer_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        param_indices: Optional[List[int]] = None,
+    ) -> PerBufferParamLayout:
+        """Compute how parameters should be laid out in the contiguous buffer.
+
+        Iterates params in reverse order (backprop order), applies 64-byte param
+        alignment, bucket-end padding for DP divisibility, and shared-embedding
+        bucket splitting.
+
+        Args:
+            params: List of parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for single bucket.
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: DistributedDataParallel config object.
+            param_indices: Optional indices for each param among same-dtype params.
+
+        Returns:
+            PerBufferParamLayout with the computed mapping.
+        """
+
+        def _does_param_require_new_bucket(param):
+            return getattr(param, "shared_embedding", False)
+
+        param_index_map = {}
+        bucket_indices = []
+        per_bucket_numel_unpadded = []
+
+        param_start_index = 0
+        bucket_start_index = 0
+        bucket_params = set()
+        bucket_id = 0
+
+        def _finalize_bucket(param_end_index, bucket_start_index, bucket_id):
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_end_index = pad_bucket_end(
+                param_end_index,
+                data_parallel_world_size,
+                ddp_config.pad_buckets_for_high_nccl_busbw,
+            )
+            bucket_indices.append((bucket_start_index, bucket_end_index))
+            return bucket_end_index, bucket_id + 1
+
+        for param in params[::-1]:
+            param_start_index = pad_param_start(param_start_index)
+
+            # Split shared embedding params into separate bucket.
+            if _does_param_require_new_bucket(param) and bucket_params:
+                bucket_start_index, bucket_id = _finalize_bucket(
+                    param_start_index, bucket_start_index, bucket_id
+                )
+                bucket_params = set()
+                param_start_index = bucket_start_index
+
+            param_numel = param.data.nelement()
+            param_end_index = param_start_index + param_numel
+            param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            bucket_params.add(param)
+
+            if (
+                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
+            ) or _does_param_require_new_bucket(param):
+                bucket_start_index, bucket_id = _finalize_bucket(
+                    param_end_index, bucket_start_index, bucket_id
+                )
+                bucket_params = set()
+                param_start_index = bucket_start_index
+            else:
+                param_start_index = param_end_index
+
+        if bucket_params:
+            _finalize_bucket(param_end_index, bucket_start_index, bucket_id)
+
+        return PerBufferParamLayout(
+            param_index_map=param_index_map,
+            bucket_indices=bucket_indices,
+            per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+            param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
+        )
+
+    @staticmethod
+    def compute_full_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        expert_data_parallel_world_size: Optional[int] = None,
+    ) -> FullParamLayout:
+        """Compute parameter layouts for all buffer groups.
+
+        Groups parameters by (param_dtype, grad_dtype, is_expert_parallel), then
+        computes a padded PerBufferParamLayout for each group. Expert-parallel groups use
+        expert_data_parallel_world_size for padding alignment.
+
+        Args:
+            params: List of all parameters to lay out.
+            bucket_size: Approximate number of elements per bucket, or None for a single bucket.
+            data_parallel_world_size: Size of the data-parallel group for dense params.
+            ddp_config: DistributedDataParallel config object.
+            expert_data_parallel_world_size: Size of the expert data-parallel group.
+                Required if any expert-parallel params are present. Defaults to
+                data_parallel_world_size if not provided.
+
+        Returns:
+            FullParamLayout with a PerBufferParamLayout per buffer group.
+        """
+        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        layouts = {}
+        for buffer_key, (group_params, param_indices) in buffer_groups.items():
+            if buffer_key.is_expert_parallel:
+                dp_world_size = (
+                    expert_data_parallel_world_size
+                    if expert_data_parallel_world_size is not None
+                    else data_parallel_world_size
+                )
+            else:
+                dp_world_size = data_parallel_world_size
+            layouts[buffer_key] = DistributedOptimizer._compute_per_buffer_param_layout(
+                group_params, bucket_size, dp_world_size, ddp_config, param_indices
+            )
+        return FullParamLayout(layouts=layouts)
 
     @classmethod
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
@@ -376,9 +520,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_model_param.shared = model_param.shared
-                        _propagate_routing_attrs(shard_model_param, model_param)
+                        copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -412,9 +554,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_main_param.shared = model_param.shared
-                        _propagate_routing_attrs(shard_main_param, model_param)
+                        copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -436,9 +576,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
-                    if hasattr(model_param, 'shared'):
-                        shard_model_param.shared = model_param.shared
-                    _propagate_routing_attrs(shard_model_param, model_param)
+                    copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:
                     raise TypeError(

@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 from abc import abstractmethod
 from functools import partial
-from typing import Optional, Protocol, cast
+from typing import Literal, Optional, Protocol, cast
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
@@ -87,7 +87,9 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False,) -> ExpertsBuilder:
+    def grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         ...
 
@@ -132,14 +134,11 @@ class LocalSpecProvider(BackendSpecProvider):
         return DotProductAttention
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool,
-        moe_use_offloading_experts: bool = False,
+        self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False
     ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         if moe_use_offloading_experts:
-            return partial(
-                OffloadingExpertsMLP,
-            )
+            return partial(OffloadingExpertsMLP)
         return partial(
             SequentialMLP,
             submodules=MLPSubmodules(
@@ -198,8 +197,12 @@ class InferenceSpecProvider(BackendSpecProvider):
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
 
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
+    def grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
+        if moe_use_offloading_experts:
+            raise NotImplementedError("InferenceGroupedMLP does not support offloading experts")
         return partial(
             InferenceGroupedMLP,
             submodules=GroupedMLPSubmodules(
@@ -208,3 +211,19 @@ class InferenceSpecProvider(BackendSpecProvider):
                 activation_func=self.activation_func(),
             ),
         )
+
+
+def get_backend(
+    transformer_impl: Literal["local", "transformer_engine", "inference_optimized"]
+) -> BackendSpecProvider:
+    """Return the backend that's selected with the given `transformer_impl`."""
+    if transformer_impl == "transformer_engine":
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+        return TESpecProvider()
+    elif transformer_impl == "inference_optimized":
+        return InferenceSpecProvider()
+    elif transformer_impl == "local":
+        return LocalSpecProvider()
+    else:
+        raise ValueError(f"unknown transformer_impl='{transformer_impl}'")

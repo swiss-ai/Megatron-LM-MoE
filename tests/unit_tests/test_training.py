@@ -3,13 +3,19 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.core.utils import get_pg_size
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import build_train_valid_test_data_iterators, get_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -79,6 +85,101 @@ class TestTraining:
                     vocab,
                     mult,
                 )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+
+class TestLegacyLayoutProcessGroups:
+    """Legacy DDP layout uses the MPU groups that DDP resolves with no collection."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+
+    def test_legacy_dist_opt_layout_uses_ddp_mpu_groups(self):
+        """Legacy layout follows DDP's MPU groups, even if the DDP count is stale."""
+        args = SimpleNamespace(
+            init_model_with_meta_device=True,
+            virtual_pipeline_model_parallel_size=None,
+            use_torch_fsdp2=False,
+            use_megatron_fsdp=False,
+            fp16=False,
+            bf16=False,
+            use_distributed_optimizer=True,
+            overlap_param_gather_with_optimizer_step=False,
+            data_parallel_random_init=False,
+        )
+        set_args(args)
+
+        external_pg = Mock()
+        for name in ("dp", "cp", "tp", "pp"):
+            getattr(external_pg, name).rank.return_value = 0
+        external_pg.pp.size.return_value = 1
+        external_pg.intra_dp_cp.size.return_value = 123
+        external_pg.intra_expt_dp.size.return_value = 456
+        external_pg.dp_cp.size.return_value = 789
+        external_pg.expt_dp.size.return_value = 654
+
+        stream_context = MagicMock()
+        stream_context.__enter__.return_value = None
+        stream_context.__exit__.return_value = False
+        for num_instances in (1, 2):
+            ddp_config = DistributedDataParallelConfig(
+                use_distributed_optimizer=True,
+                num_distributed_optimizer_instances=num_instances,
+                overlap_grad_reduce=True,
+                bucket_size=128,
+            )
+            with (
+                patch("megatron.training.training.has_nvidia_modelopt", False),
+                patch(
+                    "megatron.training.training.get_megatron_ddp_config", return_value=ddp_config
+                ),
+                patch("megatron.training.training.get_model_config", return_value=Mock()),
+                patch("megatron.training.training.get_pg_rank", return_value=0),
+                patch("megatron.training.training.correct_amax_history_if_needed"),
+                patch(
+                    "megatron.training.training.to_empty_if_meta_device",
+                    side_effect=lambda m, **_: m,
+                ),
+                patch(
+                    "megatron.training.training.tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes"
+                ),
+                patch.object(
+                    DistributedOptimizer, "compute_full_param_layout", return_value="LAYOUT"
+                ) as layout,
+                patch("megatron.training.training.DDP", return_value=Mock()) as ddp,
+                patch("torch.cuda.Stream", return_value=Mock()),
+                patch("torch.cuda.current_stream") as current_stream,
+                patch("torch.cuda.stream", return_value=stream_context),
+            ):
+                current_stream.return_value.wait_stream = Mock()
+                get_model(
+                    lambda **_: torch.nn.Linear(2, 2), wrap_with_ddp=True, pg_collection=external_pg
+                )
+
+            resolved_groups = ProcessGroupCollection.setup_process_groups_for_ddp(
+                None, SimpleNamespace(context_parallel_size=1), ddp_config
+            )
+            layout_call = layout.call_args
+            if num_instances == 1:
+                assert get_pg_size(resolved_groups["intra_dp_cp_group"]) < get_pg_size(
+                    resolved_groups["dp_cp_group"]
+                )
+                assert get_pg_size(resolved_groups["intra_expt_dp_group"]) < get_pg_size(
+                    resolved_groups["expt_dp_group"]
+                )
+            assert layout_call.args[2] == get_pg_size(resolved_groups["intra_dp_cp_group"])
+            assert layout_call.kwargs["expert_data_parallel_world_size"] == get_pg_size(
+                resolved_groups["intra_expt_dp_group"]
+            )
+            assert layout_call.args[2] != external_pg.intra_dp_cp.size.return_value
+            assert (
+                layout_call.kwargs["expert_data_parallel_world_size"]
+                != external_pg.intra_expt_dp.size.return_value
+            )
+            assert ddp.call_args.kwargs["full_param_layout"] == "LAYOUT"
+            assert "pg_collection" not in ddp.call_args.kwargs
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

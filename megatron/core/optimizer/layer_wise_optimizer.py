@@ -17,6 +17,8 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
+    _get_param_grad_norm_group,
+    _validate_grad_norm_group,
 )
 from .optimizer_config import OptimizerConfig
 
@@ -61,6 +63,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+
+        intra_dp_cp = (
+            getattr(pg_collection, 'intra_dp_cp', None) if pg_collection is not None else None
+        )
+        # LayerWise assigns whole params to ranks of the full dp_cp group and all-gathers over
+        # that same group, so it has no notion of optimizer instances. With more than one
+        # instance, DDP reduce-scatters gradients over the smaller intra-instance group, so a
+        # rank would be asked to update params whose gradients it does not hold. Reject the
+        # combination instead of silently training on partial gradients.
+        assert intra_dp_cp is None or get_pg_size(intra_dp_cp) == get_pg_size(
+            pg_collection.dp_cp
+        ), (
+            "LayerWiseDistributedOptimizer does not support "
+            "num_distributed_optimizer_instances > 1."
+        )
+
         self.shard_params(optimizers)
 
         # Set up async all-gather using DDP bucket infrastructure.
@@ -324,12 +342,42 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        # similar to dist opt, always aggregate globally
+        # Similar to DistributedOptimizer, always aggregate globally.
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
-            grads_for_norm += optimizer.get_main_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
-        return grad_norm
+            grads_for_norm += optimizer.get_grads_for_grad_norm()
+        return get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+
+    def has_grad_norm_group(self, grad_norm_group: str) -> bool:
+        """Whether any global rank owns parameters in a registered group."""
+        _validate_grad_norm_group(grad_norm_group)
+        if getattr(self, '_has_grad_norm_group_cache', None) is None:
+            self._has_grad_norm_group_cache = {}
+        cache = self._has_grad_norm_group_cache
+        if grad_norm_group not in cache:
+            local = False
+            for optimizer in self.chained_optimizers:
+                for param in optimizer.get_parameters():
+                    param_grad_norm_group = _get_param_grad_norm_group(param)
+                    if param_grad_norm_group is not None:
+                        _validate_grad_norm_group(param_grad_norm_group)
+                        local = local or param_grad_norm_group == grad_norm_group
+            # Presence is reduced on the optimizer's CUDA/NCCL device even when
+            # model parameters are CPU-offloaded (e.g. BF16 or expert params).
+            flag = torch.tensor(
+                [1 if local else 0], dtype=torch.int, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=None)
+            cache[grad_norm_group] = bool(flag.item() > 0)
+        return cache[grad_norm_group]
+
+    @torch.no_grad()
+    def _get_grad_norm_for_group(self, grad_norm_group: str):
+        _validate_grad_norm_group(grad_norm_group)
+        grads_for_norm = []
+        for optimizer in self.chained_optimizers:
+            grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
+        return get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
 
     @torch.no_grad()
     def count_zeros(self):
@@ -339,7 +387,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=None,
-            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            or (
+                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                self.config.use_precision_aware_optimizer
+                and params
+                and getattr(params[0], "__fsdp_param__", False)
+            ),
             tp_group=self.pg_collection.tp,
             expt_tp_group=self.pg_collection.expt_tp,
         )

@@ -20,6 +20,13 @@ class Headers(Enum):
     STOP = auto()
     DISCONNECT = auto()
     SHUTDOWN = auto()
+    TP_BROADCAST = auto()
+    ENGINE_REPLY_PARTIAL = auto()
+    ABORT_REQUEST = auto()
+    SUBMIT_REQUEST_WITH_KV = auto()  # Decode-side KV import.
+    RELEASE_KV = auto()  # Free pinned handoff blocks.
+    SEND_KV = auto()  # Tell the prefill engine to send a handoff's KV.
+    KV_HANDOFF_COMPLETE = auto()  # Internal MP-wide decode admission decision.
 
 
 class UnknownHeaderError(Exception):

@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -12,7 +14,10 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
@@ -41,6 +46,35 @@ class TestMambaBlock:
         return MambaStack(
             transformer_config,
             modules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+
+    def get_dsa_hybrid_block(self, layer_pattern):
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = MLATransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+        )
+        return HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
             layer_type_list=layer_type_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
@@ -104,6 +138,22 @@ class TestMambaBlock:
         assert isinstance(layers[1], TransformerLayer)
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], MambaLayer)
+
+    def test_dsa_layer_types(self):
+        """D creates a Hybrid TransformerLayer with the upstream DSA provider."""
+        block = self.get_dsa_hybrid_block(Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA)
+        layers = block.layers
+        assert isinstance(layers[0], MambaLayer)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, MLASelfAttention)
+        assert isinstance(layers[1].self_attention.core_attention, DSAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_mixed_attention_and_dsa_layer_types_fail(self):
+        with pytest.raises(ValueError, match="both Attention and MLA/DSA"):
+            self.get_dsa_hybrid_block(
+                Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
+            )
 
     def test_gdn_gpu_forward(self):
         """Test GPU forward pass with GDN, attention, and Mamba layers."""
