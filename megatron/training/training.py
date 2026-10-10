@@ -2021,23 +2021,34 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
-        # Zero spurious non-finite grad elements (nan/inf -> 0) so a rare artifact
-        # (e.g. the fp8-offloading wgrad GEMM on a near-dead expert) can't poison
-        # the grad-norm below / the optimizer step. Gated by NAN_DEBUG_SANITIZE=1
-        # (a true no-op otherwise). Runs after backward, before prepare_grad_norm()
-        # and the optimizer consume the grads. To get mask-and-continue behavior,
-        # pair NAN_DEBUG_SANITIZE=1 with CHECK_NAN=0 (the param_and_grad_buffer
-        # NaN check is fatal and fires DURING backward, before this runs).
-        from megatron.training.nan_debug import nan_debug_check_grads, nan_debug_sanitize_grads
-        # Inspect before sanitization removes the evidence of non-finite gradients.
+        from megatron.training.nan_debug import (
+            nan_debug_check_grads,
+            nan_debug_sanitize_grads,
+            nan_debug_sanitize_after_grad_norm,
+        )
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        # Inspect before sanitization removes non-finite gradient evidence.
         nan_debug_check_grads(model, iteration + 1)
-        nan_debug_sanitize_grads(model)
+
+        use_checked_grad_norm = (
+            args.optimizer == 'md_decoupling'
+            and args.check_grad_norm
+            and isinstance(optimizer, LayerWiseDistributedOptimizer)
+        )
+        # MuonMD reuses its existing norm check; other paths retain the explicit
+        # finite check. CHECK_NAN=0 disables checks during backward before repair.
+        if not use_checked_grad_norm:
+            nan_debug_sanitize_grads(model, iteration + 1)
 
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:
             from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
             from functools import partial
             if isinstance(optimizer, LayerWiseDistributedOptimizer):
                 found_inf_flag, grad_norm = optimizer.prepare_grad_norm()
+                found_inf_flag, grad_norm = nan_debug_sanitize_after_grad_norm(
+                    model, optimizer, iteration + 1, found_inf_flag, grad_norm
+                )
                 rerun_state_machine.validate_result(
                     result=(found_inf_flag, grad_norm),
                     rejection_func=partial(
