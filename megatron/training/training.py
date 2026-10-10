@@ -1943,6 +1943,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        from megatron.training.nan_debug import nan_debug_new_step
+        # Reset diagnostics for every attempt, including reruns of the same step.
+        nan_debug_new_step(iteration + 1, model)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2025,7 +2028,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # and the optimizer consume the grads. To get mask-and-continue behavior,
         # pair NAN_DEBUG_SANITIZE=1 with CHECK_NAN=0 (the param_and_grad_buffer
         # NaN check is fatal and fires DURING backward, before this runs).
-        from megatron.training.nan_debug import nan_debug_sanitize_grads
+        from megatron.training.nan_debug import nan_debug_check_grads, nan_debug_sanitize_grads
+        # Inspect before sanitization removes the evidence of non-finite gradients.
+        nan_debug_check_grads(model, iteration + 1)
         nan_debug_sanitize_grads(model)
 
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:

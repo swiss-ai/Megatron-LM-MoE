@@ -103,7 +103,14 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            # EP experts can be distinct across dense TP ranks. Filter replicas
+            # within the parameter's own TP domain before collecting its norm.
+            tp_group = (
+                mpu.get_expert_tensor_parallel_group()
+                if getattr(param, 'expert_tp', False) or not getattr(param, 'allreduce', True)
+                else mpu.get_tensor_model_parallel_group()
+            )
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group)
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
