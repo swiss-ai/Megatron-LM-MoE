@@ -2762,7 +2762,13 @@ def save_checkpoint_and_time(
     for model_chunk in model:
         if hasattr(model_chunk, 'free_overlap_buffers'):
             model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # Only async saves need the headroom. A synchronous save copies shards from this
+    # process, and empty_cache() unmaps segments NCCL registered for pipeline-parallel
+    # P2P (see the note in load_checkpoint's caller) and forces the whole cache to be
+    # re-mapped on the first step after the save, which is where the tightest stage
+    # ran out of memory.
+    if args.async_save:
+        torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED

@@ -202,10 +202,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """All-gather updated params from all ranks."""
 
         # helper function to flatten local params, all-gather,
-        # unflatten and copy to model params
-        def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+        # unflatten and copy to model params. One flat buffer (and one collective) needs a
+        # single dtype, so the params of one dtype are gathered at a time.
+        def _allgather_single_dtype(params_list, group, dtype):
+            device = next(p.device for params in params_list for p in params)
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
@@ -237,6 +237,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 updated_params = _unflatten_dense_tensors(gather_list[idx], params)
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
+
+        def _allgather_helper(params_list, group):
+            # A shard can mix dtypes (fp32 KDA decay params next to bf16 weights). params_list
+            # holds every rank's shard, so all ranks derive the same dtype order and issue
+            # the same collectives; a rank with no params of a dtype sends an empty tensor.
+            dtypes = sorted({p.dtype for params in params_list for p in params}, key=str)
+            for dtype in dtypes:
+                _allgather_single_dtype(
+                    [[p for p in params if p.dtype == dtype] for params in params_list],
+                    group,
+                    dtype,
+                )
 
         def _allgather_helper_experts_param(params_list, group):
             rank = get_pg_rank(group)
