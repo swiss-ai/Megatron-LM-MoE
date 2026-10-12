@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -69,8 +70,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cross_entropy_loss_fusion": True,
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
-    "cuda_graph_scope": [],
+    "cuda_graph_modules": [],
     "cuda_graph_use_single_mempool": False,
+    "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
@@ -285,9 +287,16 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "inference_cuda_graph_scope": {
+        "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
+        "_name_": "none",
+        "_sort_order_": 0,
+        "_value_": 1,
+    },
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
-    "inference_grouped_gemm_backend": "auto",
+    "inference_grouped_gemm_backend": "te",
+    "inference_moe_token_dispatcher_type": "nccl",
     "inference_moe_disable_fused_quant_kernels": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
@@ -485,6 +494,7 @@ class TestMambaMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 

@@ -1,11 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import hashlib
 import time
+import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -76,53 +77,52 @@ class Status(Enum):
 # Hash computation for prefix caching
 # =========================================================================
 
-# Constants for hash computation
-# Using 2^61 - 1 (Mersenne prime) for ~10^18 hash space, reducing collision probability
-# from ~10^-9 to ~10^-18 compared to the previous prime (1000000007).
-HASH_PRIME = 2305843009213693951
-HASH_BASE = 31
 
-_hash_powers: Optional[torch.Tensor] = None
+def compute_block_hashes_batched(
+    prompt_tokens: torch.Tensor, block_size: int, cache_salt: Optional[str] = None
+) -> List[int]:
+    """Compute SHA-256 based hashes for all complete blocks in a prompt.
 
-
-def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
-    """Compute hashes for all complete blocks in a prompt in one batched operation.
-
-    Reshapes prompt tokens into [num_blocks, block_size], computes all per-block
-    token hashes via a single GPU matmul, transfers results with one .tolist() call,
-    and chains parent hashes on CPU.
+    Each block hash is computed as SHA-256(parent_digest || block_bytes), where
+    parent_digest chains from the previous block (starting from a zero digest).
+    This provides cryptographic collision resistance with no exploitable algebraic
+    structure.
 
     Args:
         prompt_tokens: All prompt token IDs, shape [seq_len].
         block_size: Number of tokens per block.
+        cache_salt: Optional request-input identity mixed into the hash chain.
 
     Returns:
-        List of positive integer hash values (1 to HASH_PRIME), one per complete block.
+        List of positive integer hash values in [1, 2^63-1], one per complete block.
     """
     num_complete_blocks = len(prompt_tokens) // block_size
     if num_complete_blocks == 0:
         return []
 
-    global _hash_powers
-    if _hash_powers is None or _hash_powers.shape[0] != block_size:
-        positions = torch.arange(block_size, device=prompt_tokens.device, dtype=torch.int64)
-        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+    # Single GPU->CPU transfer, get contiguous bytes
+    tokens_cpu = prompt_tokens[: num_complete_blocks * block_size].to(torch.int64).cpu()
+    tokens_bytes = tokens_cpu.numpy().tobytes()
+    block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
-    # Reshape to [num_blocks, block_size] (zero-copy view) and compute all token hashes
-    blocks = prompt_tokens[: num_complete_blocks * block_size].view(num_complete_blocks, block_size)
-    token_hashes = (blocks.to(torch.int64) * _hash_powers).sum(dim=1) % HASH_PRIME
+    hashes = []
+    if cache_salt is None:
+        parent_digest = b'\x00' * 32  # Preserve unsalted text-only hash compatibility.
+    else:
+        parent_digest = hashlib.sha256(
+            b"megatron-prefix-cache-salt-v1\0" + cache_salt.encode()
+        ).digest()
 
-    # Single GPU→CPU transfer
-    token_hashes_list = token_hashes.tolist()
+    for i in range(num_complete_blocks):
+        block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
+        digest = hashlib.sha256(parent_digest + block_bytes).digest()
 
-    # Chain parent hashes on CPU (C-level accumulate, no Python loop)
-    hashes = list(
-        accumulate(
-            token_hashes_list,
-            lambda parent, th: (parent * HASH_BASE + th) % HASH_PRIME + 1,
-            initial=0,
-        )
-    )[1:]
+        # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
+        raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
+        hash_val = (raw % (2**63 - 1)) + 1
+
+        hashes.append(hash_val)
+        parent_digest = digest  # Full 32-byte digest chains into next block
 
     return hashes
 
@@ -140,6 +140,10 @@ class InferenceRequest:
     sampling_params: Optional[SamplingParams] = None
     inference_parameters: Optional[SamplingParams] = None
     prompt_tokens: Optional[List[int]] = None
+    # Prompt token count. Always populated when serializing a finished request so the
+    # API can report usage.prompt_tokens even when the prompt_tokens tensor itself is
+    # dropped from the payload (see SamplingParams.return_prompt_tokens).
+    prompt_length: Optional[int] = None
     arrival_time: Optional[float] = None
     status: Optional[Status] = None
     encoder_prompt: Optional[str] = None
@@ -354,6 +358,9 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
+    # `request_id` is per-engine, do not cross DP, and do not persist.
+    # A uuid is globally unique and can be used to track down individual requests.
+    uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
@@ -361,18 +368,32 @@ class DynamicInferenceRequest(InferenceRequest):
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
+    # MoE routing reconstructed from cached blocks or accumulated across steps.
     routing_indices: Optional[torch.Tensor] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    # Consecutive steps deferred by CUDA-graph-aware admission, used for starvation warnings.
+    cg_wait_iters: int = 0
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+    # Prompt tokens whose prefill was skipped via prefix caching; accumulated across chunks.
+    num_cached_tokens: int = 0
+    # Length of the leading run of this request's blocks that was obtained by hash
+    # match rather than computed. Accumulated across prefill chunks by the context,
+    # which uses it to avoid rewriting KV into blocks that already hold it.
+    num_matched_prefix_blocks: int = 0
+    block_hash_salt: Optional[str] = None
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
+
+    # KV handoff metadata describing this request's pinned prefill state.
+    # Used by decode-side pulls and prefill-side pushes.
+    # Shape: {"request_id", "block_ids", "kv_meta"}.
+    # Hybrid models may add kv_meta["ssm"] for recurrent state.
+    disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -396,7 +417,7 @@ class DynamicInferenceRequest(InferenceRequest):
         - precomputed_block_hashes is [hash1, ...] for N complete blocks
         """
         self.precomputed_block_hashes = compute_block_hashes_batched(
-            self.prompt_tokens, self.block_size_tokens
+            self.prompt_tokens, self.block_size_tokens, cache_salt=self.block_hash_salt
         )
 
     @property
@@ -430,19 +451,39 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+
+        # The prompt length is always reported (needed for usage.prompt_tokens),
+        # but the prompt_tokens tensor is dropped from the wire payload unless the
+        # client asked for it back (return_prompt_tokens). This keeps the large
+        # prompt tensor off the engine->coordinator->API path. Null it around
+        # super() so the tensor is never serialized, then restore local state.
+        prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
+        drop_prompt = (
+            self.prompt_tokens is not None
+            and self.sampling_params is not None
+            and not getattr(self.sampling_params, "return_prompt_tokens", False)
+        )
+        saved_prompt_tokens = None
+        if drop_prompt:
+            saved_prompt_tokens = self.prompt_tokens
+            self.prompt_tokens = None
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
-            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
+            total_tokens = prompt_len + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass
             # hence we expect routing indices for total_tokens - 1
             assert self.routing_indices.shape[0] == total_tokens - 1, (
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
                 f"total tokens {total_tokens-1}."
             )
+
+        if drop_prompt:
+            self.prompt_tokens = saved_prompt_tokens
 
         torch.cuda.nvtx.range_pop()
         return obj
@@ -469,26 +510,25 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
+        return [getattr(sp, field) for field, _ in self.get_metadata_types()]
 
     @staticmethod
-    def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
-        """Keeps track of all request metadata names, dtypes, and target device.
+    def get_metadata_types() -> List[Tuple[str, torch.dtype]]:
+        """Keeps track of all request metadata names and dtypes.
 
         Returns:
-            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
+            List[Tuple[str, torch.dtype]]: Mapping from metadata name to:
                 name (str) - The name of the metadata field.
                 dtype (torch.dtype) - The datatype of the metadata.
-                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
         """
         return [
-            ("temperature", torch.float32, False),  # CPU for torch sampling
-            ("top_k", torch.int32, False),  # CPU for torch sampling
-            ("top_p", torch.float32, False),  # CPU for torch sampling
-            ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("temperature", torch.float32),
+            ("top_k", torch.int32),
+            ("top_p", torch.float32),
+            ("termination_id", torch.int64),
+            ("return_log_probs", torch.bool),
+            ("skip_prompt_log_probs", torch.bool),
+            ("top_n_logprobs", torch.int32),
         ]
 
     def add_event(
@@ -660,13 +700,17 @@ class DynamicInferenceRequestRecord:
             }
         )
 
-        # New request.
+        # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
+        # expanded prompt. The previous hash list may not include newly completed blocks.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            block_size_tokens=old_request.block_size_tokens,
+            enable_prefix_caching=old_request.enable_prefix_caching,
+            block_hash_salt=old_request.block_hash_salt,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -687,16 +731,17 @@ class DynamicInferenceRequestRecord:
         """
 
         def merge_lists(key):
-            if getattr(self.requests[0], key) is None:
+            values = [getattr(request, key) for request in self.requests]
+            if all(value is None for value in values):
                 return None
-            else:
-                return [v for r in self.requests for v in getattr(r, key)]
+            return [item for value in values if value is not None for item in value]
 
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        if self.requests[0].routing_indices is not None:
-            routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if routing_parts:
+            routing_indices = torch.cat(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -705,10 +750,13 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Preserve KV handoff metadata when merging request segments.
+        disaggregated_params = self.requests[-1].disaggregated_params
 
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
+            uid=self.requests[0].uid,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
@@ -729,7 +777,10 @@ class DynamicInferenceRequestRecord:
             routing_indices=routing_indices,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            block_hash_salt=self.requests[0].block_hash_salt,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
+            num_cached_tokens=self.requests[0].num_cached_tokens,
+            disaggregated_params=disaggregated_params,
         )
 
         return request
@@ -760,6 +811,34 @@ class DynamicInferenceRequestRecord:
         request = cls(**obj)
         request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
         return request
+
+
+@dataclass
+class FinishedRequestRecord:
+    """Stores per-request metadata that is not meant to be passed through the RESTful server."""
+
+    policy_epoch: Optional[list[tuple[int, int]]]
+    kv_cache_epoch: Optional[list[tuple[int, int]]]
+    num_evictions: int
+
+    @classmethod
+    def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
+        """Build the request's non-RESTful metadata from a finished request."""
+        # Epoch stamps exist only while the engine has a generation epoch set.
+        record = cls(
+            policy_epoch=(
+                None if request.policy_epoch is None else [tuple(b) for b in request.policy_epoch]
+            ),
+            kv_cache_epoch=(
+                None
+                if request.kv_cache_epoch is None
+                else [tuple(b) for b in request.kv_cache_epoch]
+            ),
+            num_evictions=sum(
+                1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
+            ),
+        )
+        return record
 
 
 @dataclass(kw_only=True)

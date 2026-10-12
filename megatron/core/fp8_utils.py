@@ -62,6 +62,13 @@ except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
     HAVE_TE_MXFP8TENSOR = False
 
+try:
+    from transformer_engine.pytorch.tensor.grouped_tensor import (
+        GroupedTensor as _TE_GROUPED_TENSOR_CLASS,
+    )
+except (ImportError, ModuleNotFoundError):
+    _TE_GROUPED_TENSOR_CLASS = None
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -108,6 +115,33 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
     return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
+
+
+def is_grouped_tensor_with_quantized_storage(tensor: torch.Tensor) -> bool:
+    """Refit compatibility shim: ordinary tensors are supported, TE grouped tensors are not."""
+    if _TE_GROUPED_TENSOR_CLASS is not None:
+        if isinstance(tensor, _TE_GROUPED_TENSOR_CLASS) or (
+            isinstance(tensor, torch.nn.Parameter)
+            and isinstance(tensor.data, _TE_GROUPED_TENSOR_CLASS)
+        ):
+            raise NotImplementedError(
+                "TE GroupedTensor refit is not supported in this fork. "
+                "Upstream support: NVIDIA/Megatron-LM PRs #5487 and #7300 "
+                "(https://github.com/NVIDIA/Megatron-LM/pull/5487, "
+                "https://github.com/NVIDIA/Megatron-LM/pull/7300)."
+            )
+    return False
+
+
+def get_grouped_quantized_members(
+    tensor: torch.Tensor, *, create_if_missing: bool = False
+) -> List[torch.Tensor]:
+    """Import compatibility only; grouped quantized refit is not implemented."""
+    raise NotImplementedError(
+        "Grouped quantized refit is not supported in this fork. "
+        "Upstream support: NVIDIA/Megatron-LM PR #5487 "
+        "(https://github.com/NVIDIA/Megatron-LM/pull/5487)."
+    )
 
 
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:

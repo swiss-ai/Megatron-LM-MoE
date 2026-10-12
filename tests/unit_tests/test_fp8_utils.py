@@ -10,6 +10,39 @@ from megatron.core import fp8_utils
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize('as_parameter', [False, True])
+def test_grouped_refit_stub_accepts_bf16(as_parameter):
+    tensor = torch.ones(2, 4, 4, dtype=torch.bfloat16)
+    if as_parameter:
+        tensor = nn.Parameter(tensor)
+    original = tensor.detach().clone()
+    assert fp8_utils.is_grouped_tensor_with_quantized_storage(tensor) is False
+    assert torch.equal(tensor, original)
+
+
+@pytest.mark.parametrize('create_if_missing', [False, True])
+def test_grouped_refit_member_stub_rejects_construction(create_if_missing):
+    tensor = torch.ones(2, 4, 4, dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match='Grouped quantized refit is not supported'):
+        fp8_utils.get_grouped_quantized_members(tensor, create_if_missing=create_if_missing)
+
+
+@pytest.mark.parametrize('as_parameter', [False, True])
+def test_grouped_refit_stub_rejects_te_grouped_tensor(as_parameter):
+    grouped_module = pytest.importorskip('transformer_engine.pytorch.tensor.grouped_tensor')
+    tensor = grouped_module.GroupedTensor(
+        (4, 4),
+        torch.bfloat16,
+        num_tensors=2,
+        shapes=[(2, 4), (2, 4)],
+        data=torch.ones(16, dtype=torch.bfloat16),
+    )
+    if as_parameter:
+        tensor = nn.Parameter(tensor)
+    with pytest.raises(NotImplementedError, match='TE GroupedTensor refit is not supported'):
+        fp8_utils.is_grouped_tensor_with_quantized_storage(tensor)
+
+
 class MockTELinear(nn.Module):
     """Mock TE Linear module for testing."""
 

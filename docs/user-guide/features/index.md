@@ -14,6 +14,7 @@ Advanced feature guides for key Megatron Core capabilities.
 ```{toctree}
 :maxdepth: 2
 
+cuda_graph
 fine_grained_activation_offloading
 moe
 context_parallel

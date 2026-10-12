@@ -44,6 +44,8 @@ class TempNamedDir(TemporaryDirectory):
         self._finalizer = weakref.finalize(
             self, self._cleanup, self.name, warn_message="Implicitly cleaning up {!r}".format(self)
         )
+        if sync and Utils.rank != 0:
+            self._finalizer.detach()
         self.sync = sync
 
     def cleanup(self, override_sync: Optional[bool] = None) -> None:

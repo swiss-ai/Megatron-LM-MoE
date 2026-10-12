@@ -866,12 +866,11 @@ class KimiDeltaAttention(GatedDeltaNet):
         packed_seq_params=None,
         cu_seqlens=None,
     ):
-        # Input projection
+        # `qkv_fine` checkpoints the expensive post-projection path while keeping
+        # the fused input GEMM outside the checkpoint, matching the SwissAI KDA fix.
         nvtx_range_push(suffix="in_proj")
         projected, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
-
-        # `qkv_fine`: checkpoint past in_proj
         if self.recompute_qkv_fine and self.training and torch.is_grad_enabled():
             self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 fp8=self.config.fp8 or self.config.fp4

@@ -7,11 +7,15 @@ import time
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import openai_stream
+from .common import abort_requests
+
 logger = logging.getLogger(__name__)
 
 
 try:
-    from quart import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -64,9 +68,11 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
+            top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))
 
             if temperature == 0.0:
@@ -101,30 +107,97 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
+                streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        incremental_detokenizers = []
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for prompt_tokens in prompts_as_tokens
+                ]
+            except ValueError as error:
+                return str(error), 400
+
         tasks = []
-        for prompt_tokens in prompts_as_tokens:
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-                stop_words=sampling_params.stop_words,
+        # Populated on the non-streaming path only; the streaming path aborts
+        # through the AsyncStream callback its generator already owns.
+        request_ids = []
+        # The submission loop itself can fail partway -- the zmq send, or
+        # multimodal serialization on a malformed payload -- with the earlier
+        # prompts already submitted to the engine. Without this the exception
+        # escapes the handler and those requests generate to their token limit
+        # holding batch slots, the same leak the abort below closes.
+        #
+        # TODO: streaming submissions made before a mid-loop failure are not
+        # covered. Their handles are AsyncStreams, not ids, and they abort
+        # through openai_stream's finally, which never runs because the
+        # generator is never started.
+        try:
+            for prompt_tokens in prompts_as_tokens:
+                per_req_params = SamplingParams(
+                    temperature=sampling_params.temperature,
+                    top_k=sampling_params.top_k,
+                    top_p=sampling_params.top_p,
+                    return_log_probs=sampling_params.return_log_probs,
+                    top_n_logprobs=sampling_params.top_n_logprobs,
+                    skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
+                    num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                    stop_words=sampling_params.stop_words,
+                    return_prompt_tokens=True,
+                    streaming_interval=sampling_params.streaming_interval,
+                )
+                if stream_requested:
+                    tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+                else:
+                    # add_request_with_id, not add_request: a non-streaming response
+                    # writes nothing to the socket while generating, so a disconnect
+                    # is never discovered as a broken pipe. Aborting needs the ids.
+                    request_id, future = client.add_request_with_id(prompt_tokens, per_req_params)
+                    request_ids.append(request_id)
+                    tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return f"Error submitting request: {e}", 500
+
+        if stream_requested:
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    tasks,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=False,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    prompt_indices=list(range(len(prompts_as_tokens))),
+                ),
+                content_type="text/event-stream",
             )
-            tasks.append(client.add_request(prompt_tokens, per_req_params))
+            response.timeout = None
+            return response
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             return f"Error during inference: {e}", 500
 
@@ -160,12 +233,28 @@ try:
 
         # --- 5. Format Response (matching old_completions.py) ---
         choices = []
+        total_completion_tokens = 0
+        prompt_tokens_counts = []
 
         request_idx = 0
+        response_uid = None
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
+            if response_uid is None:
+                response_uid = result["uid"]
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
+
+            generated_tokens = result.get("generated_tokens") or []
+            prompt_tokens_list = result.get("prompt_tokens") or []
+            total_completion_tokens += len(generated_tokens)
+            prompt_tokens_counts.append(len(prompt_tokens_list))
+
+            finish_reason = "length"
+            sampling_params_result = result.get("sampling_params") or {}
+            num_tokens_requested = sampling_params_result.get("num_tokens_to_generate")
+            if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
+                finish_reason = "stop"
 
             logprobs_data = None
             if sampling_params.return_log_probs:
@@ -230,20 +319,44 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
+            choice_data = {
+                "index": request_idx,
+                "text": text_output,
+                "logprobs": logprobs_data,
+                "finish_reason": finish_reason,
+                "prompt_token_ids": result["prompt_tokens"],
+                "generation_token_ids": result["generated_tokens"],
+                "generation_log_probs": result.get("generated_log_probs", []),
+            }
+
             if result["routing_indices"] is not None:
-                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                choice_data["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
                     len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
                 )
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length
                     ]
 
+            choices.append(choice_data)
             request_idx += 1
 
-        return jsonify({"choices": choices})
+        prompt_token_count = sum(prompt_tokens_counts)
+        return jsonify(
+            {
+                "id": response_uid,
+                "object": "text_completion",  # as per the openAI spec
+                "created": int(time.time()),
+                "model": "EMPTY",
+                "choices": choices,
+                "usage": {
+                    "prompt_tokens": prompt_token_count,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": prompt_token_count + total_completion_tokens,
+                },
+            }
+        )
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")

@@ -38,7 +38,9 @@ def get_moe_module_spec(
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
-        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm,
+        backend=backend,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
         moe_use_offloading_experts=moe_use_offloading_experts,
     )
 
@@ -68,10 +70,17 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = partial(SharedExpertMLP, submodules=mlp)
 
+    # The inference backend uses compact [tokens, topk] index routing; other
+    # backends retain the training router's dense [tokens, num_experts] map.
+    router = InferenceTopKRouter if isinstance(backend, InferenceSpecProvider) else None
+    submodule_kwargs = {"router": router} if router is not None else {}
+
     # MoE module spec
     moe_module_spec = ModuleSpec(
         module=MoELayer,
-        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+        submodules=MoESubmodules(
+            experts=experts, shared_experts=shared_experts, **submodule_kwargs
+        ),
         metainfo={"fuse_pre_mlp_layernorm": False},
     )
     return moe_module_spec

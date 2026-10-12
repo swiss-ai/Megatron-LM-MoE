@@ -539,6 +539,9 @@ def _update_router_qb_beta(
     tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Update the quantile-balancing per-expert bias once per global batch."""
+    if config.moe_router_quantile_balancing_freeze:
+        return
+
     if config.moe_router_quantile_balancing_method == 'histogram':
         assert tp_dp_cp_group is not None, (
             "Histogram quantile balancing requires a TP+DP+CP process group."
@@ -757,6 +760,7 @@ def finalize_model_grads(
     uses_histogram_qb = (
         "quantile_balancing" in config.moe_router_load_balancing_type
         and config.moe_router_quantile_balancing_method == 'histogram'
+        and not config.moe_router_quantile_balancing_freeze
     )
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
@@ -848,7 +852,10 @@ def finalize_model_grads(
     _log_microbatch_router_metrics(model, config, dp_group)
     _log_global_router_metrics(model, config)
 
-    if "quantile_balancing" in config.moe_router_load_balancing_type:
+    if (
+        "quantile_balancing" in config.moe_router_load_balancing_type
+        and not config.moe_router_quantile_balancing_freeze
+    ):
         _update_router_qb_beta(
             model,
             config,

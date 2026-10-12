@@ -48,12 +48,15 @@ def initialize_megatron(
     get_position_embedding_ranks=None,
     parsed_args=None,
     store=None,
+    skip_dependency_compilation=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
     `allow_no_cuda` should not be set unless using megatron for cpu only
     data processing. In general this arg should not be set unless you know
     what you are doing.
+    `skip_dependency_compilation` should only be set by workloads that do not
+    use the C++ dataset helpers.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -61,36 +64,38 @@ def initialize_megatron(
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
-    # Parse arguments
-    if parsed_args is None:
-        args = parse_args(extra_args_provider, ignore_unknown_args)
-    else:
-        args = parsed_args
+    # Launchers using parse_and_validate_args() register global arguments before
+    # initialization. Keep the legacy path for library callers that still rely
+    # on initialize_megatron() to parse arguments.
+    try:
+        args = get_args()
+    except AssertionError:
+        if parsed_args is None:
+            args = parse_args(extra_args_provider, ignore_unknown_args)
+        else:
+            args = parsed_args
 
-    # Prep for checkpoint conversion.
-    if args.ckpt_convert_format is not None:
-        assert args.ckpt_convert_save is not None
-        assert args.load is not None
-        args.exit_on_missing_checkpoint = True
+        if args.ckpt_convert_format is not None:
+            assert args.ckpt_convert_save is not None
+            assert args.load is not None
+            args.exit_on_missing_checkpoint = True
 
-    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
-        assert args.non_persistent_ckpt_type != "local", (
-            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
-            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
-            "before initializing LocalCheckpointManager."
-        )
-        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
-        load_args_from_checkpoint(args)
+        if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
+            assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
+            assert args.non_persistent_ckpt_type != "local", (
+                "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
+                "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
+                "before initializing LocalCheckpointManager."
+            )
+            load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
+            load_args_from_checkpoint(args)
 
-    if args.yaml_cfg is not None:
-        args = validate_yaml(args, args_defaults)
-    else:
-        validate_args(args, args_defaults)
+        if args.yaml_cfg is not None:
+            args = validate_yaml(args, args_defaults)
+        else:
+            validate_args(args, args_defaults)
 
-    # set global args, build tokenizer, and set adlr-autoresume,
-    # tensorboard-writer, and timers.
-    set_global_variables(args)
+        set_global_variables(args)
 
     # set logging level
     setup_logging()
@@ -167,7 +172,8 @@ def initialize_megatron(
         _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        if not skip_dependency_compilation:
+            _compile_dependencies()
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?

@@ -11,7 +11,36 @@ import builtins
 import ast
 import enum
 from dataclasses import Field, fields
+from argparse import Namespace
+import warnings
+import torch.nn.functional as F
+import torch
 
+from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.heterogeneous.heterogeneous_config import HeterogeneousTransformerConfig
+from megatron.core.activations import squared_relu, rlglu_act, sssglu_act, lglu_act, situ_act
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.fusions.fused_bias_ssglu import sslu
+from megatron.core.quantization.utils import kitchen_quantization_recipe_config, load_quantization_recipe
+
+from megatron.training.config import (
+    CheckpointConfig,
+    DistributedInitConfig,
+    InferenceSetupConfig,
+    InferenceConfigContainer,
+    LoggerConfig,
+    PretrainConfigContainer,
+    ProfilingConfig,
+    RNGConfig,
+    RerunStateMachineConfig,
+    SchedulerConfig,
+    StragglerDetectionConfig,
+    TrainingConfig,
+    TokenizerConfig,
+    ValidationConfig,
+)
+from megatron.training.models import HybridModelConfig, GPTModelConfig
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -248,3 +277,428 @@ class ArgumentGroupFactory:
                 field_docstrings.update(self._get_field_docstrings(base_classes[0]))
 
         return field_docstrings
+
+
+def core_transformer_config_from_args(args, config_class=None):
+
+    # Config class.
+    config_class = config_class or TransformerConfig
+
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
+
+    if args.heterogeneous_layers_config_path is not None:
+        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        config_class = HeterogeneousTransformerConfig
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(config_class):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['num_moe_experts'] = args.num_experts
+    kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp4_param'] = getattr(args, 'fp4_param_gather', getattr(args, 'fp4_param', False))
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    else:
+        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
+    if args.squared_relu:
+        assert not args.swiglu
+        kw_args['activation_func'] = squared_relu
+    elif args.quick_geglu:
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = quick_gelu
+    elif args.ssglu:
+        # SwiGLU with the sigmoid inside SiLU replaced by softsign scaled to (0, 1). Non-learnable
+        # and structurally identical to SwiGLU, so it reuses the same fusion switch
+        # (--no-bias-swiglu-fusion) and dispatches on activation_func == sslu.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = sslu
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.reglu:
+        # ReLU-gated linear unit: relu(x_glu) * x_linear. Non-learnable and has no fused kernel;
+        # runs through the generic (non-fused) GLU path with activation_func == F.relu.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.relu
+        kw_args['bias_activation_fusion'] = False
+    elif args.rlglu:
+        # RLGLU: gate f(x)=max(x,0)-0.5*ln(1+|x|), output f(x_glu)*x_linear. Non-learnable and
+        # structurally identical to SwiGLU (elementwise gate, no cross-feature reduction), so it
+        # reuses the same fusion switch (--no-bias-swiglu-fusion) and dispatches on
+        # activation_func == rlglu_act. Its gate derivative is exactly the SSGLU gate, which the
+        # fused backward reuses.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = rlglu_act
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.sssglu:
+        # SSSGLU: gate f(x)=softsign(x-1)+0.5, output f(x_glu)*x_linear. Non-learnable and
+        # structurally identical to SwiGLU/RLGLU (elementwise gate, no cross-feature reduction), so
+        # it reuses the same fusion switch (--no-bias-swiglu-fusion) and dispatches on
+        # activation_func == sssglu_act. It has dedicated fused kernels (fused_bias_sssglu.py +
+        # sssglu_jit.py).
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = sssglu_act
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    elif args.lglu:
+        # LGLU: gate f(x)=sign(x-1)*ln(|x-1|+1)+ln2, output f(x_glu)*x_linear. Non-learnable and
+        # has no fused kernel; runs through the generic (non-fused) GLU path with
+        # activation_func == lglu_act.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = lglu_act
+        kw_args['bias_activation_fusion'] = False
+    elif args.situ:
+        # SiTU: gate f(x)=sigmoid(x)*tanh(x), output f(x_glu)*x_linear. Non-learnable and has no
+        # fused kernel; runs through the generic (non-fused) GLU path with
+        # activation_func == situ_act.
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = situ_act
+        kw_args['bias_activation_fusion'] = False
+    if args.pnglu:
+        # PolyNorm GLU replaces the gate of a gated linear unit; it is itself a (learnable)
+        # gated unit, so it cannot be combined with the non-gated squared-relu.
+        assert not args.squared_relu, '--pnglu is a gated unit and is incompatible with --squared-relu.'
+        kw_args['gated_linear_unit'] = True
+        # The gate is computed by the PolyNorm module. Keep SiLU as a harmless placeholder
+        # activation_func for the (unused) non-pnglu code paths and width-doubling assumptions.
+        kw_args['activation_func'] = F.silu
+        # Fused bias+activation kernels hardcode SiLU/GELU and cannot run PolyNorm.
+        kw_args['bias_activation_fusion'] = False
+    # xpr/gxpr/xr2/gxr2/pn3glu/polynorm are learnable activations applied by a dedicated module
+    # (see MLP/TEGroupedMLP), not via config.activation_func (the gated ones -- gxpr/gxr2/pn3glu
+    # -- still set activation_func to a harmless SiLU placeholder for width-doubling assumptions
+    # and the unused non-{flag} code paths). All are mutually exclusive with each other and with
+    # the other activation flags above.
+    _other_new_activation_flags = {
+        'pn3glu': args.pn3glu,
+        'xpr': args.xpr,
+        'gxpr': args.gxpr,
+        'gxpry': args.gxpry,
+        'gxprv2': args.gxprv2,
+        'xr2': args.xr2,
+        'gxr2': args.gxr2,
+        'xr2glu': args.xr2glu,
+        'xssglu': args.xssglu,
+        'polynorm': args.polynorm,
+    }
+    _all_activation_flags = dict(_other_new_activation_flags)
+    _all_activation_flags.update({
+        'swiglu': args.swiglu,
+        'ssglu': args.ssglu,
+        'reglu': args.reglu,
+        'rlglu': args.rlglu,
+        'sssglu': args.sssglu,
+        'lglu': args.lglu,
+        'situ': args.situ,
+        'squared_relu': args.squared_relu,
+        'quick_geglu': args.quick_geglu,
+        'pnglu': args.pnglu,
+    })
+    for _flag_name, _is_set in _other_new_activation_flags.items():
+        if _is_set:
+            _others = [n for n, v in _all_activation_flags.items() if v and n != _flag_name]
+            assert not _others, \
+                f'--{_flag_name.replace("_", "-")} cannot be combined with other activation ' \
+                f'flags (found: {_others}).'
+    if args.pn3glu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xpr:
+        kw_args['bias_activation_fusion'] = False
+    if args.gxpr:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.gxpry:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.gxprv2:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xr2:
+        kw_args['bias_activation_fusion'] = False
+    if args.gxr2:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xr2glu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.xssglu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.silu
+        kw_args['bias_activation_fusion'] = False
+    if args.polynorm:
+        kw_args['bias_activation_fusion'] = False
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if args.group_query_attention:
+        kw_args['num_query_groups'] = args.num_query_groups
+    else:
+        kw_args['num_query_groups'] = None
+    kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.rope_type is None:
+        # Pop 'rope_type' to let the config class use the default value.
+        kw_args.pop('rope_type', None)
+    else:
+        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
+            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+        )
+
+    if len(args.cp_comm_type) == 1:
+        kw_args['cp_comm_type'] = args.cp_comm_type[0]
+    if args.hybrid_layer_pattern is not None:
+        kw_args['is_hybrid_model'] = True
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
+
+    kw_args['inference_sampling_seed'] = args.seed
+
+    # handle quantization config
+    # NOTE: Kitchen arguments are only added to the namespace when
+    # Kitchen library is available.
+    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
+    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+
+    kw_args['moe_latent_size'] = args.moe_latent_size
+
+    if args.te_precision_config_file:
+        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
+        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
+        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
+
+    if hasattr(args, "use_kitchen_attention"):
+        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
+    if hasattr(args, "kitchen_attention_backend"):
+        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
+
+    # Return config.
+    return config_class(**kw_args)
+
+def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
+    """Create a config dataclass from matching values in an argparse namespace."""
+    kwargs = {f.name: getattr(args, f.name) for f in fields(cls) if hasattr(args, f.name)}
+    return cls(**kwargs) if return_instance else kwargs
+
+
+def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
+    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+
+    kwargs = {}
+    if config is None:
+        if args.yaml_cfg is not None:
+            from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+            transformer_cfg = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            transformer_cfg = core_transformer_config_from_args(args)
+    else:
+        transformer_cfg = config
+    kwargs["transformer"] = transformer_cfg
+
+    if args.spec is not None:
+        kwargs["transformer_layer_spec"] = import_module(args.spec)
+
+
+    kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
+    kwargs["position_embedding_type"] = args.position_embedding_type
+    kwargs["rotary_percent"] = args.rotary_percent
+    kwargs["rotary_base"] = args.rotary_base
+    kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
+    kwargs["rope_scaling"] = args.use_rope_scaling
+
+    kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
+    kwargs["seq_length"] = args.max_position_embeddings
+    kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
+
+    # GPTModelConfig supports either automatically padding vocab size or using exact provided
+    # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
+    # that is just mapped to settings in args appropriately.
+    if args.padded_vocab_size is not None:
+        kwargs["vocab_size"] = args.padded_vocab_size
+        kwargs["should_pad_vocab"] = False
+    else:
+        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = args.vocab_size
+        kwargs["should_pad_vocab"] = True
+
+    return GPTModelConfig(**kwargs)
+
+
+def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
+    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+
+    kwargs = {}
+    if config is None:
+        transformer_cfg = core_transformer_config_from_args(args)
+    else:
+        transformer_cfg = config
+    kwargs["transformer"] = transformer_cfg
+
+    if transformer_cfg.transformer_impl == "inference_optimized":
+        assert (
+            not transformer_cfg.inference_fuse_tp_communication
+        ), "inference_fuse_tp_communication is not supported for HybridModel"
+    elif args.spec is not None:
+        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+
+
+    kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
+    kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
+    kwargs["position_embedding_type"] = args.position_embedding_type
+    kwargs["rotary_percent"] = args.rotary_percent
+    kwargs["rotary_base"] = args.rotary_base
+    kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
+
+    kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
+    kwargs["seq_length"] = args.max_position_embeddings
+    kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
+
+    # HybridModelConfig supports either automatically padding vocab size or using exact provided
+    # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
+    # that is just mapped to settings in args appropriately.
+    if args.padded_vocab_size is not None:
+        kwargs["vocab_size"] = args.padded_vocab_size
+        kwargs["should_pad_vocab"] = False
+    else:
+        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that
+        # when converting model configs from HF, we can set a vocab size and disable padding.
+        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = args.vocab_size
+        kwargs["should_pad_vocab"] = True
+
+    return HybridModelConfig(**kwargs)
+
+
+def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
+    """Build a PretrainConfigContainer from the argparse arguments."""
+
+    from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+
+    if model_cfg is None:
+        msg = """
+        It is recommended to use a ModelConfig (e.g. megatron.training.models.HybridModelConfig) instead
+        of a model builder/model provider function pointer.
+        """
+        warnings.warn(msg)
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs.update(
+        save_optim=not args.no_save_optim,
+        save_rng=not args.no_save_rng,
+        load_optim=not args.no_load_optim,
+        load_rng=not args.no_load_rng,
+        fully_parallel_save=args.ckpt_fully_parallel_save,
+        fully_parallel_load=args.ckpt_fully_parallel_load,
+    )
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
+    rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
+
+    optim_cfg, _ = get_megatron_optimizer_config(args)
+    ddp_config = get_megatron_ddp_config(args)
+
+    return PretrainConfigContainer(
+        train=_default_config_from_args(TrainingConfig, args),
+        validation=_default_config_from_args(ValidationConfig, args),
+        model=model_cfg,
+        optimizer=optim_cfg,
+        scheduler=_default_config_from_args(SchedulerConfig, args),
+        ddp=ddp_config,
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        profiling=ProfilingConfig(**prof_kwargs),
+        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
+        straggler=_default_config_from_args(StragglerDetectionConfig, args),
+    )
+def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
+    """Build an InferenceSetupConfig from the argparse arguments.
+
+    InferenceSetupConfig field names map one-to-one onto the argparse ``dest`` names produced
+    by ``_add_inference_args``, so this is a direct copy of the relevant values from ``args``.
+
+    This builds the declarative/serializable inference config. To obtain the runtime engine
+    config (``megatron.core.inference.config.InferenceConfig``), call
+    ``inference_cfg_from_args(args).to_inference_config(model, ...)``.
+    """
+    return _default_config_from_args(InferenceSetupConfig, args)
+
+
+def inference_cfg_container_from_args(
+    args: Namespace, model_cfg=None
+) -> InferenceConfigContainer:
+    """Build an InferenceConfigContainer from the argparse arguments.
+
+    This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
+    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
+    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+
+    Args:
+        args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
+        model_cfg: Optional pre-built model config. If None, a model config is constructed from
+            ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
+            GPTModelConfig).
+    """
+    if model_cfg is None:
+        if getattr(args, "hybrid_layer_pattern", None) is not None:
+            model_cfg = hybrid_config_from_args(args)
+        else:
+            model_cfg = gpt_config_from_args(args)
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs["save_rng"] = not args.no_save_rng
+    ckpt_kwargs["load_optim"] = not args.no_load_optim
+    ckpt_kwargs["load_rng"] = not args.no_load_rng
+    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
+    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    cfg = InferenceConfigContainer(
+        model=model_cfg,
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        inference=inference_cfg_from_args(args),
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        profiling=ProfilingConfig(**prof_kwargs),
+    )
+
+    return cfg

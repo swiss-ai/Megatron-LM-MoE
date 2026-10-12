@@ -187,6 +187,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             self.triton_nvls_kernels_allowed
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
+            and symm_mem_buffer["handle"].multicast_ptr != 0
         )
         if can_use_nvls:
             # do multimem all gather
@@ -220,6 +221,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             self.skip_norm_and_all_gather
             and self.tp_size > 1
             and symm_mem_buffer["handle"] is not None
+            and symm_mem_buffer["handle"].multicast_ptr != 0
         )
         if is_in_fused_mode:
             x = symm_mem_buffer["tensor"]
@@ -304,6 +306,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             self.triton_nvls_kernels_allowed
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
+            and symm_mem_buffer["handle"].multicast_ptr != 0
         )
         if can_use_nvls:
             multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
@@ -406,6 +409,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             and x.dtype == torch.bfloat16
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
+            and symm_mem_buffer["handle"].multicast_ptr != 0
         )
 
         if can_use_nvls:
