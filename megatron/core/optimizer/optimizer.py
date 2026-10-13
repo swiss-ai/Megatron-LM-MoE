@@ -92,6 +92,8 @@ def _multi_tensor_copy_this_to_that(
         multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
     else:
         for this_, that_ in zip(this, that):
+            if this_.is_cuda and that_.device.type == 'cpu' and this_.dtype != that_.dtype:
+                this_ = this_.to(that_.dtype)  # a blocking cross-device copy_ would cast on the CPU
             that_.copy_(this_)
 
 
