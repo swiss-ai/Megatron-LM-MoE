@@ -42,7 +42,8 @@ def test_cudnn_backend_requires_safe_gate():
 
 
 @pytest.mark.skipif(not (HAVE_KDA and HAVE_CUDNN_KDA), reason="Needs FLA KDA and cuDNN KDA.")
-def test_cudnn_kda_matches_fla():
+@pytest.mark.parametrize("per_channel", [False, True])
+def test_cudnn_kda_matches_fla(per_channel):
     lower_bound = -5.0
     torch.manual_seed(0)
     num_heads, head_dim = 4, 128
@@ -51,7 +52,7 @@ def test_cudnn_kda_matches_fla():
     shape = (num_tokens, num_heads, head_dim)
     q, k, v, alpha = (torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(4))
     beta = torch.randn(num_tokens, num_heads, device="cuda").sigmoid()
-    A_log = torch.empty(num_heads, device="cuda").uniform_(1, 16).log()
+    A_log = torch.empty(num_heads * (head_dim if per_channel else 1), device="cuda").uniform_(1, 16).log()
     dt_bias = torch.empty(num_heads * head_dim, device="cuda").uniform_(1e-3, 1e-1).expm1().log()
     do = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
 
