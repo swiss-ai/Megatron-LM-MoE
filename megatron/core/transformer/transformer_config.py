@@ -591,6 +591,9 @@ class TransformerConfig(ModelParallelConfig):
     Kimi-K3 / FlashKDA (retention floor exp(-5) ~= 6.7e-3), chosen so the cumulative chunk decay
     stays representable in bf16 without rescaling."""
 
+    linear_attention_backend: Literal['fla', 'cudnn'] = 'fla'
+    """Kernel for the KDA recurrence: 'fla' (chunk_kda) or 'cudnn' (cudnn-frontend sm90 KDA engine)."""
+
     linear_attention_carry_state: bool = False
     """If True, carry the recurrent state across forward passes. Each forward pulls the
     previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back
@@ -1550,6 +1553,20 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear gated_delta_net."
+
+            if self.linear_attention_backend == 'cudnn':
+                assert self.experimental_attention_variant == "kda", (
+                    "linear_attention_backend='cudnn' is only implemented for KDA."
+                )
+                assert self.linear_key_head_dim == self.linear_value_head_dim == 128, (
+                    "linear_attention_backend='cudnn' needs linear key and value head dims of 128."
+                )
+                assert self.context_parallel_size == 1, (
+                    "linear_attention_backend='cudnn' does not support context parallelism."
+                )
+                assert self.linear_attention_safe_output_gate, (
+                    "linear_attention_backend='cudnn' needs linear_attention_safe_output_gate."
+                )
 
             # Check required parameters
             assert (

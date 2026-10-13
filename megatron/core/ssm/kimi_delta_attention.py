@@ -53,6 +53,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.ssm.kda_cudnn import HAVE_CUDNN_KDA, cudnn_kda
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
     GatedDeltaNetSubmodules,
@@ -590,6 +591,18 @@ class KimiDeltaAttention(GatedDeltaNet):
             not self.config.linear_attention_allow_neg_eigval
             or _KDA_SUPPORTS_FUSED_ALLOW_NEG_EIGVAL
         )
+
+        if self.config.linear_attention_backend == "cudnn":
+            if not HAVE_CUDNN_KDA:
+                raise ImportError(
+                    "linear_attention_backend='cudnn' needs cudnn-frontend with linear_attention."
+                )
+            if self._alog_per_channel and not _KDA_GATE_SUPPORTS_PER_CHANNEL:
+                raise ValueError("Per-channel A_log needs a flash-linear-attention gate that supports it.")
+            # cudnn_kda takes raw q/k and alpha and applies the L2-norm and decay gate itself.
+            self._qk_l2norm_in_kernel = self.use_qk_l2norm and self.qk_rmsnorm is None
+            self._use_fused_decay_gate = True
+            self._use_fused_beta_sigmoid = False
 
         # Re-init A_log + dt_bias using the reference KDA time-scale distribution.
         self._reset_kda_decay_params(A_init_range)
@@ -1230,15 +1243,47 @@ class KimiDeltaAttention(GatedDeltaNet):
         if cu_seqlens is not None:
             kda_kwargs["cu_seqlens"] = cu_seqlens
 
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query, key, value, **kda_kwargs
-        )
+        if self.config.linear_attention_backend == "cudnn":
+            core_attn_out, last_recurrent_state = self._cudnn_core(
+                query, key, value, g, beta, A_log_local_cp, dt_bias_local_cp,
+                initial_state_f32, need_final_state, cu_seqlens,
+            )
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query, key, value, **kda_kwargs
+            )
         nvtx_range_pop(suffix="chunk_kda")
 
         nvtx_range_push(suffix="gated_norm")
         norm_out = self._apply_gated_norm(core_attn_out, gate.contiguous())
         nvtx_range_pop(suffix="gated_norm")
         return norm_out, last_recurrent_state
+
+    def _cudnn_core(self, query, key, value, alpha, beta, A_log, dt_bias,
+                    initial_state_f32, need_final_state, cu_seqlens):
+        """Run the recurrence on cuDNN; inputs and outputs use chunk_kda's layout."""
+        batch, seq_len = query.shape[:2]
+        if cu_seqlens is None:
+            cu_seqlens = torch.arange(0, batch * seq_len + 1, seq_len, device=query.device)
+        initial_state = (
+            initial_state_f32.transpose(-1, -2).contiguous()
+            if initial_state_f32 is not None
+            else None
+        )
+        out, final_state = cudnn_kda(
+            *(x.reshape(batch * seq_len, *x.shape[2:]) for x in (query, key, value, alpha, beta)),
+            A_log,
+            dt_bias.reshape(-1),
+            cu_seqlens.to(torch.int32),
+            initial_state=initial_state,
+            output_final_state=bool(need_final_state),
+            l2norm=self._qk_l2norm_in_kernel,
+            lower_bound=self._gate_lower_bound,
+        )
+        out = out.reshape(batch, seq_len, *out.shape[1:])
+        if final_state is not None:
+            final_state = final_state.transpose(-1, -2)
+        return out, final_state
 
     def _split_dynamic_projection(self, projected: Tensor):
         """Expand and reshape the current factorized KDA projection for inference."""
