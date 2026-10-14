@@ -46,7 +46,6 @@ from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
     TEActivationFunctionBuilder,
-    apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -73,9 +72,15 @@ from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     offloading_fp8_grouped_swiglu_mlp,
 )
 
-from megatron.core.transformer.moe.fp8_utils import (
+from megatron.core.transformer.moe.expert_checkpoint_utils import (
+    EXPERT_CKPT_HAS_TE_EXTRA_STATE_KEY,
+    apply_swiglu_sharded_factory,
     build_offloading_expert_sharded_tensor,
+    is_legacy_offloading_checkpoint,
     make_fused_experts_sharded_factory,
+    make_fused_offloading_experts_canonical_factory,
+    make_legacy_offloading_load_factory,
+    make_offloading_expert_canonical_factory,
 )
 
 from megatron.core.transformer.spec_utils import build_module
@@ -700,6 +705,15 @@ class TEGroupedMLP(MegatronModule):
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        legacy_offloading = is_legacy_offloading_checkpoint(metadata)
+        has_te_extra_state = (metadata or {}).get(
+            EXPERT_CKPT_HAS_TE_EXTRA_STATE_KEY, True
+        )
+        if legacy_offloading:
+            assert not self.config.add_bias_linear, (
+                "Legacy offloading checkpoints contain expert weights only and cannot initialize "
+                "biased TEGroupedMLP experts."
+            )
         sharded_state_dict = {}
         for name, module in self._modules.items():
             module_sharded_offsets = sharded_offsets
@@ -722,7 +736,16 @@ class TEGroupedMLP(MegatronModule):
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', module_sharded_offsets, metadata, tp_group=self.tp_group
             )
-            if name == 'linear_fc1' and self.config.gated_linear_unit:
+            if name in ('linear_fc1', 'linear_fc2') and legacy_offloading:
+                for i in range(self.num_local_experts):
+                    key = f'{name}.weight{i}'
+                    if key in sub_sd:
+                        sub_sd[key] = make_legacy_offloading_load_factory(
+                            sub_sd[key],
+                            name,
+                            gated=(name == 'linear_fc1' and self.config.gated_linear_unit),
+                        )
+            elif name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
                 ep_axis = len(sharded_offsets)
@@ -739,6 +762,8 @@ class TEGroupedMLP(MegatronModule):
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
                             )
+            if not has_te_extra_state:
+                sub_sd = {k: v for k, v in sub_sd.items() if '_extra_state' not in k}
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:
@@ -1840,19 +1865,15 @@ class OffloadingExpertsMLP(MegatronModule):
         self.wgrad_accumulation_and_reduce_hooks.append(hook_fn)
     
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Maps local experts to global experts (interchangeable across variants).
+        """Maps local experts to the canonical Sequential/TE expert schema.
 
-        Both OffloadingExpertsMLP variants emit the same per-expert, expert-parallel
-        sharded layout under keys ``{prefix}experts.weight{1,2}`` in ``(in, out)``
-        orientation, so a checkpoint saved by one is loadable by the other:
-
-        - bf16 variant: per-expert params already ``(in, out)`` -> saved directly.
-        - inplace-fp8 variant: a single fused ``(num_local, out, in)`` master is
-          transposed per expert via a ``ShardedTensorFactory`` (one per fused
-          param, keyed by the real param name so ``load_state_dict`` maps it back).
+        New checkpoints use ``experts.linear_fc{1,2}.weight`` in TE's ``(out, in)``
+        orientation. A checkpoint marked ``legacy_offloading`` instead requests the previous
+        private ``experts.weight{1,2}`` schema for backward-compatible loading.
         """
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        legacy_offloading = is_legacy_offloading_checkpoint(metadata)
         assert self.tp_group.size() == 1, "OffloadingExpertsMLP assumes ETP size == 1"
 
         num_global_experts = self.ep_group.size() * self.num_local_experts
@@ -1870,49 +1891,71 @@ class OffloadingExpertsMLP(MegatronModule):
             )
             sharded_state_dict = {}
             for wname, fused_weight in (('weight1', self.weight1), ('weight2', self.weight2)):
-                sharded_state_dict[f'{prefix}{wname}'] = make_fused_experts_sharded_factory(
-                    fused_weight,
-                    prefix,
-                    wname,
-                    num_local_experts=self.num_local_experts,
-                    local_expert_indices_offset=local_expert_indices_offset,
-                    num_global_experts=num_global_experts,
-                    sharded_offsets=sharded_offsets,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                )
+                if legacy_offloading:
+                    factory = make_fused_experts_sharded_factory(
+                        fused_weight,
+                        prefix,
+                        wname,
+                        num_local_experts=self.num_local_experts,
+                        local_expert_indices_offset=local_expert_indices_offset,
+                        num_global_experts=num_global_experts,
+                        sharded_offsets=sharded_offsets,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                    )
+                else:
+                    linear_name = 'linear_fc1' if wname == 'weight1' else 'linear_fc2'
+                    factory = make_fused_offloading_experts_canonical_factory(
+                        fused_weight,
+                        prefix,
+                        wname,
+                        linear_name,
+                        num_local_experts=self.num_local_experts,
+                        local_expert_indices_offset=local_expert_indices_offset,
+                        num_global_experts=num_global_experts,
+                        sharded_offsets=sharded_offsets,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                        gated=(wname == 'weight1' and self.config.gated_linear_unit),
+                    )
+                sharded_state_dict[f'{prefix}{wname}'] = factory
             return sharded_state_dict
 
         sharded_state_dict = {}
         for i in range(self.num_local_experts):
             g_idx = local_expert_indices_offset + i
-            w1 = getattr(self, f'weight1_expert_{i}')
-            w2 = getattr(self, f'weight2_expert_{i}')
-
-            sharded_state_dict[f'{prefix}weight1_expert_{i}'] = (
-                build_offloading_expert_sharded_tensor(
-                    w1,
-                    prefix,
-                    'weight1',
-                    g_idx,
-                    sharded_offsets=sharded_offsets,
-                    num_global_experts=num_global_experts,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                    transpose=False,
-                )
-            )
-            sharded_state_dict[f'{prefix}weight2_expert_{i}'] = (
-                build_offloading_expert_sharded_tensor(
-                    w2,
-                    prefix,
-                    'weight2',
-                    g_idx,
-                    sharded_offsets=sharded_offsets,
-                    num_global_experts=num_global_experts,
-                    replica_id=replica_id,
-                    singleton_local_shards=singleton_local_shards,
-                    transpose=False,
-                )
-            )
+            for weight_name, linear_name in (
+                ('weight1', 'linear_fc1'),
+                ('weight2', 'linear_fc2'),
+            ):
+                parameter_name = f'{weight_name}_expert_{i}'
+                weight = getattr(self, parameter_name)
+                if legacy_offloading:
+                    shard = build_offloading_expert_sharded_tensor(
+                        weight,
+                        prefix,
+                        weight_name,
+                        g_idx,
+                        sharded_offsets=sharded_offsets,
+                        num_global_experts=num_global_experts,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                        transpose=False,
+                    )
+                else:
+                    shard = make_offloading_expert_canonical_factory(
+                        weight,
+                        prefix,
+                        parameter_name,
+                        linear_name,
+                        global_expert_idx=g_idx,
+                        num_global_experts=num_global_experts,
+                        sharded_offsets=sharded_offsets,
+                        replica_id=replica_id,
+                        singleton_local_shards=singleton_local_shards,
+                        gated=(
+                            linear_name == 'linear_fc1' and self.config.gated_linear_unit
+                        ),
+                    )
+                sharded_state_dict[f'{prefix}{parameter_name}'] = shard
         return sharded_state_dict
