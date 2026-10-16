@@ -2,6 +2,7 @@
 
 import logging
 import os
+import socket
 import time
 from dataclasses import dataclass, field
 from math import ceil
@@ -827,8 +828,11 @@ class GPTDataset(MegatronDataset):
             )
             compact_hit = os.path.isfile(path_to_bfd_docs) and os.path.isfile(path_to_bfd_splits)
         else:
+            path_to_bfd_docs = None
             cache_hit = False
             compact_hit = False
+        # save_num_valid_tokens rebuilds its array when this index is newer.
+        self.path_to_bfd_docs = path_to_bfd_docs
 
         if not path_to_cache or (
             not cache_hit
@@ -1585,3 +1589,82 @@ class MockGPTDataset(GPTDataset):
             MockGPTLowLevelDataset: The underlying MockGPTLowLevelDataset
         """
         return MockGPTLowLevelDataset(config.tokenizer)
+
+
+# With BFD packing the MoE routers on every pipeline stage need each sample's number of valid
+# tokens. Ranks that hold no first or last pipeline stage need nothing else, so global rank 0 saves
+# those numbers next to the cached indices and those ranks read them (NumValidTokensDataset)
+# instead of building the datasets. Key ("train", "valid", "valid<i>" for the i-th of multiple
+# validation sets, "test") -> (path of the array, number of samples of the dataset).
+NUM_VALID_TOKENS_PATHS: Dict[str, Tuple[str, int]] = {}
+
+
+def _bfd_num_valid_tokens(ds: "GPTDataset") -> numpy.ndarray:
+    """num_valid_tokens of every sample of one BFD-packed GPTDataset, indexed like __getitem__."""
+    # As in _query_bfd_packed_sample: whole documents, or split chunks plus their EOD.
+    docs = numpy.asarray(ds.bfd_docs, dtype=numpy.int64)
+    splits = numpy.asarray(ds.bfd_splits, dtype=numpy.int64).reshape(-1, 4)
+    lengths = numpy.empty(len(docs), dtype=numpy.int64)
+    lengths[docs >= 0] = ds.dataset.sequence_lengths[docs[docs >= 0]]
+    lengths[docs < 0] = splits[-docs[docs < 0] - 1, 2:].sum(axis=1)
+    bounds = numpy.concatenate(([0], numpy.cumsum(lengths)))[ds.sample_index[:, 0]]
+    per_bin = numpy.minimum(numpy.diff(bounds), ds.config.sequence_length)
+    return per_bin[ds.shuffle_index].astype(numpy.int32)
+
+
+def save_num_valid_tokens(dataset, key: str) -> None:
+    """Save num_valid_tokens of every sample of a BFD-packed GPTDataset or of a blend of them.
+
+    The array is rebuilt when it is missing or older than the BFD indices of any component, and
+    its name carries the BFD settings, which the dataset hashes do not cover.
+    """
+    components = dataset.datasets if hasattr(dataset, "datasets") else [dataset]
+    path_to_cache = dataset.config.path_to_cache or os.path.join(
+        components[0].dataset.path_prefix, "cache", "GPTDataset_indices"
+    )
+    name = (
+        f"{dataset.unique_description_hash}-{key}-bfd-maxdocs{dataset.config.max_docs_per_bin}"
+        f"-num_valid_tokens.npy"
+    )
+    path = os.path.join(path_to_cache, name)
+    sources = [ds.path_to_bfd_docs for ds in components if ds.path_to_bfd_docs]
+    if not os.path.isfile(path) or any(
+        os.path.getmtime(source) > os.path.getmtime(path) for source in sources
+    ):
+        per_component = [_bfd_num_valid_tokens(ds) for ds in components]
+        values = per_component[0]
+        if hasattr(dataset, "datasets"):
+            dataset_index, dataset_sample_index = dataset.dataset_index, dataset.dataset_sample_index
+            if dataset_index is None:  # defer_npy_index_mmap: the blend indices are loaded lazily
+                dataset_index = numpy.load(dataset.path_to_dataset_index, mmap_mode="r")
+                dataset_sample_index = numpy.load(dataset.path_to_dataset_sample_index, mmap_mode="r")
+            dataset_index = numpy.asarray(dataset_index)
+            # Rows of the blend grouped by component: one sort instead of one pass per component.
+            order = numpy.argsort(dataset_index, kind="stable")
+            ends = numpy.cumsum(numpy.bincount(dataset_index, minlength=len(components)))
+            values = numpy.empty(len(order), dtype=numpy.int32)
+            for rows, component_values in zip(numpy.split(order, ends[:-1]), per_component):
+                values[rows] = component_values[numpy.asarray(dataset_sample_index[rows])]
+        os.makedirs(path_to_cache, exist_ok=True)
+        tmp = f"{path}.{socket.gethostname()}.{os.getpid()}.tmp"  # unique across concurrent jobs
+        with open(tmp, "wb") as f:
+            numpy.save(f, values)
+        os.replace(tmp, path)
+    NUM_VALID_TOKENS_PATHS[key] = (path, len(dataset))
+
+
+class NumValidTokensDataset(torch.utils.data.Dataset):
+    """The dataset of a rank without first or last pipeline stage under BFD packing: only
+    num_valid_tokens per sample. Its length and split equal those of the dataset it stands in
+    for, so build_pretraining_data_loader gives it the same sampler."""
+
+    def __init__(self, path: str, length: int, split: Split) -> None:
+        self.values = numpy.load(path, mmap_mode="r")
+        self.length = length
+        self.index_split = split
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return {"num_valid_tokens": torch.tensor(int(self.values[idx]), dtype=torch.int32)}

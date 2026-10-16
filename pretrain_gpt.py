@@ -25,6 +25,7 @@ from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import NUM_VALID_TOKENS_PATHS, save_num_valid_tokens
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
@@ -276,14 +277,33 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
+def bfd_middle_ranks_read_num_valid_tokens(args):
+    """With BFD packing the MoE routers on every pipeline stage need each sample's number of valid
+    tokens. For plain pretraining data, ranks that hold no first or last pipeline stage read those
+    numbers from an array that global rank 0 saves, instead of building the datasets."""
+    return (
+        args.pretraining_packing_strategy == "bfd"
+        and args.pipeline_model_parallel_size > 2
+        and not (args.sft or args.mock_data or args.fim_data or args.dataloader_inter_document_masking)
+    )
+
+
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     args = get_args()
     config = core_transformer_config_from_args(args)
     if parallel_state.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence or args.pretraining_packing_strategy == "bfd":
-        # All PP stages run MoE routers and therefore need BFD's compact
-        # valid-token count. Only TP rank zero builds the local dataset.
+    elif is_packed_sequence:
+        # All PP stages need cu_seqlens. Only TP rank zero builds the local dataset.
+        return True
+    elif args.pretraining_packing_strategy == "bfd" and (
+        not bfd_middle_ranks_read_num_valid_tokens(args)
+        or parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+    ):
+        # All PP stages run MoE routers and need BFD's valid-token count. A first or last pipeline
+        # rank builds the datasets for all its model chunks: get_batch_on_this_tp_rank broadcasts
+        # tokens and labels by pipeline rank, also for its middle chunks.
         return True
     return (
         is_first_or_last_pipeline_stage(vp_stage)
@@ -402,6 +422,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
+
+    # BFD: ranks without first or last pipeline stage read num_valid_tokens saved here instead.
+    if bfd_middle_ranks_read_num_valid_tokens(args) and torch.distributed.get_rank() == 0:
+        NUM_VALID_TOKENS_PATHS.clear()
+        if isinstance(valid_ds, list):
+            valid = [(f"valid{i}", ds) for i, ds in enumerate(valid_ds)]
+        else:
+            valid = [("valid", valid_ds)]
+        for key, ds in [("train", train_ds), *valid, ("test", test_ds)]:
+            if ds is not None:
+                save_num_valid_tokens(ds, key)
 
     print_rank_0("> finished creating GPT datasets ...")
 
