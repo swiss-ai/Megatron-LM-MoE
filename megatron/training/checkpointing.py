@@ -452,6 +452,9 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
+    metadata['marin_qb_fixed_grid'] = (
+        getattr(args, 'moe_router_quantile_balancing_method', None) == 'marin_histogram'
+    )
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1821,6 +1824,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata["dp_cp_group"] = dp_cp_group
+        sharded_sd_metadata['marin_qb_legacy_range'] = not sharded_sd_metadata.get(
+            'marin_qb_fixed_grid', False)
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)

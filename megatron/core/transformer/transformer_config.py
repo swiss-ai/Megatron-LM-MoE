@@ -1040,11 +1040,11 @@ class TransformerConfig(ModelParallelConfig):
     """Number of uniform bins per expert used by histogram quantile balancing."""
 
     moe_router_quantile_balancing_marin_num_bins: int = 10000
-    """Bins for marin_histogram: raw-logit margins with a live global min/max grid.
-    Each forward pools a histogram over TP+DP+CP. With gradient accumulation,
-    token-weighted microbatch quantiles are averaged at the optimizer-step boundary;
-    this is not the quantile of the entire accumulated batch. Expert combination
-    weights still use moe_router_score_function. Adds three forward collectives.
+    """Bins for marin_histogram: pooled raw-logit margins on one fixed grid per step.
+    Counts accumulate across microbatches and are reduced over TP+DP+CP at the
+    optimizer-step boundary. The checkpointed range bootstraps at [-32, 32],
+    expands immediately, and contracts gradually between steps. Clipped quantiles
+    and nonfinite valid observations preserve the previous layer beta.
     """
 
     moe_router_force_load_balancing: bool = False

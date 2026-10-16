@@ -7,6 +7,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.jit import jit_fuser
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -16,10 +17,10 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_qb_histogram,
+    compute_marin_qb_histogram,
     compute_routing_scores_for_aux_loss,
     dropped_token_fraction,
     get_tokens_per_expert_and_token_count,
-    marin_qb_histogram_update,
     pop_routing_oob_accum,
     qb_dual_update,
     router_gating_linear,
@@ -34,7 +35,7 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 # persistent MoE buffers for rerun state machine
-_RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta')
+_RERUN_ROUTER_BUFFERS = ('expert_bias', 'qb_beta', 'qb_marin_range')
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -241,6 +242,10 @@ class TopKRouter(Router):
         # sequence-level aux loss through the load-balancing type list. The average method
         # accumulates per-microbatch quantiles, while the histogram method accumulates local
         # counts and recovers the pooled quantile at the global-batch boundary.
+        self.register_buffer('qb_marin_range', None)
+        self.register_buffer('qb_marin_tails', None, persistent=False)
+        self.register_buffer('qb_marin_extrema', None, persistent=False)
+        self.register_buffer('qb_marin_bad_tokens', None, persistent=False)
         if "quantile_balancing" in self.routing_type:
             self.register_buffer(
                 'qb_beta',
@@ -250,13 +255,15 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
-            if self.config.moe_router_quantile_balancing_method == 'histogram':
+            if self.config.moe_router_quantile_balancing_method in ('histogram', 'marin_histogram'):
+                is_marin = self.config.moe_router_quantile_balancing_method == 'marin_histogram'
                 self.register_buffer(
                     'qb_histogram',
                     torch.zeros(
                         (
                             self.config.num_moe_experts,
-                            self.config.moe_router_quantile_balancing_num_bins,
+                            self.config.moe_router_quantile_balancing_marin_num_bins if is_marin
+                            else self.config.moe_router_quantile_balancing_num_bins,
                         ),
                         dtype=torch.int64,
                         device=torch.cuda.current_device(),
@@ -265,6 +272,14 @@ class TopKRouter(Router):
                 )
                 self.qb_beta_accum = None
                 self.qb_beta_count = None
+                if is_marin:
+                    self.qb_marin_range = self.qb_beta.new_tensor([-32.0, 32.0])
+                    self.qb_marin_tails = torch.zeros(
+                        self.config.num_moe_experts, 2, dtype=torch.int64,
+                        device=self.qb_beta.device)
+                    self.qb_marin_extrema = self.qb_beta.new_tensor([float('inf'), -float('inf')])
+                    self.qb_marin_bad_tokens = torch.zeros(
+                        (), dtype=torch.int64, device=self.qb_beta.device)
             else:
                 self.qb_histogram = None
                 self.register_buffer(
@@ -303,6 +318,15 @@ class TopKRouter(Router):
         """Restore the snapshot taken by get_rerun_state()."""
         for n, saved in state.items():
             getattr(self, n).copy_(saved)
+        # A rejected/partial pass must not contribute counts to its replay.
+        for name in ('qb_histogram', 'qb_beta_accum', 'qb_beta_count',
+                     'qb_marin_tails', 'qb_marin_bad_tokens'):
+            value = getattr(self, name, None)
+            if value is not None:
+                value.zero_()
+        if self.qb_marin_extrema is not None:
+            self.qb_marin_extrema.copy_(self.qb_marin_extrema.new_tensor(
+                [float('inf'), -float('inf')]))
 
     def _maintain_float32_expert_bias(self):
         """
@@ -321,6 +345,10 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        for name in ('qb_marin_range', 'qb_marin_extrema'):
+            value = getattr(self, name, None)
+            if value is not None and value.dtype != torch.float32:
+                value.data = value.data.float()
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -365,8 +393,8 @@ class TopKRouter(Router):
         compatibility with older QB checkpoints, while ``average`` uses bounded
         router scores. The histogram method performs no forward-pass communication:
         it accumulates local counts that are pooled once at the batch boundary.
-        ``marin_histogram`` uses raw logits and a live global histogram per forward,
-        then token-weights its quantiles across microbatches at the batch boundary.
+        ``marin_histogram`` pools raw-logit counts on one fixed grid throughout
+        the optimizer step, then decodes a quantile at the batch boundary.
 
         Returns probs, routing_map and, when a capacity factor is set, the selection margin
         ``(qb_scores - qb_beta) - alpha`` used to rank tokens for dropping, where ``alpha`` is
@@ -427,19 +455,15 @@ class TopKRouter(Router):
 
             if should_update_beta:
                 if use_marin:
-                    if self.tp_dp_cp_group is None:
-                        raise RuntimeError("marin_histogram requires a TP+DP+CP process group")
-                    beta_local, token_count = marin_qb_histogram_update(
-                        qb_scores,
-                        topk_result.values[:, -1],
-                        self.qb_beta,
-                        self.topk,
+                    histogram, tails, extrema, bad_tokens = compute_marin_qb_histogram(
+                        qb_scores, topk_result.values[:, -1], self.qb_marin_range,
                         self.config.moe_router_quantile_balancing_marin_num_bins,
-                        group=self.tp_dp_cp_group,
-                        padding_mask=padding_mask,
-                    )
-                    self.qb_beta_accum.add_(beta_local * token_count)
-                    self.qb_beta_count.add_(token_count)
+                        padding_mask=padding_mask)
+                    self.qb_histogram.add_(histogram)
+                    self.qb_marin_tails.add_(tails)
+                    self.qb_marin_bad_tokens.add_(bad_tokens)
+                    self.qb_marin_extrema[0].copy_(torch.minimum(self.qb_marin_extrema[0], extrema[0]))
+                    self.qb_marin_extrema[1].copy_(torch.maximum(self.qb_marin_extrema[1], extrema[1]))
                 elif use_histogram:
                     # Hand the mask down instead of compacting the rows here:
                     # scores[~padding_mask] lowers to nonzero(), which synchronizes the
@@ -1150,10 +1174,20 @@ class TopKRouter(Router):
 
         return probs, routing_map
 
-    def _load_from_state_dict(self, *args, **kwargs):
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        state = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.qb_marin_range is not None and (metadata or {}).get('marin_qb_legacy_range', False):
+            # Old torch_dist checkpoints have no range tensor. Restore the local
+            # bootstrap value without asking the distributed loader for a missing key.
+            state[prefix + 'qb_marin_range'] = LocalNonpersistentObject(self.qb_marin_range)
+        return state
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         """Load the state dict of the router."""
         self._maintain_float32_expert_bias()  # switch to float32 before loading
-        return super()._load_from_state_dict(*args, **kwargs)
+        if self.qb_marin_range is not None and prefix + 'qb_marin_range' not in state_dict:
+            state_dict[prefix + 'qb_marin_range'] = self.qb_marin_range.detach().clone()
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _save_to_state_dict(self, *args, **kwargs):
         """Save the state dict of the router."""

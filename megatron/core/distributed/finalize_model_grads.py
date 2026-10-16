@@ -27,6 +27,7 @@ from ..transformer.moe.moe_utils import (
     expert_load_violation_batchwise,
     get_updated_expert_bias,
     recover_qb_beta_from_histogram,
+    recover_marin_qb_beta,
     save_to_aux_losses_tracker,
 )
 from ..transformer.transformer_config import TransformerConfig
@@ -303,6 +304,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_histogram', None) is not None:
                 module.qb_histogram.zero_()
+            if getattr(module, 'qb_marin_tails', None) is not None:
+                module.qb_marin_tails.zero_()
+                module.qb_marin_bad_tokens.zero_()
+                module.qb_marin_extrema[0].fill_(float('inf'))
+                module.qb_marin_extrema[1].fill_(-float('inf'))
             if getattr(module, 'expert_load_sample_count', None) is not None:
                 module.expert_load_sample_count.zero_()
 
@@ -532,6 +538,58 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
+def _update_marin_router_qb_beta(model, config, group):
+    """Pool one fixed-grid histogram per layer over the whole optimizer step."""
+    assert group is not None, 'Marin histogram QB requires a TP+DP+CP group'
+    modules = [module for chunk in model
+               for module in get_attr_wrapped_model(chunk, 'modules')()
+               if getattr(module, 'qb_marin_range', None) is not None and module.training]
+    if not modules:
+        return
+    hist = torch.stack([m.qb_histogram for m in modules])
+    tails = torch.stack([m.qb_marin_tails for m in modules])
+    bad = torch.stack([m.qb_marin_bad_tokens for m in modules])
+    extrema = torch.stack([m.qb_marin_extrema for m in modules])
+    bounds = torch.stack([m.qb_marin_range for m in modules])
+    beta = torch.stack([m.qb_beta for m in modules])
+    torch.distributed.all_reduce(hist, group=group)
+    statistics = torch.cat((tails.flatten(1), bad[:, None]), dim=1)
+    torch.distributed.all_reduce(statistics, group=group)
+    tails = statistics[:, :-1].reshape_as(tails)
+    bad = statistics[:, -1]
+    lo, hi = extrema[:, 0].contiguous(), extrema[:, 1].contiguous()
+    torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
+    torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
+    estimate, next_bounds, accept = recover_marin_qb_beta(
+        hist, tails, bounds, torch.stack((lo, hi), dim=-1), bad, beta,
+        config.moe_router_topk)
+    updated = config.moe_router_quantile_balancing_ema * beta + (
+        1.0 - config.moe_router_quantile_balancing_ema) * estimate
+    updated = updated - updated.mean(dim=-1, keepdim=True)
+    # Preserve the COMPLETE previous layer bias on rejected/all-padding steps.
+    updated = torch.where(accept[:, None], updated, beta)
+    for i, module in enumerate(modules):
+        observations = hist[i].sum().clamp_min(1).float()
+        metrics = {
+            'qb_histogram_underflow_fraction': tails[i, :, 0].sum() / observations,
+            'qb_histogram_overflow_fraction': tails[i, :, 1].sum() / observations,
+            'qb_histogram_nonfinite_tokens': bad[i].float(),
+            'qb_histogram_update_skipped': (~accept[i]).float(),
+            'qb_histogram_range_min': bounds[i, 0],
+            'qb_histogram_range_max': bounds[i, 1],
+        }
+        layer = module.layer_number
+        num_layers = config.num_layers
+        if getattr(module, 'is_mtp_layer', False):
+            layer += config.num_layers
+        num_layers += getattr(config, 'mtp_num_layers', None) or 0
+        for name, value in metrics.items():
+            save_to_aux_losses_tracker(
+                name, value * get_num_microbatches(), layer, num_layers)
+        module.qb_beta.copy_(updated[i])
+        module.qb_marin_range.copy_(next_bounds[i])
+
+
 def _update_router_qb_beta(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -539,6 +597,9 @@ def _update_router_qb_beta(
     tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Update the quantile-balancing per-expert bias once per global batch."""
+    if config.moe_router_quantile_balancing_method == 'marin_histogram':
+        _update_marin_router_qb_beta(model, config, tp_dp_cp_group)
+        return
     if config.moe_router_quantile_balancing_method == 'histogram':
         assert tp_dp_cp_group is not None, (
             "Histogram quantile balancing requires a TP+DP+CP process group."
@@ -756,7 +817,7 @@ def finalize_model_grads(
     config = get_model_config(model[0])
     uses_histogram_qb = (
         "quantile_balancing" in config.moe_router_load_balancing_type
-        and config.moe_router_quantile_balancing_method == 'histogram'
+        and config.moe_router_quantile_balancing_method in ('histogram', 'marin_histogram')
     )
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')

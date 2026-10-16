@@ -2408,6 +2408,14 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
+        if args.moe_router_quantile_balancing_method == 'marin_histogram':
+            # These are recorded ONCE per optimizer step, rather than per microbatch.
+            # Compensate for the common aux-metric microbatch averaging below.
+            track_names.extend([
+                'qb_histogram_underflow_fraction', 'qb_histogram_overflow_fraction',
+                'qb_histogram_nonfinite_tokens', 'qb_histogram_update_skipped',
+                'qb_histogram_range_min', 'qb_histogram_range_max',
+            ])
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:

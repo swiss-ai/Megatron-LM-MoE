@@ -40,23 +40,34 @@ matching Marin's denominator epsilon. Other routing methods retain `1e-20`.
 This reduces the total combine weight when all selected sigmoid scores are tiny;
 it does not change expert selection. Existing Marin checkpoints can resume without
 converting weights or optimizer state, but their tiny-score behavior changes.
-The top-(k+1) cutoff defines raw-logit margins. Two scalar all-reduces find their
-current global extrema; an integer histogram reduction pools counts. The upper
-quantile is interpolated within the crossing bin. Padding contributes neither
-extrema nor counts; empty global forwards preserve the previous threshold.
+The top-(k+1) cutoff defines raw-logit margins. Every layer holds one fixed grid
+throughout an optimizer step and adds local integer counts for each microbatch.
+At finalization, counts are summed across TP+DP+CP and one upper-tail quantile is
+decoded per expert, followed by EMA and mean-centering. There are no QB forward
+collectives. With identical starting beta/range and tokens, partitioning tokens
+across microbatches or ranks gives identical pooled counts.
 
-**Gradient accumulation changes the semantics:** each microbatch uses its own
-globally agreed live grid, and its resulting quantile is weighted by valid-token
-count. These estimates are averaged at the optimizer-step boundary before the
-existing EMA and mean-centering. With one microbatch this is a global-batch
-histogram; with multiple microbatches it is an average of global-microbatch
-quantiles, NOT a pooled full-step quantile. Histograms on different grids cannot
-simply be added. No full-step routing margins are retained in memory.
+**Range approximation relative to Marin:** Marin determines its range from the
+current distributed batch. Sequential gradient accumulation cannot know that
+range without retaining or recomputing earlier margins. Here each layer starts
+at [-32, 32] and adapts the NEXT step's grid from pooled finite extrema: include
+the observed range with 10% padding, expanding immediately but contracting at
+most 5% of the previous span per edge. Quantiles landing in a clipped edge bin
+preserve the whole layer's previous beta while the range adapts. A nonfinite valid
+token row also prevents the layer's beta/range update; padding is excluded. This
+protects the QB state, not the forward output or gradients of that bad token.
+All-padding steps preserve beta and range too.
 
-There are three new forward collectives per routed layer per microbatch, unlike
-the existing bounded-score histogram's step-boundary-only communication. More
-bins and temporary margin tensors also cost memory. GPU throughput and CUDA graph
-compatibility must be measured on the target setup.
+W&B/TensorBoard log `qb_histogram_underflow_fraction`,
+`qb_histogram_overflow_fraction` (fractions of finite token-expert margins),
+`qb_histogram_nonfinite_tokens`, `qb_histogram_update_skipped`, and
+`qb_histogram_range_min`/`qb_histogram_range_max` (the grid used that step).
+These are step-level metrics, not divided down by the accumulation count.
+
+With 256 experts and 10,000 bins the persistent int64 histogram is 19.5 MiB per
+MoE layer; finalization temporarily stacks one additional histogram per local
+layer. No full-step margins are retained. GPU memory/throughput and CUDA graph
+compatibility must still be measured on the target setup.
 
 ## Checkpoints
 
@@ -66,6 +77,12 @@ or convert its saved thresholds. Use a fresh run or an explicitly prepared
 checkpoint with reinitialized QB thresholds, then assess the routing transient.
 Checkpoints produced with `marin_histogram` retain the method through the existing
 checkpoint-argument loader and use raw-logit selection during inference too.
+Existing Marin checkpoints from the microbatch-quantile implementation load
+without resetting beta, model, optimizer, scheduler, or counters. Missing range
+state bootstraps at [-32, 32]; new checkpoints persist each layer's range.
+Distributed-checkpoint content metadata distinguishes these formats so strict
+loading does not request a missing range shard from an old checkpoint. Reruns
+restore beta/range and clear the rejected pass's temporary histogram statistics.
 
 ## Validation
 

@@ -237,6 +237,93 @@ def qb_dual_update(
     return indices, beta_local
 
 
+def compute_marin_qb_histogram(
+    logits: torch.Tensor,
+    alpha: torch.Tensor,
+    bounds: torch.Tensor,
+    num_bins: int,
+    padding_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Local raw-logit counts on a grid held fixed for an entire optimizer step.
+
+    Return histogram, per-expert [underflow, overflow] counts, finite margin
+    extrema, and the number of nonfinite valid token rows. No collectives or
+    host synchronization are performed. Padding never contributes observations.
+    """
+    with torch.no_grad():
+        margins = logits.detach().float() - alpha.detach().float().unsqueeze(1)
+        valid = torch.ones_like(alpha, dtype=torch.bool) if padding_mask is None else ~padding_mask.bool()
+        finite = torch.isfinite(margins).all(dim=-1)
+        bad_tokens = (valid & ~finite).sum()
+        valid = valid & finite
+        safe = torch.where(valid[:, None], margins, bounds[0])
+        width = (bounds[1] - bounds[0]) / num_bins
+        bins = ((safe - bounds[0]) / width).clamp(0, num_bins - 1).long()
+        offsets = torch.arange(logits.shape[1], device=logits.device) * num_bins
+        histogram = torch.zeros(logits.shape[1] * num_bins, dtype=torch.int64, device=logits.device)
+        histogram.scatter_add_(
+            0, (bins + offsets).flatten(),
+            valid[:, None].expand_as(bins).reshape(-1).to(torch.int64),
+        )
+        tails = torch.stack((
+            ((margins < bounds[0]) & valid[:, None]).sum(dim=0),
+            ((margins > bounds[1]) & valid[:, None]).sum(dim=0),
+        ), dim=-1)
+        if margins.numel() == 0:
+            extrema = bounds.new_tensor([float('inf'), -float('inf')])
+        else:
+            extrema = torch.stack((
+                margins.masked_fill(~valid[:, None], float('inf')).amin(),
+                margins.masked_fill(~valid[:, None], -float('inf')).amax(),
+            ))
+        return histogram.reshape(logits.shape[1], num_bins), tails, extrema, bad_tokens
+
+
+def recover_marin_qb_beta(
+    histogram: torch.Tensor,
+    tails: torch.Tensor,
+    bounds: torch.Tensor,
+    extrema: torch.Tensor,
+    bad_tokens: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Decode pooled counts, flag clipped quantiles, and adapt the NEXT step's grid.
+
+    Leading layer dimensions are supported. Clipped observations count toward
+    quantile ranks, but an estimate landing in a clipped edge bin is rejected.
+    """
+    token_counts = histogram.sum(dim=-1)
+    target = token_counts.float() * topk / histogram.shape[-2]
+    cumulative = histogram.flip(-1).cumsum(-1).flip(-1)
+    crossing = ((cumulative >= target.unsqueeze(-1)).sum(-1) - 1).clamp(0, histogram.shape[-1] - 1)
+    above = cumulative.gather(-1, crossing.unsqueeze(-1)).squeeze(-1)
+    in_bin = histogram.gather(-1, crossing.unsqueeze(-1)).squeeze(-1)
+    width = (bounds[..., 1] - bounds[..., 0]) / histogram.shape[-1]
+    estimate = bounds[..., 0, None] + width.unsqueeze(-1) * (
+        crossing + (above - target) / in_bin.clamp_min(1)
+    )
+    clipped = ((crossing == 0) & (tails[..., 0] > 0)) | (
+        (crossing == histogram.shape[-1] - 1) & (tails[..., 1] > 0)
+    )
+    has_tokens = token_counts[..., 0] > 0
+    accept = has_tokens & (bad_tokens == 0) & ~clipped.any(dim=-1)
+    estimate = torch.where(accept.unsqueeze(-1), estimate, beta)
+
+    # Include all observed finite values with 10% padding; contract by at most
+    # 5% of the old span at each edge, so one narrow batch cannot collapse it.
+    span = (bounds[..., 1] - bounds[..., 0]).clamp_min(1e-3)
+    observed_span = (extrema[..., 1] - extrema[..., 0]).clamp_min(1e-3)
+    padding = observed_span * 0.1
+    next_bounds = torch.stack((
+        torch.minimum(extrema[..., 0] - padding, bounds[..., 0] + span * 0.05),
+        torch.maximum(extrema[..., 1] + padding, bounds[..., 1] - span * 0.05),
+    ), dim=-1)
+    can_adapt = has_tokens & (bad_tokens == 0) & torch.isfinite(next_bounds).all(dim=-1)
+    next_bounds = torch.where(can_adapt.unsqueeze(-1), next_bounds, bounds)
+    return estimate, next_bounds, accept
+
+
 def marin_qb_histogram_update(
     logits: torch.Tensor,
     alpha: torch.Tensor,

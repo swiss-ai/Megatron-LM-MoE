@@ -35,6 +35,10 @@ update = load_function(
     "megatron/core/transformer/moe/moe_utils.py", "marin_qb_histogram_update",
     {"torch": torch, "Optional": Optional, "Tuple": Tuple},
 )
+compute_pooled = load_function(
+    'megatron/core/transformer/moe/moe_utils.py', 'compute_marin_qb_histogram', {'torch': torch})
+recover_pooled = load_function(
+    'megatron/core/transformer/moe/moe_utils.py', 'recover_marin_qb_beta', {'torch': torch})
 
 
 def distributed_worker(rank, rendezvous):
@@ -53,6 +57,24 @@ def distributed_worker(rank, rendezvous):
             actual, count = update(logits[sl], alpha[sl], beta, 2, group=dist.group.WORLD)
             torch.testing.assert_close(actual, expected)
             assert count.item() == 37
+            bounds = torch.tensor([-256., 256.])
+            reference_parts = compute_pooled(logits, alpha, bounds, 10000)
+            expected_pooled = recover_pooled(
+                *reference_parts[:2], bounds, *reference_parts[2:], beta, 2)
+            local_logits, local_alpha = logits[sl], alpha[sl]
+            cut = local_logits.shape[0] // 2
+            parts = [compute_pooled(local_logits[a:b], local_alpha[a:b], bounds, 10000)
+                     for a, b in ((0, cut), (cut, local_logits.shape[0]))]
+            hist, tails, bad = sum(p[0] for p in parts), sum(p[1] for p in parts), sum(p[3] for p in parts)
+            lo = torch.stack([p[2][0] for p in parts]).min()
+            hi = torch.stack([p[2][1] for p in parts]).max()
+            for value in (hist, tails, bad):
+                dist.all_reduce(value)
+            dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+            dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+            actual_pooled = recover_pooled(hist, tails, bounds, torch.stack((lo, hi)), bad, beta, 2)
+            for actual_value, expected_value in zip(actual_pooled, expected_pooled):
+                torch.testing.assert_close(actual_value, expected_value)
         actual, count = update(
             logits, alpha, beta, 2, group=dist.group.WORLD,
             padding_mask=torch.ones(37, dtype=torch.bool),
@@ -64,6 +86,171 @@ def distributed_worker(rank, rendezvous):
 
 
 class TestMarinQB(unittest.TestCase):
+    def test_fixed_grid_counts_and_beta_are_partition_invariant(self):
+        torch.manual_seed(5)
+        logits = torch.randn(97, 8) * 3
+        beta = torch.linspace(-1, 1, 8)
+        alpha = (logits - beta).topk(3, dim=-1).values[:, -1]
+        bounds = torch.tensor([-32., 32.])
+        expected = compute_pooled(logits, alpha, bounds, 10000)
+        for splits in ([0, 97], [0, 11, 97], [0, 0, 11, 37, 97]):
+            parts = [compute_pooled(logits[a:b], alpha[a:b], bounds, 10000)
+                     for a, b in zip(splits, splits[1:])]
+            hist = sum(p[0] for p in parts)
+            tails = sum(p[1] for p in parts)
+            extrema = torch.stack((torch.stack([p[2][0] for p in parts]).min(),
+                                   torch.stack([p[2][1] for p in parts]).max()))
+            bad = sum(p[3] for p in parts)
+            for actual, wanted in zip((hist, tails, extrema, bad), expected):
+                torch.testing.assert_close(actual, wanted)
+            result = recover_pooled(hist, tails, bounds, extrema, bad, beta, 2)
+            reference = recover_pooled(*expected[:2], bounds, *expected[2:], beta, 2)
+            for actual, wanted in zip(result, reference):
+                torch.testing.assert_close(actual, wanted)
+            self.assertTrue(result[2].item())
+
+    def test_overflow_rejects_bias_but_expands_next_grid(self):
+        logits = torch.tensor([[100., 99., 0., -1.]]).repeat(32, 1)
+        beta = torch.tensor([0.3, 0.2, -0.1, -0.4])
+        alpha = (logits - beta).topk(2, dim=-1).values[:, -1]
+        bounds = torch.tensor([-1., 1.])
+        hist, tails, extrema, bad = compute_pooled(logits, alpha, bounds, 10000)
+        estimate, next_bounds, accept = recover_pooled(hist, tails, bounds, extrema, bad, beta, 1)
+        self.assertFalse(accept.item())
+        torch.testing.assert_close(estimate, beta)
+        self.assertGreater(tails.sum().item(), 0)
+        self.assertLess(next_bounds[0].item(), extrema[0].item())
+        self.assertGreater(next_bounds[1].item(), extrema[1].item())
+        hist, tails, extrema, bad = compute_pooled(logits, alpha, next_bounds, 10000)
+        _, _, accept = recover_pooled(hist, tails, next_bounds, extrema, bad, beta, 1)
+        self.assertTrue(accept.item())
+
+    def test_nonfinite_valid_rows_reject_update_padding_does_not(self):
+        logits = torch.tensor([[2., 1., 0., -1.], [float('nan'), 0., 0., 0.]])
+        alpha = torch.tensor([0., float('nan')])
+        bounds, beta = torch.tensor([-32., 32.]), torch.zeros(4)
+        for mask, expected_bad, expected_accept in (
+            (None, 1, False), (torch.tensor([False, True]), 0, True),
+        ):
+            hist, tails, extrema, bad = compute_pooled(logits, alpha, bounds, 10000, mask)
+            self.assertEqual(bad.item(), expected_bad)
+            self.assertEqual(hist[0].sum().item(), 1)
+            estimate, next_bounds, accept = recover_pooled(hist, tails, bounds, extrema, bad, beta, 1)
+            self.assertEqual(accept.item(), expected_accept)
+            self.assertTrue(torch.isfinite(estimate).all())
+            self.assertTrue(torch.isfinite(next_bounds).all())
+
+    def test_empty_padded_and_batched_layers(self):
+        bounds, beta = torch.tensor([-32., 32.]), torch.zeros(4)
+        for logits, alpha, mask in (
+            (torch.empty(0, 4), torch.empty(0), None),
+            (torch.full((3, 4), float('nan')), torch.full((3,), float('nan')),
+             torch.ones(3, dtype=torch.bool)),
+        ):
+            hist, tails, extrema, bad = compute_pooled(logits, alpha, bounds, 100, mask)
+            result = recover_pooled(hist, tails, bounds, extrema, bad, beta, 1)
+            torch.testing.assert_close(result[0], beta)
+            torch.testing.assert_close(result[1], bounds)
+            self.assertFalse(result[2].item())
+            batched = recover_pooled(hist[None], tails[None], bounds[None], extrema[None], bad[None], beta[None], 1)
+            for actual, expected in zip(batched, result):
+                torch.testing.assert_close(actual[0], expected)
+
+    def test_grid_contraction_is_limited(self):
+        bounds, beta = torch.tensor([-32., 32.]), torch.zeros(4)
+        hist, tails, extrema, bad = compute_pooled(torch.zeros(32, 4), torch.zeros(32), bounds, 10000)
+        _, next_bounds, _ = recover_pooled(hist, tails, bounds, extrema, bad, beta, 1)
+        torch.testing.assert_close(next_bounds, torch.tensor([-28.8, 28.8]))
+
+    def test_rerun_restores_range_and_clears_partial_counts(self):
+        ns = {'torch': torch, '_RERUN_ROUTER_BUFFERS': ('qb_beta', 'qb_marin_range')}
+        snapshot = load_function('megatron/core/transformer/moe/router.py', 'get_router_rerun_state', ns, 'TopKRouter')
+        restore = load_function('megatron/core/transformer/moe/router.py', 'set_router_rerun_state', ns, 'TopKRouter')
+        router = SimpleNamespace(qb_beta=torch.arange(4).float(), qb_marin_range=torch.tensor([-32., 32.]),
+                                 qb_histogram=torch.ones(4, 100, dtype=torch.long),
+                                 qb_marin_tails=torch.ones(4, 2, dtype=torch.long),
+                                 qb_marin_bad_tokens=torch.tensor(1), qb_marin_extrema=torch.tensor([-10., 10.]))
+        state = snapshot(router)
+        router.qb_beta.add_(20)
+        router.qb_marin_range.mul_(2)
+        restore(router, state)
+        torch.testing.assert_close(router.qb_beta, torch.arange(4).float())
+        torch.testing.assert_close(router.qb_marin_range, torch.tensor([-32., 32.]))
+        self.assertEqual(router.qb_histogram.sum().item(), 0)
+        self.assertEqual(router.qb_marin_tails.sum().item(), 0)
+        self.assertEqual(router.qb_marin_bad_tokens.item(), 0)
+        self.assertEqual(router.qb_marin_extrema.tolist(), [float('inf'), -float('inf')])
+
+    def test_range_checkpoint_roundtrip_and_legacy_bootstrap(self):
+        class Parent(torch.nn.Module):
+            def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+                return {prefix + key: ('sharded', value) for key, value in self.state_dict().items()}
+
+        class Local:
+            def __init__(self, value):
+                self.value = value
+
+        tree = ast.parse((ROOT / 'megatron/core/transformer/moe/router.py').read_text(encoding='utf-8'))
+        original = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'TopKRouter')
+        methods = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in (
+            'sharded_state_dict', '_load_from_state_dict', '_save_to_state_dict',
+            '_maintain_float32_expert_bias')]
+        namespace = {'torch': torch, 'Parent': Parent, 'LocalNonpersistentObject': Local}
+        cls = ast.ClassDef(name='Router', bases=[ast.Name(id='Parent', ctx=ast.Load())],
+                           keywords=[], body=methods, decorator_list=[])
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
+                     '<production checkpoint methods>', 'exec'), namespace)
+
+        def make():
+            router = namespace['Router']()
+            router.register_buffer('qb_beta', torch.arange(4).float())
+            router.register_buffer('qb_marin_range', torch.tensor([-32., 32.]))
+            return router
+
+        router = make()
+        # Old state dict has only beta. Strict loading must still work.
+        router.load_state_dict({'qb_beta': torch.ones(4)}, strict=True)
+        torch.testing.assert_close(router.qb_beta, torch.ones(4))
+        torch.testing.assert_close(router.qb_marin_range, torch.tensor([-32., 32.]))
+        router.qb_marin_range.copy_(torch.tensor([-13., 57.]))
+        restored = make()
+        restored.load_state_dict(router.state_dict(), strict=True)
+        torch.testing.assert_close(restored.qb_marin_range, router.qb_marin_range)
+        self.assertIsInstance(router.sharded_state_dict(metadata={
+            'marin_qb_legacy_range': True})['qb_marin_range'], Local)
+        self.assertEqual(router.sharded_state_dict(metadata={})['qb_marin_range'][0], 'sharded')
+
+    def test_pooled_finalization_centers_and_logs_once_per_step(self):
+        logs = {}
+        ns = {'torch': torch, 'recover_marin_qb_beta': recover_pooled,
+              'get_attr_wrapped_model': lambda obj, name: getattr(obj, name),
+              'get_num_microbatches': lambda: 4,
+              'save_to_aux_losses_tracker': lambda name, value, *args: logs.update({name: value})}
+        finalize = load_function('megatron/core/distributed/finalize_model_grads.py',
+                                 '_update_marin_router_qb_beta', ns)
+        beta = torch.tensor([0.3, 0.2, -0.1, -0.4])
+        bounds = torch.tensor([-32., 32.])
+        logits = torch.tensor([[3., 2., 1., 0.]]).repeat(32, 1)
+        alpha = (logits - beta).topk(2, dim=-1).values[:, -1]
+        hist, tails, extrema, bad = compute_pooled(logits, alpha, bounds, 10000)
+        expected, expected_bounds, _ = recover_pooled(hist, tails, bounds, extrema, bad, beta, 1)
+        module = SimpleNamespace(training=True, qb_beta=beta.clone(), qb_histogram=hist,
+                                 qb_marin_range=bounds.clone(), qb_marin_tails=tails,
+                                 qb_marin_extrema=extrema, qb_marin_bad_tokens=bad,
+                                 layer_number=1, is_mtp_layer=False)
+        model = SimpleNamespace(modules=lambda: [module])
+        cfg = SimpleNamespace(moe_router_topk=1, moe_router_quantile_balancing_ema=0.25,
+                              num_layers=1, mtp_num_layers=None)
+        with patch.object(dist, 'all_reduce', return_value=None) as reduce:
+            finalize([model], cfg, object())
+            self.assertEqual(reduce.call_count, 4)
+        wanted = 0.25 * beta + 0.75 * expected
+        torch.testing.assert_close(module.qb_beta, wanted - wanted.mean())
+        torch.testing.assert_close(module.qb_marin_range, expected_bounds)
+        self.assertEqual(logs['qb_histogram_update_skipped'].item(), 0.)
+        self.assertEqual(logs['qb_histogram_range_min'].item() / 4, -32.)
+
+
     def test_order_statistic_within_bin_width(self):
         torch.manual_seed(9)
         for tokens in (31, 128):
@@ -117,7 +304,7 @@ class TestMarinQB(unittest.TestCase):
         )
 
         ns = {"torch": torch, "Optional": Optional,
-              "marin_qb_histogram_update": lambda *a, **kw: update(*a, **{**kw, "group": None}),
+              "compute_marin_qb_histogram": compute_pooled,
               "topk_routing_with_score_function": combine}
         route = load_function("megatron/core/transformer/moe/router.py", "quantile_balancing", ns, "TopKRouter")
         cfg = SimpleNamespace(moe_router_fusion=False, moe_router_num_groups=None,
@@ -127,7 +314,11 @@ class TestMarinQB(unittest.TestCase):
         beta = torch.tensor([0.2, 0.1, 0., -0.1])
         router = SimpleNamespace(config=cfg, tp_cp_group=None, tp_dp_cp_group=object(), training=True,
                                  score_function="sigmoid", topk=2, qb_beta=beta.clone(),
-                                 qb_beta_accum=torch.zeros(4), qb_beta_count=torch.zeros((), dtype=torch.long))
+                                 qb_histogram=torch.zeros(4, 10000, dtype=torch.long),
+                                 qb_marin_range=torch.tensor([-32., 32.]),
+                                 qb_marin_tails=torch.zeros(4, 2, dtype=torch.long),
+                                 qb_marin_bad_tokens=torch.zeros((), dtype=torch.long),
+                                 qb_marin_extrema=torch.tensor([float('inf'), -float('inf')]))
         logits = torch.tensor([[106., 105., 100., 99.]]).repeat(8, 1)
         weights, selected = route(router, logits)
         expected = torch.zeros_like(selected).scatter_(1, (logits - beta).topk(2, dim=1).indices, True)
@@ -136,11 +327,11 @@ class TestMarinQB(unittest.TestCase):
         self.assertFalse(torch.equal(selected, sigmoid_selected))
         torch.testing.assert_close(weights.sum(-1), torch.full((8,), 2.5))
         torch.testing.assert_close(router.qb_beta, beta)
-        self.assertEqual(router.qb_beta_count.item(), 8)
-        accumulated = router.qb_beta_accum.clone()
+        self.assertEqual(router.qb_histogram[0].sum().item(), 8)
+        accumulated = router.qb_histogram.clone()
         router.training = False
         route(router, logits)
-        torch.testing.assert_close(router.qb_beta_accum, accumulated)
+        torch.testing.assert_close(router.qb_histogram, accumulated)
 
         infer = load_function("megatron/core/transformer/moe/router.py", "_forward", ns, "InferenceTopKRouter")
         router.gating = lambda x: x
@@ -181,7 +372,7 @@ class TestMarinQB(unittest.TestCase):
                                  qb_beta_accum=torch.tensor([2., 4., 8., 10.]),
                                  qb_beta_count=torch.tensor(2))
         model = SimpleNamespace(modules=lambda: [module])
-        config = SimpleNamespace(moe_router_quantile_balancing_method="marin_histogram",
+        config = SimpleNamespace(moe_router_quantile_balancing_method="legacy_average",
                                  moe_router_quantile_balancing_ema=0.)
         with patch.object(dist, "all_reduce", return_value=SimpleNamespace(wait=lambda: None)):
             finalize([model], config)
