@@ -12,7 +12,7 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.core.datasets.utils import compile_helpers
+from megatron.core.datasets.utils import Split, compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.utils.tokenizer_extra_metadata import (
     ModelSpecialTokens,
@@ -165,6 +165,130 @@ def test_bfd_dataset_emits_compact_padding_boundary():
     # This real token predicts the first pad, so it is absent from LM loss but
     # remains inside the routing-valid prefix [0:num_valid_tokens].
     assert sample["loss_mask"][2] == 0
+
+
+def test_bfd_num_valid_tokens_array_matches_samples(tmp_path):
+    """The per-sample num_valid_tokens array that middle pipeline stages read equals what
+    __getitem__ emits for every sample, and NumValidTokensDataset serves it."""
+    from megatron.core.datasets import gpt_dataset
+
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=64,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+        pretraining_packing_strategy="bfd",
+        path_to_cache=str(tmp_path),
+    )
+    dataset = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [300, 0, 0], lambda: True, config
+    ).build()[0]
+
+    gpt_dataset.save_num_valid_tokens(dataset, "train")
+    stand_in = gpt_dataset.NumValidTokensDataset(
+        *gpt_dataset.NUM_VALID_TOKENS_PATHS["train"], Split.train
+    )
+    assert len(stand_in) == len(dataset) and stand_in.index_split == Split.train
+    expected = [int(dataset[i]["num_valid_tokens"]) for i in range(len(dataset))]
+    assert [int(stand_in[i]["num_valid_tokens"]) for i in range(len(dataset))] == expected
+    assert min(expected) > 0 and max(expected) <= 64
+    assert stand_in[0]["num_valid_tokens"].dtype == torch.int32
+
+
+def test_bfd_num_valid_tokens_array_matches_blend(tmp_path):
+    """Same for a blend of real indexed datasets, with documents longer than a sample, a changed
+    max_docs_per_bin, rebuilt BFD indices, and lazily loaded blend indices."""
+    import os
+
+    from megatron.core.datasets import gpt_dataset
+    from megatron.core.datasets.gpt_dataset import GPTDataset
+    from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
+
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    # 200 documents of 20-150 tokens per file with 64-token samples: whole documents and split chunks.
+    rng = numpy.random.default_rng(1234)
+    os.makedirs(tmp_path / "data")
+    prefixes = []
+    for i in range(3):
+        prefix = str(tmp_path / "data" / f"file_{i}")
+        builder = IndexedDatasetBuilder(prefix + ".bin", dtype=DType.optimal_dtype(_MOCK_VOCAB_SIZE))
+        for _ in range(200):
+            document = rng.integers(0, _MOCK_VOCAB_SIZE - 1, rng.integers(20, 150))
+            builder.add_document(torch.from_numpy(document), [len(document)])
+        builder.finalize(prefix + ".idx")
+        prefixes.append(prefix)
+
+    def build(max_docs_per_bin, defer=False):
+        config = GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=64,
+            blend=(prefixes, [0.5, 0.3, 0.2]),
+            split="100,0,0",
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            tokenizer=tokenizer,
+            mid_level_dataset_surplus=0.005,
+            pretraining_packing_strategy="bfd",
+            max_docs_per_bin=max_docs_per_bin,
+            path_to_cache=str(tmp_path / "cache"),
+            defer_npy_index_mmap=defer,
+        )
+        return BlendedMegatronDatasetBuilder(GPTDataset, [100, 0, 0], lambda: True, config).build()[0]
+
+    def check(dataset):
+        gpt_dataset.save_num_valid_tokens(dataset, "train")
+        path, length = gpt_dataset.NUM_VALID_TOKENS_PATHS["train"]
+        stand_in = gpt_dataset.NumValidTokensDataset(path, length, Split.train)
+        assert len(stand_in) == len(dataset)
+        expected = [int(dataset[i]["num_valid_tokens"]) for i in range(len(dataset))]
+        assert [int(stand_in[i]["num_valid_tokens"]) for i in range(len(dataset))] == expected
+        return path
+
+    path_uncapped = check(build(0))
+    path_capped = check(build(1))  # one document per bin: other bins, so another array
+    assert path_capped != path_uncapped
+
+    # BFD indices newer than the array (rebuilt since) -> the array is rebuilt.
+    dataset = build(1)
+    mtime = os.path.getmtime(path_capped)
+    for ds in dataset.datasets:
+        os.utime(ds.path_to_bfd_docs, (mtime + 10, mtime + 10))
+    assert check(dataset) == path_capped and os.path.getmtime(path_capped) > mtime
+
+    # Lazily loaded blend indices (defer_npy_index_mmap), from the cache written above.
+    before = numpy.load(path_capped)
+    os.remove(path_capped)
+    deferred = build(1, defer=True)
+    assert deferred.dataset_index is None
+    gpt_dataset.save_num_valid_tokens(deferred, "train")
+    assert gpt_dataset.NUM_VALID_TOKENS_PATHS["train"] == (path_capped, len(dataset))
+    assert numpy.array_equal(numpy.load(path_capped), before)
 
 
 def test_packed_batch_flattens_padding_mask():
