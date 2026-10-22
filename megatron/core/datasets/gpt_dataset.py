@@ -1597,8 +1597,9 @@ class MockGPTDataset(GPTDataset):
 # tokens, and with inter-document masking every stage needs each sample's cu_seqlens. Ranks that
 # hold no first or last pipeline stage need nothing else, so global rank 0 saves those numbers
 # next to the cached indices and those ranks read them (NumValidTokensDataset) instead of
-# building the datasets. Key ("train", "valid", "valid<i>" for the i-th of multiple validation
-# sets, "test") -> (path of the num_valid_tokens array, number of samples of the dataset).
+# building the datasets, also with greedy packing when masking is on. Key ("train", "valid",
+# "valid<i>" for the i-th of multiple validation sets, "test") -> (path of the num_valid_tokens
+# array, None with greedy packing, which has no padding; number of samples of the dataset).
 NUM_VALID_TOKENS_PATHS: Dict[str, Tuple[str, int]] = {}
 # With inter-document masking: key -> (offsets path, lengths path) of the per-sample document
 # lengths, from which the stand-in derives cu_seqlens and max_seqlen.
@@ -1656,21 +1657,27 @@ def _bfd_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarra
 def _greedy_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarray]:
     """Same for a greedily packed GPTDataset: as _query_document_sample_shuffle_indices, a sample
     spans document_index[beg:end + 1] from offset beg_off to end_off + add_extra_token."""
-    si = numpy.asarray(ds.sample_index, dtype=numpy.int64)
+    sample_index, document_index, shuffle_index = ds.sample_index, ds.document_index, ds.shuffle_index
+    if sample_index is None:  # defer_npy_index_mmap: the indices are memory-mapped on first use
+        load = lambda path: numpy.load(path, allow_pickle=True, mmap_mode="r")
+        sample_index, document_index, shuffle_index = (
+            load(ds.path_to_sample_index), load(ds.path_to_document_index), load(ds.path_to_shuffle_index)
+        )
+    si = numpy.asarray(sample_index, dtype=numpy.int64)
     extra = int(ds.config.add_extra_token_to_sequence)
     beg, beg_off, end, end_off = si[:-1, 0], si[:-1, 1], si[1:, 0], si[1:, 1]
     counts = end - beg + 1
     starts = numpy.concatenate(([0], numpy.cumsum(counts)))
     total = int(starts[-1])
     doc_pos = numpy.arange(total, dtype=numpy.int64) - numpy.repeat(starts[:-1], counts) + numpy.repeat(beg, counts)
-    lengths = ds.dataset.sequence_lengths[numpy.asarray(ds.document_index)[doc_pos]].astype(numpy.int64)
+    lengths = ds.dataset.sequence_lengths[numpy.asarray(document_index)[doc_pos]].astype(numpy.int64)
     first, last = starts[:-1], starts[1:] - 1
     multi = counts > 1
     lengths[first[multi]] -= beg_off[multi]
     lengths[last[multi]] = end_off[multi] + extra
     lengths[first[~multi]] = end_off[~multi] - beg_off[~multi] + extra
     return _masked_document_lengths(
-        lengths, starts, ds.shuffle_index, ds.config.sequence_length, ds.config.add_extra_token_to_sequence
+        lengths, starts, shuffle_index, ds.config.sequence_length, ds.config.add_extra_token_to_sequence
     )
 
 
@@ -1788,10 +1795,11 @@ def _save_document_lengths(dataset, key, components, nvt_path, sources, per_comp
 
 
 class NumValidTokensDataset(torch.utils.data.Dataset):
-    """The dataset of a rank without first or last pipeline stage under BFD packing: per sample
-    only num_valid_tokens and, with inter-document masking, cu_seqlens and max_seqlen, read from
-    the arrays that rank 0 saved. Its length and split equal those of the dataset it stands in
-    for, so build_pretraining_data_loader gives it the same sampler."""
+    """The dataset of a rank without first or last pipeline stage under BFD packing, or greedy
+    packing with inter-document masking: per sample only num_valid_tokens (BFD) and, with
+    inter-document masking, cu_seqlens and max_seqlen, read from the arrays that rank 0 saved. Its
+    length and split equal those of the dataset it stands in for, so build_pretraining_data_loader
+    gives it the same sampler."""
 
     def __init__(
         self,
