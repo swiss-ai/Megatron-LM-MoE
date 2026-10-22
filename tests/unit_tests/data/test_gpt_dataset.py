@@ -291,15 +291,11 @@ def test_bfd_num_valid_tokens_array_matches_blend(tmp_path):
     assert numpy.array_equal(numpy.load(path_capped), before)
 
 
-@pytest.mark.parametrize("add_extra_token", [True, False])
-def test_document_lengths_arrays_match_samples_with_masking(tmp_path, add_extra_token):
-    """With inter-document masking, the stand-in that middle pipeline stages use serves the same
-    cu_seqlens, max_seqlen and num_valid_tokens as __getitem__, for every sample of a BFD-packed
-    blend of indexed datasets with documents of 1 to 150 tokens (including documents longer than a
-    sample and 1-token documents, whose adjusted length can be zero)."""
+def _build_masked_blend(tmp_path, packing, add_extra_token, defer_npy_index_mmap=False):
+    """Two indexed datasets with documents of 1 to 150 tokens (plus 1-token documents and documents
+    longer than a 64-token sample), blended 0.6 / 0.4, packed with `packing`, inter-document masking on."""
     import os
 
-    from megatron.core.datasets import gpt_dataset
     from megatron.core.datasets.gpt_dataset import GPTDataset
     from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
 
@@ -314,18 +310,17 @@ def test_document_lengths_arrays_match_samples_with_masking(tmp_path, add_extra_
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
     )
-    rng = numpy.random.default_rng(1234)
-    os.makedirs(tmp_path / "data")
-    prefixes = []
-    for i in range(2):
-        prefix = str(tmp_path / "data" / f"file_{i}")
-        builder = IndexedDatasetBuilder(prefix + ".bin", dtype=DType.optimal_dtype(_MOCK_VOCAB_SIZE))
-        lengths = list(rng.integers(1, 150, 150)) + [1, 1, 2, 64, 65, 129]
-        for n in lengths:
-            document = rng.integers(0, _MOCK_VOCAB_SIZE - 1, int(n))
-            builder.add_document(torch.from_numpy(document), [len(document)])
-        builder.finalize(prefix + ".idx")
-        prefixes.append(prefix)
+    prefixes = [str(tmp_path / "data" / f"file_{i}") for i in range(2)]
+    if not os.path.isdir(tmp_path / "data"):
+        rng = numpy.random.default_rng(1234)
+        os.makedirs(tmp_path / "data")
+        for prefix in prefixes:
+            builder = IndexedDatasetBuilder(prefix + ".bin", dtype=DType.optimal_dtype(_MOCK_VOCAB_SIZE))
+            lengths = list(rng.integers(1, 150, 150)) + [1, 1, 2, 64, 65, 129]
+            for n in lengths:
+                document = rng.integers(0, _MOCK_VOCAB_SIZE - 1, int(n))
+                builder.add_document(torch.from_numpy(document), [len(document)])
+            builder.finalize(prefix + ".idx")
     config = GPTDatasetConfig(
         random_seed=1234,
         sequence_length=64,
@@ -336,26 +331,97 @@ def test_document_lengths_arrays_match_samples_with_masking(tmp_path, add_extra_
         eod_mask_loss=False,
         tokenizer=tokenizer,
         mid_level_dataset_surplus=0.005,
-        pretraining_packing_strategy="bfd",
+        pretraining_packing_strategy=packing,
         inter_document_masking=True,
         add_extra_token_to_sequence=add_extra_token,
         path_to_cache=str(tmp_path / "cache"),
+        defer_npy_index_mmap=defer_npy_index_mmap,
     )
-    datasets = BlendedMegatronDatasetBuilder(GPTDataset, [150, 20, 20], lambda: True, config).build()
-    for key, dataset in zip(("train", "valid", "test"), datasets):
-        gpt_dataset.NUM_VALID_TOKENS_PATHS.clear()
-        gpt_dataset.DOC_LENGTHS_PATHS.clear()
+    return BlendedMegatronDatasetBuilder(GPTDataset, [150, 20, 20], lambda: True, config).build()
+
+
+def _check_stand_in(dataset, key):
+    """The stand-in of a middle pipeline stage serves what __getitem__ serves, per sample and merged
+    across a micro-batch of two as the model receives it. Returns the document-length array paths."""
+    from torch.utils.data._utils.collate import default_collate
+
+    from megatron.core.datasets import gpt_dataset
+
+    gpt_dataset.NUM_VALID_TOKENS_PATHS.clear()
+    gpt_dataset.DOC_LENGTHS_PATHS.clear()
+    if dataset.config.pretraining_packing_strategy == "bfd":
         gpt_dataset.save_num_valid_tokens(dataset, key)
-        path, length = gpt_dataset.NUM_VALID_TOKENS_PATHS[key]
-        stand_in = gpt_dataset.NumValidTokensDataset(
-            path, length, dataset.split, doc_paths=gpt_dataset.DOC_LENGTHS_PATHS[key], seq_length=64
-        )
-        assert len(stand_in) == len(dataset) > 0
-        for i in range(len(dataset)):
-            real, got = dataset[i], stand_in[i]
-            assert torch.equal(real["cu_seqlens"], got["cu_seqlens"]) and got["cu_seqlens"].dtype == torch.int32
-            assert int(real["max_seqlen"]) == int(got["max_seqlen"]) and got["max_seqlen"].dtype == torch.int32
+    else:
+        gpt_dataset.save_greedy_document_lengths(dataset, key)
+    path, length = gpt_dataset.NUM_VALID_TOKENS_PATHS[key]
+    doc_paths = gpt_dataset.DOC_LENGTHS_PATHS[key]
+    stand_in = gpt_dataset.NumValidTokensDataset(path, length, dataset.split, doc_paths=doc_paths, seq_length=64)
+    assert len(stand_in) == len(dataset) > 0
+    for i in range(len(dataset)):
+        real, got = dataset[i], stand_in[i]
+        assert torch.equal(real["cu_seqlens"], got["cu_seqlens"]) and got["cu_seqlens"].dtype == torch.int32
+        assert int(real["max_seqlen"]) == int(got["max_seqlen"]) and got["max_seqlen"].dtype == torch.int32
+        if path is None:  # greedy packing: no padding, no num_valid_tokens
+            assert "num_valid_tokens" not in real and "num_valid_tokens" not in got
+        else:
             assert int(real["num_valid_tokens"]) == int(got["num_valid_tokens"])
+    for i in range(0, min(len(dataset), 20) - 1, 2):
+        real = flatten_batch_for_packed_sequences(default_collate([dataset[i], dataset[i + 1]]))
+        got = flatten_batch_for_packed_sequences(default_collate([stand_in[i], stand_in[i + 1]]))
+        assert torch.equal(real["cu_seqlens"], got["cu_seqlens"])
+        assert torch.equal(real["max_seqlen"], got["max_seqlen"])
+    return doc_paths
+
+
+@pytest.mark.parametrize("packing", ["bfd", "greedy"])
+@pytest.mark.parametrize("add_extra_token", [True, False])
+def test_document_lengths_arrays_match_samples_with_masking(tmp_path, packing, add_extra_token):
+    """With inter-document masking, the stand-in that middle pipeline stages use serves the same
+    cu_seqlens, max_seqlen and (BFD) num_valid_tokens as __getitem__, for every sample of every split
+    of a packed blend, including documents longer than a sample and 1-token documents, whose adjusted
+    length can be zero."""
+    import os
+
+    datasets = _build_masked_blend(tmp_path, packing, add_extra_token)
+    for key, dataset in zip(("train", "valid", "test"), datasets):
+        offsets_path, lengths_path = _check_stand_in(dataset, key)
+        offsets, lengths = numpy.load(offsets_path), numpy.load(lengths_path)
+        assert f"-{key}-{packing}-" in os.path.basename(offsets_path)
+        assert offsets.dtype == numpy.int64 and lengths.dtype == numpy.int32
+        assert len(offsets) >= len(dataset) + 1 and offsets[-1] == len(lengths)
+        assert numpy.all(numpy.diff(offsets) >= 1) and numpy.all(lengths >= 0)
+    if packing == "greedy":
+        assert not any(f.endswith("num_valid_tokens.npy") for f in os.listdir(tmp_path / "cache"))
+
+
+@pytest.mark.parametrize("packing", ["bfd", "greedy"])
+def test_document_lengths_arrays_rebuilt_and_deferred(tmp_path, packing):
+    """The arrays are reused from the cache, rebuilt with identical content when a component's index
+    is newer, and built from lazily memory-mapped indices (--dataloader-defer-npy-index-mmap)."""
+    import os
+    import time
+
+    train = _build_masked_blend(tmp_path, packing, True)[0]
+    offsets_path, lengths_path = _check_stand_in(train, "train")
+    before = numpy.load(lengths_path)
+    mtime = os.path.getmtime(lengths_path)
+    time.sleep(1.1)
+    assert _check_stand_in(train, "train") == (offsets_path, lengths_path)
+    assert os.path.getmtime(lengths_path) == mtime
+    component = train.datasets[0]
+    source = component.path_to_bfd_docs if packing == "bfd" else component.path_to_sample_index
+    os.utime(source, (mtime + 10, mtime + 10))
+    assert _check_stand_in(train, "train") == (offsets_path, lengths_path)
+    assert os.path.getmtime(lengths_path) > mtime
+    assert numpy.array_equal(numpy.load(lengths_path), before)
+
+    os.remove(lengths_path)
+    deferred = _build_masked_blend(tmp_path, packing, True, defer_npy_index_mmap=True)[0]
+    assert deferred.dataset_index is None
+    if packing == "greedy":
+        assert deferred.datasets[0].sample_index is None
+    assert _check_stand_in(deferred, "train") == (offsets_path, lengths_path)
+    assert numpy.array_equal(numpy.load(lengths_path), before)
 
 
 def test_packed_batch_flattens_padding_mask():
