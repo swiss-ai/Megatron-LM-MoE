@@ -25,7 +25,7 @@ from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
-from megatron.core.datasets.gpt_dataset import NUM_VALID_TOKENS_PATHS, save_num_valid_tokens
+from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, save_num_valid_tokens
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
@@ -284,7 +284,7 @@ def bfd_middle_ranks_read_num_valid_tokens(args):
     return (
         args.pretraining_packing_strategy == "bfd"
         and args.pipeline_model_parallel_size > 2
-        and not (args.sft or args.mock_data or args.fim_data or args.dataloader_inter_document_masking)
+        and not (args.sft or args.mock_data or args.fim_data)
     )
 
 
@@ -293,7 +293,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if parallel_state.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence and not bfd_middle_ranks_read_num_valid_tokens(args):
         # All PP stages need cu_seqlens. Only TP rank zero builds the local dataset.
         return True
     elif args.pretraining_packing_strategy == "bfd" and (
@@ -428,9 +428,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
-    # BFD: ranks without first or last pipeline stage read num_valid_tokens saved here instead.
+    # BFD: ranks without first or last pipeline stage read the per-sample metadata saved here
+    # instead of building the datasets.
     if bfd_middle_ranks_read_num_valid_tokens(args) and torch.distributed.get_rank() == 0:
         NUM_VALID_TOKENS_PATHS.clear()
+        DOC_LENGTHS_PATHS.clear()
         if isinstance(valid_ds, list):
             valid = [(f"valid{i}", ds) for i, ds in enumerate(valid_ds)]
         else:

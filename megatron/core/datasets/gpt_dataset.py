@@ -1592,11 +1592,51 @@ class MockGPTDataset(GPTDataset):
 
 
 # With BFD packing the MoE routers on every pipeline stage need each sample's number of valid
-# tokens. Ranks that hold no first or last pipeline stage need nothing else, so global rank 0 saves
-# those numbers next to the cached indices and those ranks read them (NumValidTokensDataset)
-# instead of building the datasets. Key ("train", "valid", "valid<i>" for the i-th of multiple
-# validation sets, "test") -> (path of the array, number of samples of the dataset).
+# tokens, and with inter-document masking every stage needs each sample's cu_seqlens. Ranks that
+# hold no first or last pipeline stage need nothing else, so global rank 0 saves those numbers
+# next to the cached indices and those ranks read them (NumValidTokensDataset) instead of
+# building the datasets. Key ("train", "valid", "valid<i>" for the i-th of multiple validation
+# sets, "test") -> (path of the num_valid_tokens array, number of samples of the dataset).
 NUM_VALID_TOKENS_PATHS: Dict[str, Tuple[str, int]] = {}
+# With inter-document masking: key -> (offsets path, lengths path) of the per-sample document
+# lengths, from which the stand-in derives cu_seqlens and max_seqlen.
+DOC_LENGTHS_PATHS: Dict[str, Tuple[str, str]] = {}
+
+
+def _bfd_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """Document lengths of every sample of one BFD-packed GPTDataset, as __getitem__ derives them
+    for cu_seqlens under inter_document_masking: (offsets int64[len + 1], lengths int32), sample i
+    owning lengths[offsets[i]:offsets[i + 1]], indexed like __getitem__."""
+    docs = numpy.asarray(ds.bfd_docs, dtype=numpy.int64)
+    splits = numpy.asarray(ds.bfd_splits, dtype=numpy.int64).reshape(-1, 4)
+    lengths = numpy.empty(len(docs), dtype=numpy.int64)
+    lengths[docs >= 0] = ds.dataset.sequence_lengths[docs[docs >= 0]]
+    lengths[docs < 0] = splits[-docs[docs < 0] - 1, 2:].sum(axis=1)
+    seq = ds.config.sequence_length
+    starts = numpy.asarray(ds.sample_index[:, 0], dtype=numpy.int64)  # bin b = docs[starts[b]:starts[b+1]]
+    counts = numpy.diff(starts)
+    last = starts[1:] - 1
+    # As in __getitem__: the extra token comes off the last document; an emptied last document is
+    # dropped; padding is folded into the last document (or is the only document).
+    if ds.config.add_extra_token_to_sequence:
+        lengths[last] -= 1
+        counts = counts - (lengths[last] == 0)
+    cums = numpy.concatenate(([0], numpy.cumsum(lengths)))
+    bin_sum = cums[starts[:-1] + counts] - cums[starts[:-1]]
+    shortfall = seq - bin_sum
+    assert (shortfall >= 0).all(), "packed sample is longer than sequence_length"
+    empty = counts == 0
+    lengths[starts[:-1][empty]] = seq  # the dropped slot becomes the single padding document
+    counts[empty] = 1
+    nonempty = ~empty
+    lengths[(starts[:-1] + counts - 1)[nonempty]] += shortfall[nonempty]
+    # Sample order: sample i is bin shuffle_index[i].
+    bins = numpy.asarray(ds.shuffle_index, dtype=numpy.int64)
+    out_counts = counts[bins]
+    offsets = numpy.concatenate(([0], numpy.cumsum(out_counts)))
+    total = int(offsets[-1])
+    idx = numpy.arange(total, dtype=numpy.int64) - numpy.repeat(offsets[:-1], out_counts) + numpy.repeat(starts[bins], out_counts)
+    return offsets, lengths[idx].astype(numpy.int32)
 
 
 def _bfd_num_valid_tokens(ds: "GPTDataset") -> numpy.ndarray:
@@ -1651,20 +1691,88 @@ def save_num_valid_tokens(dataset, key: str) -> None:
             numpy.save(f, values)
         os.replace(tmp, path)
     NUM_VALID_TOKENS_PATHS[key] = (path, len(dataset))
+    if dataset.config.inter_document_masking:
+        _save_document_lengths(dataset, key, components, path, sources)
+
+
+def _save_document_lengths(dataset, key, components, nvt_path, sources) -> None:
+    """Save the per-sample document lengths (for cu_seqlens on middle stages) next to the
+    num_valid_tokens array, with the same rebuild rule."""
+    offsets_path = nvt_path.replace("-num_valid_tokens.npy", "-doc_offsets.npy")
+    lengths_path = nvt_path.replace("-num_valid_tokens.npy", "-doc_lengths.npy")
+    if not (os.path.isfile(offsets_path) and os.path.isfile(lengths_path)) or any(
+        os.path.getmtime(source) > min(os.path.getmtime(offsets_path), os.path.getmtime(lengths_path))
+        for source in sources
+    ):
+        per_component = [_bfd_document_lengths(ds) for ds in components]
+        offsets, lengths = per_component[0]
+        if hasattr(dataset, "datasets"):
+            dataset_index, dataset_sample_index = dataset.dataset_index, dataset.dataset_sample_index
+            if dataset_index is None:  # defer_npy_index_mmap
+                dataset_index = numpy.load(dataset.path_to_dataset_index, mmap_mode="r")
+                dataset_sample_index = numpy.load(dataset.path_to_dataset_sample_index, mmap_mode="r")
+            dataset_index = numpy.asarray(dataset_index)
+            dataset_sample_index = numpy.asarray(dataset_sample_index, dtype=numpy.int64)
+            counts = numpy.empty(len(dataset_index), dtype=numpy.int64)
+            starts = numpy.empty(len(dataset_index), dtype=numpy.int64)
+            for c, (c_offsets, _) in enumerate(per_component):
+                rows = numpy.nonzero(dataset_index == c)[0]
+                sample = dataset_sample_index[rows]
+                counts[rows] = c_offsets[sample + 1] - c_offsets[sample]
+                starts[rows] = c_offsets[sample]
+            offsets = numpy.concatenate(([0], numpy.cumsum(counts)))
+            lengths = numpy.empty(int(offsets[-1]), dtype=numpy.int32)
+            for c, (_, c_lengths) in enumerate(per_component):
+                rows = numpy.nonzero(dataset_index == c)[0]
+                n = counts[rows]
+                src = numpy.repeat(starts[rows], n) + (numpy.arange(int(n.sum()), dtype=numpy.int64)
+                                                       - numpy.repeat(numpy.cumsum(n) - n, n))
+                dst = numpy.repeat(offsets[rows], n) + (numpy.arange(int(n.sum()), dtype=numpy.int64)
+                                                        - numpy.repeat(numpy.cumsum(n) - n, n))
+                lengths[dst] = c_lengths[src]
+        for p, arr in ((offsets_path, offsets), (lengths_path, lengths)):
+            tmp = f"{p}.{socket.gethostname()}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                numpy.save(f, arr)
+            os.replace(tmp, p)
+    DOC_LENGTHS_PATHS[key] = (offsets_path, lengths_path)
 
 
 class NumValidTokensDataset(torch.utils.data.Dataset):
-    """The dataset of a rank without first or last pipeline stage under BFD packing: only
-    num_valid_tokens per sample. Its length and split equal those of the dataset it stands in
+    """The dataset of a rank without first or last pipeline stage under BFD packing: per sample
+    only num_valid_tokens and, with inter-document masking, cu_seqlens and max_seqlen, read from
+    the arrays that rank 0 saved. Its length and split equal those of the dataset it stands in
     for, so build_pretraining_data_loader gives it the same sampler."""
 
-    def __init__(self, path: str, length: int, split: Split) -> None:
+    def __init__(
+        self,
+        path: str,
+        length: int,
+        split: Split,
+        doc_paths: Optional[Tuple[str, str]] = None,
+        seq_length: Optional[int] = None,
+    ) -> None:
         self.values = numpy.load(path, mmap_mode="r")
         self.length = length
         self.index_split = split
+        # With inter-document masking: per-sample document lengths for cu_seqlens / max_seqlen.
+        self.offsets = self.lengths = None
+        if doc_paths is not None:
+            self.offsets = numpy.load(doc_paths[0], mmap_mode="r")
+            self.lengths = numpy.load(doc_paths[1], mmap_mode="r")
+            self.seq_length = seq_length
 
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {"num_valid_tokens": torch.tensor(int(self.values[idx]), dtype=torch.int32)}
+        sample = {"num_valid_tokens": torch.tensor(int(self.values[idx]), dtype=torch.int32)}
+        if self.lengths is not None:
+            lens = numpy.asarray(self.lengths[self.offsets[idx] : self.offsets[idx + 1]], dtype=numpy.int64)
+            cu_seqlens = numpy.concatenate(([0], numpy.cumsum(lens)))
+            # Same layout as GPTDataset.__getitem__: padded with sequence_length for collation.
+            padded = torch.full((self.seq_length + 1,), self.seq_length, dtype=torch.int32)
+            padded[: len(cu_seqlens)] = torch.from_numpy(cu_seqlens).to(torch.int32)
+            sample["cu_seqlens"] = padded
+            sample["max_seqlen"] = torch.tensor(int(lens.max()), dtype=torch.int32)
+        return sample

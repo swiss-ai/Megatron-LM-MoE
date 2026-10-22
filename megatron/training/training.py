@@ -211,7 +211,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.gpt_dataset import NUM_VALID_TOKENS_PATHS, NumValidTokensDataset
+from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, NumValidTokensDataset
 from megatron.core.datasets.utils import Split
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -4178,13 +4178,16 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if getattr(args, "pretraining_packing_strategy", None) == "bfd":
         # BFD: ranks that built no datasets (no first or last pipeline stage) read the
         # num_valid_tokens that rank 0 saved. Only tensor-parallel rank 0 loads data.
-        saved = [NUM_VALID_TOKENS_PATHS]
+        saved = [NUM_VALID_TOKENS_PATHS, DOC_LENGTHS_PATHS]
         torch.distributed.broadcast_object_list(saved, src=0)
-        saved = saved[0]
+        saved, doc_paths = saved
 
         def _stand_in(key, split, ds):
             if ds is None and key in saved and mpu.get_tensor_model_parallel_rank() == 0:
-                return NumValidTokensDataset(*saved[key], split)
+                # With inter-document masking the stand-in also serves cu_seqlens / max_seqlen.
+                return NumValidTokensDataset(
+                    *saved[key], split, doc_paths=doc_paths.get(key), seq_length=args.seq_length
+                )
             return ds
 
         train_ds = _stand_in("train", Split.train, train_ds)

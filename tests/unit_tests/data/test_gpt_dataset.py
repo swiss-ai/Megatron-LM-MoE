@@ -291,6 +291,73 @@ def test_bfd_num_valid_tokens_array_matches_blend(tmp_path):
     assert numpy.array_equal(numpy.load(path_capped), before)
 
 
+@pytest.mark.parametrize("add_extra_token", [True, False])
+def test_document_lengths_arrays_match_samples_with_masking(tmp_path, add_extra_token):
+    """With inter-document masking, the stand-in that middle pipeline stages use serves the same
+    cu_seqlens, max_seqlen and num_valid_tokens as __getitem__, for every sample of a BFD-packed
+    blend of indexed datasets with documents of 1 to 150 tokens (including documents longer than a
+    sample and 1-token documents, whose adjusted length can be zero)."""
+    import os
+
+    from megatron.core.datasets import gpt_dataset
+    from megatron.core.datasets.gpt_dataset import GPTDataset
+    from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
+
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+    rng = numpy.random.default_rng(1234)
+    os.makedirs(tmp_path / "data")
+    prefixes = []
+    for i in range(2):
+        prefix = str(tmp_path / "data" / f"file_{i}")
+        builder = IndexedDatasetBuilder(prefix + ".bin", dtype=DType.optimal_dtype(_MOCK_VOCAB_SIZE))
+        lengths = list(rng.integers(1, 150, 150)) + [1, 1, 2, 64, 65, 129]
+        for n in lengths:
+            document = rng.integers(0, _MOCK_VOCAB_SIZE - 1, int(n))
+            builder.add_document(torch.from_numpy(document), [len(document)])
+        builder.finalize(prefix + ".idx")
+        prefixes.append(prefix)
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=64,
+        blend=(prefixes, [0.6, 0.4]),
+        split="80,10,10",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+        pretraining_packing_strategy="bfd",
+        inter_document_masking=True,
+        add_extra_token_to_sequence=add_extra_token,
+        path_to_cache=str(tmp_path / "cache"),
+    )
+    datasets = BlendedMegatronDatasetBuilder(GPTDataset, [150, 20, 20], lambda: True, config).build()
+    for key, dataset in zip(("train", "valid", "test"), datasets):
+        gpt_dataset.NUM_VALID_TOKENS_PATHS.clear()
+        gpt_dataset.DOC_LENGTHS_PATHS.clear()
+        gpt_dataset.save_num_valid_tokens(dataset, key)
+        path, length = gpt_dataset.NUM_VALID_TOKENS_PATHS[key]
+        stand_in = gpt_dataset.NumValidTokensDataset(
+            path, length, dataset.split, doc_paths=gpt_dataset.DOC_LENGTHS_PATHS[key], seq_length=64
+        )
+        assert len(stand_in) == len(dataset) > 0
+        for i in range(len(dataset)):
+            real, got = dataset[i], stand_in[i]
+            assert torch.equal(real["cu_seqlens"], got["cu_seqlens"]) and got["cu_seqlens"].dtype == torch.int32
+            assert int(real["max_seqlen"]) == int(got["max_seqlen"]) and got["max_seqlen"].dtype == torch.int32
+            assert int(real["num_valid_tokens"]) == int(got["num_valid_tokens"])
+
+
 def test_packed_batch_flattens_padding_mask():
     batch = {
         "tokens": torch.arange(8).reshape(2, 4),
