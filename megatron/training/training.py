@@ -211,6 +211,8 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.core.datasets.gpt_dataset import NUM_VALID_TOKENS_PATHS, NumValidTokensDataset
+from megatron.core.datasets.utils import Split
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
@@ -4170,6 +4172,28 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
+    train_ds, valid_ds, test_ds = None, None, None
+    if (is_distributed or mpu.get_tensor_model_parallel_rank() == 0) and not args.perform_rl_step:
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+    if args.pretraining_packing_strategy == "bfd":
+        # BFD: ranks that built no datasets (no first or last pipeline stage) read the
+        # num_valid_tokens that rank 0 saved. Only tensor-parallel rank 0 loads data.
+        saved = [NUM_VALID_TOKENS_PATHS]
+        torch.distributed.broadcast_object_list(saved, src=0)
+        saved = saved[0]
+
+        def _stand_in(key, split, ds):
+            if ds is None and key in saved and mpu.get_tensor_model_parallel_rank() == 0:
+                return NumValidTokensDataset(*saved[key], split)
+            return ds
+
+        train_ds = _stand_in("train", Split.train, train_ds)
+        test_ds = _stand_in("test", Split.test, test_ds)
+        if isinstance(valid_ds, list):
+            valid_ds = [_stand_in(f"valid{i}", Split.valid, ds) for i, ds in enumerate(valid_ds)]
+        else:
+            valid_ds = _stand_in("valid", Split.valid, valid_ds)
+
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
@@ -4184,8 +4208,6 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_test = (args.full_validation or args.eval_iters > 0)
 
         else:
-            # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.exit_on_tranche_end and train_ds is not None:
                 tranche_size = len(train_ds)

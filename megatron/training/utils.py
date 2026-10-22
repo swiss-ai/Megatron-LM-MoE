@@ -647,15 +647,16 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             data["num_valid_tokens"].cuda(non_blocking=True) if has_bfd_padding else None
         )
         batch = {
-            'tokens': data["tokens"].cuda(non_blocking=True),
-            'labels': data["labels"].cuda(non_blocking=True),
-            'loss_mask': data["loss_mask"].cuda(non_blocking=True),
+            # A middle pipeline stage's BFD batch holds only num_valid_tokens.
+            'tokens': data["tokens"].cuda(non_blocking=True) if "tokens" in data else None,
+            'labels': data["labels"].cuda(non_blocking=True) if "labels" in data else None,
+            'loss_mask': data["loss_mask"].cuda(non_blocking=True) if "loss_mask" in data else None,
             'attention_mask': (
                 None
                 if "attention_mask" not in data
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
-            'position_ids': data["position_ids"].cuda(non_blocking=True),
+            'position_ids': data["position_ids"].cuda(non_blocking=True) if "position_ids" in data else None,
             'cu_seqlens': (
                 None
                 if "cu_seqlens" not in data
