@@ -1101,6 +1101,7 @@ class GPTDataset(MegatronDataset):
                 self.dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
             )
 
+        self.path_to_sample_index = None  # save_greedy_document_lengths rebuilds its arrays when this is newer
         if path_to_cache:
             base = f"{self.unique_description_hash}-{type(self).__name__}-{self.index_split.name}"
             get_path_to = lambda affix: os.path.join(path_to_cache, f"{base}-{affix}")
@@ -1108,6 +1109,7 @@ class GPTDataset(MegatronDataset):
             path_to_document_index = get_path_to("document_index.npy")
             path_to_sample_index = get_path_to("sample_index.npy")
             path_to_shuffle_index = get_path_to("shuffle_index.npy")
+            self.path_to_sample_index = path_to_sample_index
             cache_hit = (
                 True
                 if self.config.fast_cache_load
@@ -1603,22 +1605,20 @@ NUM_VALID_TOKENS_PATHS: Dict[str, Tuple[str, int]] = {}
 DOC_LENGTHS_PATHS: Dict[str, Tuple[str, str]] = {}
 
 
-def _bfd_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarray]:
-    """Document lengths of every sample of one BFD-packed GPTDataset, as __getitem__ derives them
-    for cu_seqlens under inter_document_masking: (offsets int64[len + 1], lengths int32), sample i
-    owning lengths[offsets[i]:offsets[i + 1]], indexed like __getitem__."""
-    docs = numpy.asarray(ds.bfd_docs, dtype=numpy.int64)
-    splits = numpy.asarray(ds.bfd_splits, dtype=numpy.int64).reshape(-1, 4)
-    lengths = numpy.empty(len(docs), dtype=numpy.int64)
-    lengths[docs >= 0] = ds.dataset.sequence_lengths[docs[docs >= 0]]
-    lengths[docs < 0] = splits[-docs[docs < 0] - 1, 2:].sum(axis=1)
-    seq = ds.config.sequence_length
-    starts = numpy.asarray(ds.sample_index[:, 0], dtype=numpy.int64)  # bin b = docs[starts[b]:starts[b+1]]
+def _masked_document_lengths(
+    lengths: numpy.ndarray, starts: numpy.ndarray, shuffle_index, seq: int, add_extra_token: bool
+) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """Apply __getitem__'s inter_document_masking adjustments to the document lengths of packed
+    samples and return them in sample order. lengths: one entry per document part, samples in index
+    order occupying lengths[starts[s]:starts[s + 1]]; sample i of the dataset is index shuffle_index[i].
+    Returns (offsets int64[len + 1], lengths int32)."""
+    lengths = numpy.array(lengths, dtype=numpy.int64)
+    starts = numpy.asarray(starts, dtype=numpy.int64)
     counts = numpy.diff(starts)
     last = starts[1:] - 1
     # As in __getitem__: the extra token comes off the last document; an emptied last document is
     # dropped; padding is folded into the last document (or is the only document).
-    if ds.config.add_extra_token_to_sequence:
+    if add_extra_token:
         lengths[last] -= 1
         counts = counts - (lengths[last] == 0)
     cums = numpy.concatenate(([0], numpy.cumsum(lengths)))
@@ -1630,13 +1630,48 @@ def _bfd_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarra
     counts[empty] = 1
     nonempty = ~empty
     lengths[(starts[:-1] + counts - 1)[nonempty]] += shortfall[nonempty]
-    # Sample order: sample i is bin shuffle_index[i].
-    bins = numpy.asarray(ds.shuffle_index, dtype=numpy.int64)
+    bins = numpy.asarray(shuffle_index, dtype=numpy.int64)
     out_counts = counts[bins]
     offsets = numpy.concatenate(([0], numpy.cumsum(out_counts)))
     total = int(offsets[-1])
     idx = numpy.arange(total, dtype=numpy.int64) - numpy.repeat(offsets[:-1], out_counts) + numpy.repeat(starts[bins], out_counts)
     return offsets, lengths[idx].astype(numpy.int32)
+
+
+def _bfd_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """Document lengths of every sample of one BFD-packed GPTDataset, as __getitem__ derives them
+    for cu_seqlens under inter_document_masking: (offsets int64[len + 1], lengths int32), sample i
+    owning lengths[offsets[i]:offsets[i + 1]], indexed like __getitem__."""
+    docs = numpy.asarray(ds.bfd_docs, dtype=numpy.int64)
+    splits = numpy.asarray(ds.bfd_splits, dtype=numpy.int64).reshape(-1, 4)
+    lengths = numpy.empty(len(docs), dtype=numpy.int64)
+    lengths[docs >= 0] = ds.dataset.sequence_lengths[docs[docs >= 0]]
+    lengths[docs < 0] = splits[-docs[docs < 0] - 1, 2:].sum(axis=1)
+    starts = numpy.asarray(ds.sample_index[:, 0], dtype=numpy.int64)  # bin b = docs[starts[b]:starts[b+1]]
+    return _masked_document_lengths(
+        lengths, starts, ds.shuffle_index, ds.config.sequence_length, ds.config.add_extra_token_to_sequence
+    )
+
+
+def _greedy_document_lengths(ds: "GPTDataset") -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """Same for a greedily packed GPTDataset: as _query_document_sample_shuffle_indices, a sample
+    spans document_index[beg:end + 1] from offset beg_off to end_off + add_extra_token."""
+    si = numpy.asarray(ds.sample_index, dtype=numpy.int64)
+    extra = int(ds.config.add_extra_token_to_sequence)
+    beg, beg_off, end, end_off = si[:-1, 0], si[:-1, 1], si[1:, 0], si[1:, 1]
+    counts = end - beg + 1
+    starts = numpy.concatenate(([0], numpy.cumsum(counts)))
+    total = int(starts[-1])
+    doc_pos = numpy.arange(total, dtype=numpy.int64) - numpy.repeat(starts[:-1], counts) + numpy.repeat(beg, counts)
+    lengths = ds.dataset.sequence_lengths[numpy.asarray(ds.document_index)[doc_pos]].astype(numpy.int64)
+    first, last = starts[:-1], starts[1:] - 1
+    multi = counts > 1
+    lengths[first[multi]] -= beg_off[multi]
+    lengths[last[multi]] = end_off[multi] + extra
+    lengths[first[~multi]] = end_off[~multi] - beg_off[~multi] + extra
+    return _masked_document_lengths(
+        lengths, starts, ds.shuffle_index, ds.config.sequence_length, ds.config.add_extra_token_to_sequence
+    )
 
 
 def _bfd_num_valid_tokens(ds: "GPTDataset") -> numpy.ndarray:
@@ -1692,10 +1727,24 @@ def save_num_valid_tokens(dataset, key: str) -> None:
         os.replace(tmp, path)
     NUM_VALID_TOKENS_PATHS[key] = (path, len(dataset))
     if dataset.config.inter_document_masking:
-        _save_document_lengths(dataset, key, components, path, sources)
+        _save_document_lengths(dataset, key, components, path, sources, _bfd_document_lengths)
 
 
-def _save_document_lengths(dataset, key, components, nvt_path, sources) -> None:
+def save_greedy_document_lengths(dataset, key: str) -> None:
+    """Greedy packing with inter-document masking: middle pipeline stages need only cu_seqlens, which
+    rank 0 saves here as per-sample document lengths (no num_valid_tokens array)."""
+    components = dataset.datasets if hasattr(dataset, "datasets") else [dataset]
+    path_to_cache = dataset.config.path_to_cache or os.path.join(
+        components[0].dataset.path_prefix, "cache", "GPTDataset_indices"
+    )
+    base = os.path.join(path_to_cache, f"{dataset.unique_description_hash}-{key}-greedy-num_valid_tokens.npy")
+    sources = [p for p in (getattr(ds, "path_to_sample_index", None) for ds in components) if p]
+    os.makedirs(path_to_cache, exist_ok=True)
+    NUM_VALID_TOKENS_PATHS[key] = (None, len(dataset))
+    _save_document_lengths(dataset, key, components, base, sources, _greedy_document_lengths)
+
+
+def _save_document_lengths(dataset, key, components, nvt_path, sources, per_component_fn) -> None:
     """Save the per-sample document lengths (for cu_seqlens on middle stages) next to the
     num_valid_tokens array, with the same rebuild rule."""
     offsets_path = nvt_path.replace("-num_valid_tokens.npy", "-doc_offsets.npy")
@@ -1704,7 +1753,7 @@ def _save_document_lengths(dataset, key, components, nvt_path, sources) -> None:
         os.path.getmtime(source) > min(os.path.getmtime(offsets_path), os.path.getmtime(lengths_path))
         for source in sources
     ):
-        per_component = [_bfd_document_lengths(ds) for ds in components]
+        per_component = [per_component_fn(ds) for ds in components]
         offsets, lengths = per_component[0]
         if hasattr(dataset, "datasets"):
             dataset_index, dataset_sample_index = dataset.dataset_index, dataset.dataset_sample_index
@@ -1752,7 +1801,7 @@ class NumValidTokensDataset(torch.utils.data.Dataset):
         doc_paths: Optional[Tuple[str, str]] = None,
         seq_length: Optional[int] = None,
     ) -> None:
-        self.values = numpy.load(path, mmap_mode="r")
+        self.values = numpy.load(path, mmap_mode="r") if path is not None else None  # None: greedy
         self.length = length
         self.index_split = split
         # With inter-document masking: per-sample document lengths for cu_seqlens / max_seqlen.
@@ -1766,7 +1815,9 @@ class NumValidTokensDataset(torch.utils.data.Dataset):
         return self.length
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = {"num_valid_tokens": torch.tensor(int(self.values[idx]), dtype=torch.int32)}
+        sample = {}
+        if self.values is not None:
+            sample["num_valid_tokens"] = torch.tensor(int(self.values[idx]), dtype=torch.int32)
         if self.lengths is not None:
             lens = numpy.asarray(self.lengths[self.offsets[idx] : self.offsets[idx + 1]], dtype=numpy.int64)
             cu_seqlens = numpy.concatenate(([0], numpy.cumsum(lens)))

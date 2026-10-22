@@ -25,7 +25,7 @@ from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
-from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, save_num_valid_tokens
+from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, save_greedy_document_lengths, save_num_valid_tokens
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
@@ -288,13 +288,31 @@ def bfd_middle_ranks_read_num_valid_tokens(args):
     )
 
 
+def greedy_middle_ranks_read_doc_lengths(args):
+    """Greedy packing with inter-document masking: middle pipeline ranks need only cu_seqlens, which
+    they read from the per-sample document lengths that global rank 0 saves."""
+    return (
+        args.pretraining_packing_strategy == "greedy"
+        and args.dataloader_inter_document_masking
+        and args.pipeline_model_parallel_size > 2
+        and not (args.sft or args.mock_data or args.fim_data)
+    )
+
+
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     args = get_args()
     config = core_transformer_config_from_args(args)
     if parallel_state.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence and not bfd_middle_ranks_read_num_valid_tokens(args):
+    elif is_packed_sequence and not (
+        bfd_middle_ranks_read_num_valid_tokens(args) or greedy_middle_ranks_read_doc_lengths(args)
+    ):
         # All PP stages need cu_seqlens. Only TP rank zero builds the local dataset.
+        return True
+    elif greedy_middle_ranks_read_doc_lengths(args) and (
+        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+    ):
         return True
     elif args.pretraining_packing_strategy == "bfd" and (
         not bfd_middle_ranks_read_num_valid_tokens(args)
@@ -428,9 +446,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
-    # BFD: ranks without first or last pipeline stage read the per-sample metadata saved here
-    # instead of building the datasets.
-    if bfd_middle_ranks_read_num_valid_tokens(args) and torch.distributed.get_rank() == 0:
+    # BFD, or greedy with inter-document masking: ranks without first or last pipeline stage read
+    # the per-sample metadata saved here instead of building the datasets.
+    bfd_feature = bfd_middle_ranks_read_num_valid_tokens(args)
+    if (bfd_feature or greedy_middle_ranks_read_doc_lengths(args)) and torch.distributed.get_rank() == 0:
         NUM_VALID_TOKENS_PATHS.clear()
         DOC_LENGTHS_PATHS.clear()
         if isinstance(valid_ds, list):
@@ -439,7 +458,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
             valid = [("valid", valid_ds)]
         for key, ds in [("train", train_ds), *valid, ("test", test_ds)]:
             if ds is not None:
-                save_num_valid_tokens(ds, key)
+                (save_num_valid_tokens if bfd_feature else save_greedy_document_lengths)(ds, key)
 
     print_rank_0("> finished creating GPT datasets ...")
 

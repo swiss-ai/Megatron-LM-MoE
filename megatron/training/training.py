@@ -4175,8 +4175,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     train_ds, valid_ds, test_ds = None, None, None
     if (is_distributed or mpu.get_tensor_model_parallel_rank() == 0) and not args.perform_rl_step:
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
-    if getattr(args, "pretraining_packing_strategy", None) == "bfd":
-        # BFD: ranks that built no datasets (no first or last pipeline stage) read the
+    if getattr(args, "pretraining_packing_strategy", None) == "bfd" or (
+        getattr(args, "pretraining_packing_strategy", None) == "greedy" and getattr(args, "dataloader_inter_document_masking", False)
+    ):
+        # BFD, or greedy with inter-document masking: ranks that built no datasets (no first or last pipeline stage) read the
         # num_valid_tokens that rank 0 saved. Only tensor-parallel rank 0 loads data.
         saved = [NUM_VALID_TOKENS_PATHS, DOC_LENGTHS_PATHS]
         torch.distributed.broadcast_object_list(saved, src=0)
