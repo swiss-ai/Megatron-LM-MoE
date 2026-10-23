@@ -211,7 +211,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, NumValidTokensDataset
+from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, SAVE_ERROR_KEY, NumValidTokensDataset
 from megatron.core.datasets.utils import Split
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -4183,6 +4183,11 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         saved = [NUM_VALID_TOKENS_PATHS, DOC_LENGTHS_PATHS]
         torch.distributed.broadcast_object_list(saved, src=0)
         saved, doc_paths = saved
+        if SAVE_ERROR_KEY in saved:
+            raise RuntimeError(
+                f"rank 0 could not save the per-sample packed-sequence metadata that the middle pipeline "
+                f"ranks read ({saved[SAVE_ERROR_KEY]}); the data cache directory must be writable by rank 0"
+            )
 
         def _stand_in(key, split, ds):
             if ds is None and key in saved and mpu.get_tensor_model_parallel_rank() == 0:

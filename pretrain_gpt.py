@@ -25,7 +25,7 @@ from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
-from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, save_greedy_document_lengths, save_num_valid_tokens
+from megatron.core.datasets.gpt_dataset import DOC_LENGTHS_PATHS, NUM_VALID_TOKENS_PATHS, SAVE_ERROR_KEY, save_greedy_document_lengths, save_num_valid_tokens
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
@@ -456,9 +456,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
             valid = [(f"valid{i}", ds) for i, ds in enumerate(valid_ds)]
         else:
             valid = [("valid", valid_ds)]
-        for key, ds in [("train", train_ds), *valid, ("test", test_ds)]:
-            if ds is not None:
-                (save_num_valid_tokens if bfd_feature else save_greedy_document_lengths)(ds, key)
+        try:
+            for key, ds in [("train", train_ds), *valid, ("test", test_ds)]:
+                if ds is not None:
+                    (save_num_valid_tokens if bfd_feature else save_greedy_document_lengths)(ds, key)
+        except Exception as error:
+            # e.g. a read-only data cache: every rank raises right after the broadcast (see
+            # build_train_valid_test_data_loaders) instead of waiting for the distributed timeout.
+            NUM_VALID_TOKENS_PATHS.clear()
+            DOC_LENGTHS_PATHS.clear()
+            NUM_VALID_TOKENS_PATHS[SAVE_ERROR_KEY] = f"{type(error).__name__}: {error}"
+            print_rank_0(f"> could not save the per-sample packed-sequence metadata: {type(error).__name__}: {error}")
 
     print_rank_0("> finished creating GPT datasets ...")
 

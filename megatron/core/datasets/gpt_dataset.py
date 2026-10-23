@@ -1604,6 +1604,9 @@ NUM_VALID_TOKENS_PATHS: Dict[str, Tuple[str, int]] = {}
 # With inter-document masking: key -> (offsets path, lengths path) of the per-sample document
 # lengths, from which the stand-in derives cu_seqlens and max_seqlen.
 DOC_LENGTHS_PATHS: Dict[str, Tuple[str, str]] = {}
+# If rank 0 cannot save the arrays (e.g. a read-only data cache) it records the error under this key instead of
+# raising, so that every rank fails right after the broadcast instead of waiting for the distributed timeout.
+SAVE_ERROR_KEY = "__error__"
 
 
 def _masked_document_lengths(

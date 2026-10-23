@@ -291,9 +291,10 @@ def test_bfd_num_valid_tokens_array_matches_blend(tmp_path):
     assert numpy.array_equal(numpy.load(path_capped), before)
 
 
-def _build_masked_blend(tmp_path, packing, add_extra_token, defer_npy_index_mmap=False):
+def _build_masked_blend(tmp_path, packing, add_extra_token, defer_npy_index_mmap=False, single=False):
     """Two indexed datasets with documents of 1 to 150 tokens (plus 1-token documents and documents
-    longer than a 64-token sample), blended 0.6 / 0.4, packed with `packing`, inter-document masking on."""
+    longer than a 64-token sample), blended 0.6 / 0.4 (or the first one alone with `single`), packed with `packing`,
+    inter-document masking on."""
     import os
 
     from megatron.core.datasets.gpt_dataset import GPTDataset
@@ -324,7 +325,7 @@ def _build_masked_blend(tmp_path, packing, add_extra_token, defer_npy_index_mmap
     config = GPTDatasetConfig(
         random_seed=1234,
         sequence_length=64,
-        blend=(prefixes, [0.6, 0.4]),
+        blend=(prefixes[:1], None) if single else (prefixes, [0.6, 0.4]),
         split="80,10,10",
         reset_position_ids=False,
         reset_attention_mask=False,
@@ -337,7 +338,9 @@ def _build_masked_blend(tmp_path, packing, add_extra_token, defer_npy_index_mmap
         path_to_cache=str(tmp_path / "cache"),
         defer_npy_index_mmap=defer_npy_index_mmap,
     )
-    return BlendedMegatronDatasetBuilder(GPTDataset, [150, 20, 20], lambda: True, config).build()
+    # within one BFD epoch of the blend (or of the single file)
+    sizes = [60, 8, 8] if single else [150, 20, 20]
+    return BlendedMegatronDatasetBuilder(GPTDataset, sizes, lambda: True, config).build()
 
 
 def _check_stand_in(dataset, key):
@@ -355,7 +358,8 @@ def _check_stand_in(dataset, key):
         gpt_dataset.save_greedy_document_lengths(dataset, key)
     path, length = gpt_dataset.NUM_VALID_TOKENS_PATHS[key]
     doc_paths = gpt_dataset.DOC_LENGTHS_PATHS[key]
-    stand_in = gpt_dataset.NumValidTokensDataset(path, length, dataset.split, doc_paths=doc_paths, seq_length=64)
+    split = getattr(dataset, "split", None) or dataset.index_split  # BlendedDataset / GPTDataset
+    stand_in = gpt_dataset.NumValidTokensDataset(path, length, split, doc_paths=doc_paths, seq_length=64)
     assert len(stand_in) == len(dataset) > 0
     for i in range(len(dataset)):
         real, got = dataset[i], stand_in[i]
@@ -392,6 +396,27 @@ def test_document_lengths_arrays_match_samples_with_masking(tmp_path, packing, a
         assert numpy.all(numpy.diff(offsets) >= 1) and numpy.all(lengths >= 0)
     if packing == "greedy":
         assert not any(f.endswith("num_valid_tokens.npy") for f in os.listdir(tmp_path / "cache"))
+
+
+@pytest.mark.parametrize("packing", ["bfd", "greedy"])
+def test_document_lengths_arrays_single_dataset_layout(tmp_path, packing):
+    """A single indexed dataset (no blend) takes the per-component arrays as they are: same equality with
+    __getitem__ and the same layout (int64 offsets, one row per sample, int32 lengths) as a blend."""
+    import os
+
+    from megatron.core.datasets import gpt_dataset
+
+    datasets = _build_masked_blend(tmp_path, packing, True, single=True)
+    for key, dataset in zip(("train", "valid", "test"), datasets):
+        assert not hasattr(dataset, "datasets")
+        offsets_path, lengths_path = _check_stand_in(dataset, key)
+        offsets, lengths = numpy.load(offsets_path), numpy.load(lengths_path)
+        assert offsets.dtype == numpy.int64 and lengths.dtype == numpy.int32
+        assert len(offsets) == len(dataset) + 1 and offsets[-1] == len(lengths)
+        assert f"-{key}-{packing}-" in os.path.basename(offsets_path)
+        if packing == "bfd":
+            nvt = numpy.load(gpt_dataset.NUM_VALID_TOKENS_PATHS[key][0])
+            assert nvt.dtype == numpy.int32 and len(nvt) == len(dataset)
 
 
 @pytest.mark.parametrize("packing", ["bfd", "greedy"])
