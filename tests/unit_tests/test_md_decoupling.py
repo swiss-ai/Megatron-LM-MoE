@@ -927,11 +927,12 @@ def test_md_projected_row_gain_reshards(tmp_path_dist_ckpt):
     try:
         def make_row_shard(rank, fragments, local_rows, values):
             param = torch.nn.Parameter(torch.ones(local_rows, 3))
+            # Only DP rank 0 advertises primary shards; the other copies are replicas.
             model_shard = ShardedTensor.from_rank_offsets(
                 'linear.weight',
                 param,
                 (0, rank, fragments),
-                replica_id=(0, 0, 0),
+                replica_id=(0, 0, parallel_state.get_data_parallel_rank()),
             )
             optimizer = MDDecoupling(
                 params=[param],
@@ -1252,7 +1253,11 @@ def _md_sharded_optimizer(param):
 
 
 def _linear_weight_sharded_state(param):
-    return {'linear.weight': ShardedTensor.from_rank_offsets('linear.weight', param)}
+    return {
+        'linear.weight': ShardedTensor.from_rank_offsets(
+            'linear.weight', param, replica_id=(0, 0, parallel_state.get_data_parallel_rank())
+        )
+    }
 
 
 def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):

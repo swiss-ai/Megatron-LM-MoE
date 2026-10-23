@@ -1,0 +1,22 @@
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-bd13b7e6467b0018bdab6e1377696b8c" # from https://github.com/eth-cscs/alps-extended-images/pull/70
+
+mounts = ["/capstor/", "/ritom/"]
+
+writable = true
+entrypoint = true
+
+[env]
+PATH = "/usr/local/lib/python3.12/dist-packages/torch_tensorrt/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin"
+UCCL_EP_TRANSPORT = "cxi"
+# Four GPUs per node: the two-node combine kernel needs an RDMA send chunk of at least 8.
+UCCL_EP_COMBINE_CONFIG = "20,4,256,8,128"
+PMIX_MCA_psec = "native"
+NCCL_PXN_DISABLE = "1"
+NCCL_CROSS_NIC = "0"
+# NOTE: GH200 CSCS Alps machine don't support NVLS multicast
+# Keep optimized inference enabled, but use its supported NCCL collective fallback.
+UNIT_TEST_DISABLE_TRITON_NVLS = "true"
+
+[annotations]
+com.hooks.cxi.enabled = "false"
+com.hooks.netstack.source = "artifact"

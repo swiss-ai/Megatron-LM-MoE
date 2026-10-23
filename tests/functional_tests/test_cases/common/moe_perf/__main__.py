@@ -14,6 +14,7 @@ from typing import Any, Dict, Mapping, Sequence, cast
 import pytest  # type: ignore[import]
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.config import set_experimental_flag
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -21,7 +22,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import RandomSTE
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
+from megatron.core.tensor_parallel.random import (
+    get_cuda_rng_tracker,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -92,16 +100,23 @@ def _resolve_moe_submodules(case: MoEPerformanceCase):
     ).mlp.submodules
 
 
-def _load_baselines() -> Dict[str, Dict[str, float]]:
-    if not BASELINES_PATH.exists():
+def _baseline_path(case: MoEPerformanceCase) -> Path:
+    if case.gpu_platform == "GH200":
+        path = BASELINES_PATH.with_name("baseline_gh200.json")
+        return Path(os.environ.get("MEGATRON_MOE_PERF_BASELINE_PATH", str(path)))
+    return BASELINES_PATH
+
+
+def _load_baselines(path: Path = BASELINES_PATH) -> Dict[str, Dict[str, float]]:
+    if not path.exists():
         return {}
-    with BASELINES_PATH.open("r", encoding="utf-8") as fh:
+    with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def _persist_baselines(data: Dict[str, Dict[str, float]]) -> None:
-    BASELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with BASELINES_PATH.open("w", encoding="utf-8") as fh:
+def _persist_baselines(data: Dict[str, Dict[str, float]], path: Path = BASELINES_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
         fh.write("\n")
 
@@ -203,9 +218,13 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
         generator=generator,
     )
     input_tensor.requires_grad_(True)
+    rng_tracker = get_cuda_rng_tracker()
+    router_rng_name = get_expert_parallel_rng_tracker_name()
+    router_rng_state = rng_tracker.get_states()[router_rng_name].clone()
     for iteration in range(WARMUP_ITERS + MEASURE_ITERS):
-        if RandomSTE.generator is not None:
-            RandomSTE.generator.manual_seed(RandomSTE.generator.initial_seed())
+        rng_states = rng_tracker.get_states()
+        rng_states[router_rng_name] = router_rng_state
+        rng_tracker.set_states(rng_states)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         torch.cuda.nvtx.range_push(f"({case.name}) iteration {iteration}")
@@ -286,7 +305,7 @@ def _maybe_update_baseline(
         f"(limit {DEFAULT_MAX_VARIANCE_RATIO:.3f} of {backward_ms:.3f} ms)."
     )
     baselines[case.name] = _serialize_metrics(metrics)
-    _persist_baselines(baselines)
+    _persist_baselines(baselines, _baseline_path(case))
 
 
 def _prepare_moe_layer(case: MoEPerformanceCase) -> MoELayer:
@@ -341,6 +360,14 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
     )
 
     try:
+        data_parallel_size = parallel_state.get_data_parallel_world_size()
+        init_num_microbatches_calculator(
+            rank=Utils.rank,
+            rampup_batch_size=None,
+            global_batch_size=perf_case.model.micro_batch_size * data_parallel_size,
+            micro_batch_size=perf_case.model.micro_batch_size,
+            data_parallel_size=data_parallel_size,
+        )
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         torch.cuda.reset_peak_memory_stats()
         layer = _prepare_moe_layer(perf_case)
@@ -364,13 +391,13 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 
         # Only rank 0 checks the baseline
         if Utils.rank == 0 and not debug_mode:
-            baselines = _load_baselines()
+            baselines = _load_baselines(_baseline_path(perf_case))
             try:
                 if os.getenv(UPDATE_BASELINES_ENV) == "1":
                     _maybe_update_baseline(perf_case, metrics, baselines)
                 else:
                     _assert_within_baseline(perf_case.name, metrics, baselines)
-            except AssertionError as exc:
+            except (AssertionError, pytest.fail.Exception) as exc:
                 baseline_failed = True
                 baseline_failure_message = str(exc)
 
@@ -390,6 +417,7 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
                 pytest.fail(baseline_failure_message, pytrace=True)
 
     finally:
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         torch.cuda.empty_cache()
 
@@ -403,11 +431,15 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 #         --capture-range-end=stop \
 #         -o output \
 #         uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf
-# Commands to run with pytest:
+# Commands to run with pytest (H100: one eight-GPU node):
 # export MEGATRON_UPDATE_PERF_BASELINES=0 # set to 1 to update baseline perf numbers
 # uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf
+# GH200: one launcher task per node on two four-GPU nodes; each task runs:
+# uv run --no-sync python -m torch.distributed.run --nnodes=2 --nproc_per_node=4 \
+#   --node_rank="$SLURM_PROCID" --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+#   -m tests.functional_tests.test_cases.common.moe_perf
 if __name__ == "__main__":
-    pytest.main(["-x", "-v", "-s", __file__])  # -xvs
+    raise SystemExit(pytest.main(["-x", "-v", "-s", __file__]))  # -xvs
     # torch.cuda.cudart().cudaProfilerStart()
     # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
     # for case in PERFORMANCE_CASES:

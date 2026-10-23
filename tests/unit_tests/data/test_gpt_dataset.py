@@ -388,16 +388,18 @@ def test_mock_gpt_dataset_goldfish():
     base_bad["tokenizer_extra_metadata"] = TokenizerExtraMetadata(
         special_tokens=ModelSpecialTokens(full_ids=[1, tokenizer.vocab_size])
     )
-    # The mock builder rewraps construction errors; the assertion is the chained cause.
-    with pytest.raises(Exception, match="failed to build") as excinfo:
-        BlendedMegatronDatasetBuilder(
-            MockGPTDataset,
-            [100, 100, 100],
-            lambda: True,
-            GPTDatasetConfig(**base_bad, goldfish_loss=True, goldfish_k=4, goldfish_h=13),
-        ).build()
-    assert isinstance(excinfo.value.__cause__, AssertionError)
-    assert "outside the tokenizer vocab" in str(excinfo.value.__cause__)
+    # Only rank 0 tests this failure, which occurs before the builder's barrier.
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        # The mock builder rewraps construction errors; the assertion is the chained cause.
+        with pytest.raises(Exception, match="failed to build") as excinfo:
+            BlendedMegatronDatasetBuilder(
+                MockGPTDataset,
+                [100, 100, 100],
+                lambda: True,
+                GPTDatasetConfig(**base_bad, goldfish_loss=True, goldfish_k=4, goldfish_h=13),
+            ).build()
+        assert isinstance(excinfo.value.__cause__, AssertionError)
+        assert "outside the tokenizer vocab" in str(excinfo.value.__cause__)
 
 
 def test_mask_loss_token_ids_masks_targets_only(monkeypatch):

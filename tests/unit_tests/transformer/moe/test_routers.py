@@ -623,6 +623,7 @@ class TestAuxLossFreeTop2Router:
             moe_router_enable_expert_bias=True,  # Enable expert bias
             moe_router_bias_update_rate=0.1,  # Set bias update rate
             moe_router_topk=2,
+            moe_router_violation_metrics=[],
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,

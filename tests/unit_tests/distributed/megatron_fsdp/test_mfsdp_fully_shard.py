@@ -5,7 +5,6 @@ import shutil
 from contextlib import nullcontext
 from copy import deepcopy
 from itertools import product
-from pathlib import Path
 
 import pytest
 import torch
@@ -39,10 +38,6 @@ DELAYED_FP8_RECIPE = "fp8_delayed_scaling"
 CURRENT_FP8_RECIPE = "fp8_current_scaling"
 BLOCKWISE_FP8_RECIPE = "fp8_blockwise_scaling"
 MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
-
-# Needed for `torch.distributed.checkpoint.{save,load}` because
-# multiple processes need to write to the same directory.
-SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
 def destroy_device_mesh(device_mesh):
@@ -413,7 +408,7 @@ class TestMegatronFsdpFullyShard:
     @pytest.mark.parametrize("model_type", [CNN, TRANSFORMER, TE_TRANSFORMER])
     @pytest.mark.parametrize("mesh_dim_config", [(1, 4, 2, 1), (2, 2, 2, 1)])
     def test_dcp_checkpoint_save_and_load(
-        self, mesh_dim_config, shard_strategy, outer_shard_strategy, model_type
+        self, mesh_dim_config, shard_strategy, outer_shard_strategy, model_type, tmp_path_dist_ckpt
     ):
         """
         Test that an Megatron-FSDP model checkpoint can be saved and loaded accurately.
@@ -520,9 +515,9 @@ class TestMegatronFsdpFullyShard:
         """
         MODEL CHECKPOINT SAVE
         """
-        # Write model to checkpoint.
+        # Save and load the same shared checkpoint on every node.
         CKPT_DIR = (
-            Path(SHARED_TMP_DIR)
+            tmp_path_dist_ckpt
             / TestMegatronFsdpFullyShard.__name__
             / self.test_dcp_checkpoint_save_and_load.__name__
             / f"checkpoint_shard-{shard_strategy}_outer-{outer_shard_strategy}_{model_type}"

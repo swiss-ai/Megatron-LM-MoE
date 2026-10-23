@@ -1,0 +1,723 @@
+{
+  "version": 1,
+  "environments": [
+    "gh200:jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/apertus-2-cuda:alps7-dev-3802febe0fec326b69512641b32deb1e",
+    "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-bd13b7e6467b0018bdab6e1377696b8c"
+  ],
+  "required_selections": {
+    "unit": {
+      "model-configs": 4,
+      "fp8-parameters": 8,
+      "pipeline": 8,
+      "pipeline-multimodule": 8,
+      "pipeline-two-ranks": 2,
+      "models": 8,
+      "data": 4,
+      "checkpoint-optimizer": 8,
+      "checkpointing": 8,
+      "checkpoint-models": 8,
+      "checkpoint-moe": 8,
+      "transformer": 8,
+      "inference": 8,
+      "rl": 8,
+      "post-training": 8,
+      "resharding": 8,
+      "ssm": 8,
+      "moe": 8,
+      "fsdp": 8,
+      "a2a-overlap": 8,
+      "general": 8
+    },
+    "functional": {
+      "gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_tp1_pp2": 1,
+      "gpt3_mcore_tp1_pp2_resume_torch_dist": 1,
+      "gpt3_mcore_tp1_pp4": 1,
+      "gpt3_mcore_tp1_pp4_resume_torch_dist": 1,
+      "gpt3_mcore_tp4_pp1_resume_torch": 1,
+      "gpt3_mcore_tp4_pp1_resume_torch_dist": 1,
+      "gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files": 1,
+      "gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset": 1,
+      "gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer": 1,
+      "gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute": 1,
+      "gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings": 1,
+      "gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_tunable_overlap": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline": 1,
+      "gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split": 1,
+      "gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion": 1,
+      "gpt3_mcore_te_tp2_pp1_gdn": 1,
+      "gpt3_mcore_te_tp2_pp2_mla": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone": 1,
+      "gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce": 1,
+      "gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode": 1,
+      "gpt3_mcore_tp2_pp2_uninstall_te": 1,
+      "gpt3_7b_tp1_pp4_memory_speed": 1,
+      "gpt3_7b_tp4_pp1_memory_speed": 1,
+      "gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor": 1,
+      "gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": 1,
+      "gpt3_mcore_reruns_persistent_1": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer": 1,
+      "gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone": 1,
+      "gpt3_weekly_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap": 1,
+      "gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap": 1
+    }
+  },
+  "scopes": [
+    {
+      "suite": "unit",
+      "environment": "gh200:jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/apertus-2-cuda:alps7-dev-3802febe0fec326b69512641b32deb1e",
+      "source_sha": "41370f3657360d676b8331fac38e00c8ea3c1f61",
+      "source_job": "3675428",
+      "failures": [
+        {
+          "selection": "a2a-overlap",
+          "test_id": "tests.unit_tests.a2a_overlap.test_schedule_chunk_1f1b.TestA2AOverlap::test_1f1b_schedule_model_chunk[layers0-fp8_flag0-alltoall-1]",
+          "reason": "Existing all-to-all return-value unpacking mismatch.",
+          "blocking": false,
+          "error_signatures": [
+            "ValueError: too many values to unpack (expected 5)"
+          ]
+        },
+        {
+          "selection": "checkpoint-models",
+          "test_id": "tests.unit_tests.dist_checkpointing.models.test_bert_model.TestBERTModelReconfiguration::test_parallel_reconfiguration_e2e[False-src_tp_pp3-dest_tp_pp3-src_layer_spec3-dst_layer_spec3]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "checkpoint-moe",
+          "test_id": "tests.unit_tests.dist_checkpointing.models.test_moe_experts.TestExpertLayerReconfiguration::test_parallel_reconfiguration_e2e[True-tp-ep-dp-pp-tp-ep-dp-pp-sequential-False-src_tp_pp_ep_etp0-dest_tp_pp_ep_etp0-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "checkpointing",
+          "test_id": "tests.unit_tests.dist_checkpointing.test_async_save.TestAsyncSave::test_async_is_equivalent_to_sync[False-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_dcp_checkpoint_save_and_load[mesh_dim_config0-cnn-no_shard-optim_grads_params]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: metadata is None"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_gxpr_glu_fusion::test_fused_matches_reference[shape0-False-dtype1]",
+          "reason": "Existing fused-GLU float32 versus bfloat16 dtype assertion.",
+          "blocking": false,
+          "error_signatures": [
+            "AssertionError: assert torch.float32 == torch.bfloat16"
+          ]
+        },
+        {
+          "selection": "inference",
+          "test_id": "tests.unit_tests.inference.engines.test_dynamic_engine.TestDynamicInferenceEngine::test_simple[cuda_graph_scope0-None-mamba]",
+          "reason": "Optional Mamba backend is absent from the pinned image.",
+          "blocking": false,
+          "error_signatures": [
+            "ModuleNotFoundError: No module named 'mamba_ssm'"
+          ]
+        },
+        {
+          "selection": "moe",
+          "test_id": "::tests.unit_tests.transformer.moe.test_activation_offload",
+          "reason": "Existing test imports the removed ActivationOffloadHandle API.",
+          "blocking": false,
+          "error_signatures": [
+            "ImportError: cannot import name 'ActivationOffloadHandle' from 'megatron.core.transformer.moe.moe_offload' (<path>)"
+          ]
+        },
+        {
+          "selection": "post-training",
+          "test_id": "tests.unit_tests.post_training.test_modelopt_module_spec.TestModelOptGPTModel::test_inference",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
+          ]
+        },
+        {
+          "selection": "post-training",
+          "test_id": "tests.unit_tests.post_training.test_modelopt_module_spec.TestModelOptGPTModel::test_sharded_state_dict_restore",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "ssm",
+          "test_id": "tests.unit_tests.ssm.test_mamba_block.TestMambaBlock::test_gpu_forward",
+          "reason": "Optional Mamba backend is absent from the pinned image.",
+          "blocking": false,
+          "error_signatures": [
+            "ImportError: MambaSSM is not installed. Please install it with `pip install mamba-ssm`. when instantiating MambaMixer when instantiating MambaLayer"
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_dsa.TestDSAIndexer::test_dsa_indexer_constructor[16]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: Gloo connectFullMesh failed with [/opt/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [<peer>]"
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_dsa.TestDSAIndexer::test_dsa_indexer_constructor[64]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
+          ]
+        }
+      ]
+    },
+    {
+      "suite": "unit",
+      "environment": "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-bd13b7e6467b0018bdab6e1377696b8c",
+      "source_sha": "002986bd7a976890999a0accce6240a150830a14",
+      "source_job": "5116448",
+      "source_report": "https://github.com/swiss-ai/Megatron-LM-MoE/actions/runs/39758589297",
+      "source_patch_sha256": "82633cd6942e3fee007ccfc7c493e50ba94fccbdea0f913de857497bb0bd4c7f",
+      "failures": [
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.test_multi_token_prediction.TestMultiTokenPrediction::test_fp8_support[True]",
+          "reason": "FP8 test references an unregistered process group; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "ValueError: Process group <torch.distributed.distributed_c10d.ProcessGroup object at <address>> is not initialized in the world group map. Please initialize the group first."
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.test_submodule_callables.TestTransformerLayerSubmoduleCallables::test_1f1b_overlap[False-True-True-flex]",
+          "reason": "Fine-grained flex overlap differs from the reference on some ranks; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: [rank 0] value mismatch at index 3.",
+            "AssertionError: [rank 1] mlp.experts.linear_fc1.weight0: value mismatch",
+            "AssertionError: [rank 2] value mismatch at index 2.",
+            "AssertionError: [rank 3] value mismatch at index 2.",
+            "AssertionError: [rank 6] value mismatch at index 2.",
+            "AssertionError: [rank 7] value mismatch at index 2."
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.test_transformer_block.TestParallelTransformerBlock::test_gpu_forward_full_checkpoint_fp8",
+          "reason": "FP8 test references an unregistered process group; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "ValueError: Process group <torch.distributed.distributed_c10d.ProcessGroup object at <address>> is not initialized in the world group map. Please initialize the group first."
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.test_transformer_block.TestParallelTransformerBlock::test_gpu_forward_selective_checkpoint_fp8",
+          "reason": "FP8 test references an unregistered process group; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "ValueError: Process group <torch.distributed.distributed_c10d.ProcessGroup object at <address>> is not initialized in the world group map. Please initialize the group first."
+          ]
+        },
+        {
+          "selection": "inference",
+          "test_id": "tests.unit_tests.inference.engines.test_mamba_prefix_caching_e2e.TestMambaPrefixCachingE2E::test_mamba_prefix_caching_multi_group_e2e[2]",
+          "reason": "Mamba multi-group prefix-cache tokens differ from per-group outputs; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: group 3 req 3: multi [3983, 1003, 610, 1194, 8136, 5298, 7618, 8779] != per-group [3983, 1003, 610, 1194, 6946, 2777, 7532, 9067]"
+          ]
+        },
+        {
+          "selection": "inference",
+          "test_id": "tests.unit_tests.inference.engines.test_mamba_prefix_caching_e2e.TestMambaPrefixCachingE2E::test_mamba_prefix_caching_multi_group_e2e[None]",
+          "reason": "Mamba multi-group prefix-cache tokens differ from per-group outputs; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: group 3 req 3: multi [3983, 1003, 610, 1194, 8136, 5298, 7618, 8779] != per-group [3983, 1003, 610, 1194, 6946, 2777, 7532, 9067]"
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config0-no_shard-no_shard-cnn]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config0-no_shard-no_shard-te_transformer]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config0-no_shard-no_shard-transformer]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config1-no_shard-no_shard-cnn]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config1-no_shard-no_shard-te_transformer]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config1-no_shard-no_shard-transformer]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config2-no_shard-no_shard-cnn]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config2-no_shard-no_shard-te_transformer]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_fully_shard[common_args1-mesh_dim_config2-no_shard-no_shard-transformer]",
+          "reason": "DTensor rejects the optimizer in-place lerp placement change.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: aten.lerp.Scalar: in-place operations that require placement changes are not supported. The input has placement (Replicate(),), but no valid strategy preserves this placement. Please use the out-of-place version of this operation instead."
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.export.trtllm.test_single_device_fp8.TestTRTLLMSingleDeviceConverterFP8::test_get_model_weights_converter",
+          "reason": "FP8 export setup references an unregistered process group; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "ValueError: Process group <torch.distributed.distributed_c10d.ProcessGroup object at <address>> is not initialized in the world group map. Please initialize the group first."
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_gxpr_glu_fusion::test_fused_matches_reference[shape0-False-dtype1]",
+          "reason": "Fused GLU returns float32 instead of bfloat16.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert torch.float32 == torch.bfloat16"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_gxpr_glu_fusion::test_fused_matches_reference[shape1-False-dtype1]",
+          "reason": "Fused GLU returns float32 instead of bfloat16.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert torch.float32 == torch.bfloat16"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_gxpr_glu_fusion::test_fused_matches_reference[shape2-False-dtype1]",
+          "reason": "Fused GLU returns float32 instead of bfloat16.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert torch.float32 == torch.bfloat16"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_rlglu_fusion::test_bias_rlglu_against_autograd_reference[True-input_dtype2]",
+          "reason": "Fused GLU does not match its autograd reference for this dtype; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert False"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_ssglu_fusion::test_bias_ssglu_against_autograd_reference[False-input_dtype2]",
+          "reason": "Fused GLU does not match its autograd reference for this dtype; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert False"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_ssglu_fusion::test_bias_ssglu_against_autograd_reference[True-input_dtype2]",
+          "reason": "Fused GLU does not match its autograd reference for this dtype; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert False"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_sssglu_fusion::test_bias_sssglu_against_autograd_reference[False-input_dtype2]",
+          "reason": "Fused GLU does not match its autograd reference for this dtype; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert False"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_sssglu_fusion::test_bias_sssglu_against_autograd_reference[True-input_dtype2]",
+          "reason": "Fused GLU does not match its autograd reference for this dtype; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert False"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.optimizer.test_layerwise_allgather_dtype_cpu.TestLayerwiseAllgatherDtype::test_mixed_dtype_shards_are_gathered_per_dtype",
+          "reason": "CPU distributed test fails to initialize its file store; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistStoreError: No such file or directory"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.optimizer.test_layerwise_allgather_dtype_cpu.TestLayerwiseAllgatherDtype::test_single_dtype_shards_unchanged",
+          "reason": "CPU distributed test fails to initialize its file store; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistStoreError: No such file or directory"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling::test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags",
+          "reason": "Test configuration lacks the tp attribute required by the current optimizer API.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: 'types.SimpleNamespace' object has no attribute 'tp'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_logs_effective_weight_sparsity_per_matrix",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_logs_global_layer_buckets",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_logs_layernorm_effective_gains",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_logs_softplus_saturation_only",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_pairs_row_and_col_within_each_matrix",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_md_decoupling_logging::test_collect_md_gain_stats_treats_merged_experts_as_separate_matrices",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_muon_logging::test_collect_muon_stats_logs_layernorm_sparsity_and_param_rms",
+          "reason": "CPU logging reduction uses a process group without a CPU backend.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: No backend type associated with device type cpu"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_muon_optimizer::test_muon_builder_routes_kda_decay_parameters_to_scalar_optimizer",
+          "reason": "Fake model chunk lacks named_modules required by the optimizer builder.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: '_FakeModelChunk' object has no attribute 'named_modules'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_muon_optimizer::test_muon_builder_uses_per_head_mla_kv_split_shapes[False-None]",
+          "reason": "Fake model chunk lacks named_modules required by the optimizer builder.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: '_FakeModelChunk' object has no attribute 'named_modules'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_muon_optimizer::test_muon_builder_uses_per_head_mla_kv_split_shapes[True-8]",
+          "reason": "Fake model chunk lacks named_modules required by the optimizer builder.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: '_FakeModelChunk' object has no attribute 'named_modules'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_nan_sanitization::test_counts_and_sanitizes_aliases_once",
+          "reason": "Expected sanitization log text is absent or differs on nonzero ranks.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert '[NAN-SANITIZ...with_zero=3\\n' == '[NAN-SANITIZ...with_zero=3\\n'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_nan_sanitization::test_locally_finite_rank_recomputes_when_a_peer_repairs",
+          "reason": "Expected sanitization log text is absent or differs on nonzero ranks.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 'max_per_rank=5 threshold=16 action=sanitize' in ''"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_nan_sanitization::test_nonfinite_norm_without_nonfinite_grads_is_left_to_rerun",
+          "reason": "Expected sanitization log text is absent or differs on nonzero ranks.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 'no gradient element is' in ''"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_nan_sanitization::test_ranks_agree_when_only_one_rank_has_bad_elements",
+          "reason": "Multi-rank sanitization test fails to initialize its file store; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistStoreError: No such file or directory"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_distrib_optimizer_save_load_with_non_tensor_state[False]",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_distrib_optimizer_save_load_with_non_tensor_state[True]",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_optim_sharded_state_dict[bf16-False]",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_optim_sharded_state_dict[bf16-True]",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_optim_sharded_state_dict[fp32-False]",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_optim_sharded_state_dict[fp32-True]",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_optim_sharded_state_dict_mixed_model_dtypes",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_optimizer::test_optimizer_reload_model_params",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_training.TestTraining::test_build_train_valid_test_data_iterators",
+          "reason": "Test arguments omit exit_on_tranche_end required by current training code.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: 'types.SimpleNamespace' object has no attribute 'exit_on_tranche_end'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.test_utils::test_param_norm_cpu_offloaded_expert_bypasses_cuda_fused_norm",
+          "reason": "Expected value 8 differs from observed value 4; cause unresolved.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: assert 4 == 8"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.tokenizers.test_tokenizer::test_multimodal_tokenizer",
+          "reason": "Tokenizer backend Encoding lacks the copy method used by these tests.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: 'tokenizers.Encoding' object has no attribute 'copy'"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.tokenizers.test_tokenizer::test_sft_tokenizer",
+          "reason": "Tokenizer backend Encoding lacks the copy method used by these tests.",
+          "blocking": true,
+          "error_signatures": [
+            "AttributeError: 'tokenizers.Encoding' object has no attribute 'copy'"
+          ]
+        }
+      ]
+    }
+  ]
+}

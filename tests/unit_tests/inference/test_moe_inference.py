@@ -10,6 +10,8 @@ dimensions for fast unit test execution:
 - shared experts
 """
 
+import os
+
 import pytest
 import torch
 
@@ -21,6 +23,10 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 # Reusable skip decorators
+requires_nvls = pytest.mark.skipif(
+    os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true",
+    reason="Triton NVLS disabled by platform profile; requires CUDA switch multicast",
+)
 requires_te = pytest.mark.skipif(
     not is_te_min_version("1.7.0.dev0"), reason="Requires transformer-engine >= 1.7.0"
 )
@@ -137,7 +143,8 @@ class TestInferenceTopKRouter:
 
     def test_training_mode_forward_returns_sparse(self):
         """In training mode, forward delegates to parent and returns sparse tensors."""
-        router = self._make_router()
+        # NOTE: Routing parity does not require the global training-metrics calculator.
+        router = self._make_router(moe_router_violation_metrics=[])
         router.train()
         num_tokens = 16
         num_experts = NANOV3_BASE["num_moe_experts"]
@@ -152,7 +159,7 @@ class TestInferenceTopKRouter:
 
     def test_inference_vs_training_selects_same_experts(self):
         """Inference and training modes should select the same top-k experts."""
-        router = self._make_router()
+        router = self._make_router(moe_router_violation_metrics=[])
         num_tokens = 16
         topk = NANOV3_BASE["moe_router_topk"]
 
@@ -229,6 +236,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
 
+    @requires_nvls
     def test_symmetric_memory_buffer_initialized(self):
         """EP symmetric memory buffer is lazily created via SymmetricMemoryManager."""
         from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -302,6 +310,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
             512,
         ],
     )
+    @requires_nvls
     def test_cuda_graph_dispatch_combine(self, num_local_tokens, seed):
         """Dispatch+combine can be captured in a CUDA graph and replayed.
         Creates global buffers, shards per rank, and verifies:

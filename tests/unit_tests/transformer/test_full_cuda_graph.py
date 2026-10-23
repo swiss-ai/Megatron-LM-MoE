@@ -29,9 +29,7 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = torch.distributed.get_rank()
         dummy_data = torch.ones(1, 4)
 
         def loss_func(output_tensor):

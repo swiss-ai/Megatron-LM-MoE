@@ -6,6 +6,7 @@ import math
 import os
 import random
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
@@ -342,6 +343,11 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                # Keep the optimized transformer when the profile selects NCCL.
+                inference_disable_triton_nvls_kernels=(
+                    test_config.transformer_impl == "inference_optimized"
+                    and os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true"
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -434,6 +440,10 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_disable_triton_nvls_kernels=(
+                    test_config.transformer_impl == "inference_optimized"
+                    and os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true"
+                ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
@@ -750,7 +760,12 @@ class TestDynamicInferenceEngine:
             )
         )
 
-        with pytest.warns(UserWarning, match="Active buffer token capacity: 256"):
+        # Only engine rank 0 emits the warning; all ranks check the failure state.
+        with (
+            pytest.warns(UserWarning, match="Active buffer token capacity: 256")
+            if env.engine.rank == 0
+            else nullcontext()
+        ):
             future = env.engine._add_request(env.requests[0])
 
         assert future.done()
@@ -938,8 +953,9 @@ class TestDynamicInferenceEngine:
             assert results == []
             assert env.engine.controller.dummy_forward.call_count > 0
 
+    # Keep the engine's cached event loop open across tests.
     @pytest.mark.internal
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="session")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -1207,7 +1223,10 @@ class TestDynamicInferenceEngine:
 
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
+        # torchrun sets ranks, but each test must initialize its process group.
+        if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not torch.distributed.is_initialized():
+            Utils.initialize_distributed()
+        if not torch.distributed.is_initialized():
             pytest.skip("Distributed not initialized")
         world_size = torch.distributed.get_world_size()
         min_world_size = tp_size * pp_size * ep_size

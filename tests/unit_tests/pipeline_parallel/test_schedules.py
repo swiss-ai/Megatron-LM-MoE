@@ -1,7 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import os
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -188,9 +186,7 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = dist.get_rank()
         dummy_data = torch.ones(1, 4)
 
         def loss_func(output_tensor):
@@ -241,9 +237,7 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = dist.get_rank()
 
         def loss_func(output_tensor):
             return rank, {'loss_reduced': rank}
@@ -308,9 +302,7 @@ def test_forward_backward_func_with_interleaving(mocker):
     )
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = dist.get_rank()
 
         def loss_func(output_tensor):
             return rank, {'loss_reduced': rank}
@@ -412,9 +404,7 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
     )
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = dist.get_rank()
 
         def loss_func(output_tensor):
             return rank, {'loss_reduced': rank}
@@ -525,7 +515,7 @@ def test_forward_backward_pipelining_without_interleaving_with_custom_pgs(mocker
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
 
     def dummy_step_func(data_iterator, model):
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = dist.get_rank()
 
         def loss_func(output_tensor):
             return rank, {'loss_reduced': rank}
@@ -624,9 +614,7 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
     )
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank = int(os.environ['LOCAL_RANK'])
+        rank = dist.get_rank()
 
         def loss_func(output_tensor):
             return rank, {'loss_reduced': rank}
@@ -712,12 +700,10 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     def forward_step_func(data_iterator, model):
-        import os
-
-        rank_local = int(os.environ['LOCAL_RANK'])
+        global_rank = dist.get_rank()
 
         def loss_func(output_tensor):
-            return rank_local, {'loss_reduced': rank_local}
+            return global_rank, {'loss_reduced': global_rank}
 
         dummy_inp = torch.ones(1, 4)
         return model(dummy_inp), loss_func

@@ -2,6 +2,7 @@
 import gc
 import os
 import sys
+from functools import partialmethod
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -60,20 +62,37 @@ class TestPartialCudaGraphedA2AOverlap:
         self.cuda_graph_helper = None
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
+        self.buffer_patch = pytest.MonkeyPatch()
+        if fused_a2a.HAVE_DEEP_EP:
+            self.buffer_patch.setattr(
+                fused_a2a.Buffer,
+                '__init__',
+                partialmethod(fused_a2a.Buffer.__init__, explicitly_destroy=True),
+            )
 
     def teardown_method(self, method):
-        # Restore original environment variable values
-        for key, value in self.original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        Utils.destroy_model_parallel()
-        destroy_global_vars()
-        destroy_num_microbatches_calculator()
-        self.delete_cuda_graphs()
-
-        gc.collect()
+        try:
+            torch.cuda.synchronize()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            # Release graphs and their buffers while parallel state is still valid.
+            self.delete_cuda_graphs()
+            if fused_a2a.HAVE_DEEP_EP and fused_a2a._buffer is not None:
+                fused_a2a._buffer.destroy()
+                fused_a2a._buffer = None
+        finally:
+            try:
+                Utils.destroy_model_parallel()
+                destroy_global_vars()
+                destroy_num_microbatches_calculator()
+                gc.collect()
+            finally:
+                self.buffer_patch.undo()
+                for key, value in self.original_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def delete_cuda_graphs(self):
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():

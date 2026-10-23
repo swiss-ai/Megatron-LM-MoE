@@ -525,6 +525,8 @@ class TestQuantileBalancingCapacityFactor:
     topk = 2
 
     def setup_method(self, method):
+        # Entries retain the layer count of the model that first created them.
+        get_moe_layer_wise_logging_tracker().clear()
         Utils.initialize_model_parallel(1, 1)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         self.submodules = get_submodules(
@@ -535,6 +537,7 @@ class TestQuantileBalancingCapacityFactor:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        get_moe_layer_wise_logging_tracker().clear()
 
     def _router(self, method, capacity_factor, drop_policy="probs"):
         config = TransformerConfig(

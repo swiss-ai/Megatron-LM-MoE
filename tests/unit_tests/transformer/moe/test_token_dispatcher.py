@@ -2,12 +2,15 @@
 
 import copy
 import dataclasses
+import os
+from functools import partialmethod
 
 import pytest
 import torch
 
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -34,6 +37,8 @@ def token_unpermutation(token_dispatcher, hidden_states):
 
 
 class MoEModelTestContainer:
+    """Model helper; parallel groups belong to the calling test fixture."""
+
     def __init__(
         self,
         tp_size,
@@ -108,11 +113,6 @@ class MoEModelTestContainer:
         moe_layer = MoELayer(new_config, submodules.mlp.submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
-
-    def __del__(self):
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
-        Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def dispatcher_dropless_test(self):
@@ -422,10 +422,30 @@ def is_hybrid_ep_available():
 )
 class TestFlexDispatcher:
     def setup_method(self, method):
-        pass
+        # CXI retains transport queues until the default world is destroyed.
+        if os.environ.get('UCCL_EP_TRANSPORT') == 'cxi':
+            Utils.reinitialize_distributed()
+        self.buffer_patch = pytest.MonkeyPatch()
+        if is_deep_ep_available():
+            # Explicit buffer destruction unregisters the UCCL proxies.
+            self.buffer_patch.setattr(
+                fused_a2a.Buffer,
+                "__init__",
+                partialmethod(fused_a2a.Buffer.__init__, explicitly_destroy=True),
+            )
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+        try:
+            if fused_a2a._buffer is not None:
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                fused_a2a._buffer.destroy()
+                fused_a2a._buffer = None
+        finally:
+            try:
+                Utils.destroy_model_parallel()
+            finally:
+                self.buffer_patch.undo()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
