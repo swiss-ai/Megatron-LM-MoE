@@ -27,7 +27,9 @@ def load_function(path, name, namespace):
     namespace.setdefault('Optional', Optional)
     tree = ast.parse((ROOT / path).read_text())
     node = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == name
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(ROOT / path), "exec"), namespace)
     return namespace[name]
@@ -87,7 +89,6 @@ def test_tp_collective_contract_and_existing_batch_keys(
     if ap_sft:
         raw.update(
             cu_seqlens=torch.tensor([[0, 4, 8], [0, 8, 8]], dtype=torch.int32),
-            cu_seqlens_padded=torch.tensor([[0, 4, 8], [0, 8, 8]], dtype=torch.int32),
             max_seqlen=torch.tensor([4, 8], dtype=torch.int32),
             padding_mask=torch.tensor([[False] * 6 + [True] * 2] * 2),
             assistant_mask=torch.tensor([[False, True, True, False] * 2] * 2),
@@ -97,7 +98,6 @@ def test_tp_collective_contract_and_existing_batch_keys(
     received = get_batch(None)
     assert not messages, "receiver skipped a source broadcast"
     if ap_sft:
-        assert torch.equal(received["cu_seqlens_padded"], raw["cu_seqlens_padded"])
         assert torch.equal(received["padding_mask"], raw["padding_mask"])
         if report_assistant:
             assert torch.equal(received['assistant_mask'], raw['assistant_mask'])
@@ -105,14 +105,26 @@ def test_tp_collective_contract_and_existing_batch_keys(
             assert 'assistant_mask' not in received
     else:
         assert "padding_mask" not in received
-        assert "cu_seqlens_padded" not in received
         assert 'assistant_mask' not in received
 
 
+def loss_args(**overrides):
+    """Arguments loss_func reads for --ap-sft without CP."""
+    return SimpleNamespace(
+        ap_sft=True,
+        context_parallel_size=1,
+        calculate_per_token_loss=True,
+        check_for_nan_in_loss_and_grad=False,
+        check_for_spiky_loss=False,
+        **overrides,
+    )
+
+
 @pytest.mark.parametrize("stage", ["first", "middle", "last"])
-def test_cp_slices_available_tensors_and_padding_on_every_pp_stage(monkeypatch, stage):
+@pytest.mark.parametrize("cp", [1, 2])
+def test_cp_slices_available_tensors_and_padding_on_every_pp_stage(monkeypatch, stage, cp):
     monkeypatch.setattr(core_utils, "is_te_min_version", lambda _: True)
-    indices = torch.tensor([0, 3, 4, 7, 8, 9, 14, 15])
+    indices = torch.tensor([0, 3, 4, 7, 8, 9, 14, 15]) if cp == 2 else torch.arange(16)
 
     def partition(cu, length, cp, rank):
         assert cu.ndim == 1 and cu.tolist() == [0, 4, 8, 16]
@@ -124,6 +136,7 @@ def test_cp_slices_available_tensors_and_padding_on_every_pp_stage(monkeypatch, 
         sft=False,
         ap_sft=True,
         dataloader_inter_document_masking=False,
+        cp_doc_aware=False,
         pretraining_packing_strategy="greedy",
     )
     padding = torch.arange(16).reshape(2, 8) % 3 == 0
@@ -136,39 +149,42 @@ def test_cp_slices_available_tensors_and_padding_on_every_pp_stage(monkeypatch, 
         "padding_mask": padding,
         "assistant_mask": ~padding if stage == 'last' else None,
         "cu_seqlens": torch.tensor([[0, 4, 8], [0, 8, 8]], dtype=torch.int32),
-        "cu_seqlens_padded": torch.tensor([[0, 4, 8], [0, 8, 8]], dtype=torch.int32),
         "max_seqlen": torch.tensor([4, 8], dtype=torch.int32),
         "local_cp_size": None,
     }
-    get_batch = load_function(
-        "pretrain_gpt.py",
-        "get_batch",
-        {
-            "get_args": lambda: args,
-            "core_transformer_config_from_args": lambda _: None,
-            "mtp_on_this_rank": lambda *args, **kwargs: False,
-            "is_first_or_last_pipeline_stage": lambda _: stage != "middle",
-            "get_batch_on_this_tp_rank": lambda *args, **kwargs: raw,
-            "flatten_batch_for_packed_sequences": core_utils.flatten_batch_for_packed_sequences,
-            "get_thd_batch_on_this_cp_rank": lambda *args: core_utils.get_thd_batch_on_this_cp_rank(
-                *args, cp_size=2, cp_rank=0
-            ),
-            "PackedSeqParams": PackedSeqParams,
-        },
-    )
+    namespace = {
+        "get_args": lambda: args,
+        "parallel_state": SimpleNamespace(
+            get_context_parallel_world_size=lambda: cp, get_context_parallel_rank=lambda: 0
+        ),
+        "core_transformer_config_from_args": lambda _: None,
+        "mtp_on_this_rank": lambda *args, **kwargs: False,
+        "is_first_or_last_pipeline_stage": lambda _: stage != "middle",
+        "get_batch_on_this_tp_rank": lambda *args, **kwargs: raw,
+        "flatten_batch_for_packed_sequences": core_utils.flatten_batch_for_packed_sequences,
+        "get_thd_batch_on_this_cp_rank": lambda *args: core_utils.get_thd_batch_on_this_cp_rank(
+            *args, cp_size=cp, cp_rank=0
+        ),
+        "PackedSeqParams": PackedSeqParams,
+    }
+    load_function("pretrain_gpt.py", "_batch_outputs", namespace)
+    get_batch = load_function("pretrain_gpt.py", "get_batch", namespace)
     result = get_batch(None)
     assert len(result) == 8
     assert torch.equal(result[5], padding.reshape(1, -1).index_select(1, indices))
     assert result[6].cu_seqlens_q.ndim == 1
-    assert result[6].cu_seqlens_q_padded.ndim == 1
     assert result[6].cu_seqlens_q[-1] == 16
+    if cp == 1:
+        assert result[6].cu_seqlens_q_padded is None
+    else:
+        assert torch.equal(result[6].cu_seqlens_q_padded, result[6].cu_seqlens_q)
     if stage == "middle":
         assert all(value is None for value in result[:5])
     elif stage == "last":
-        assert result[0] is None and result[1].shape == (1, 8)
+        assert result[0] is None and result[1].shape == (1, 16 // cp)
         assert torch.equal(result[7], (~padding).reshape(1, -1).index_select(1, indices))
     else:
-        assert result[0].shape == (1, 8)
+        assert result[0].shape == (1, 16 // cp)
 
 
 def test_packed_pipeline_shape_includes_apertus_sft():
@@ -193,6 +209,7 @@ def test_packed_pipeline_shape_includes_apertus_sft():
         'goldfish_loss',
         'dataloader_inter_document_masking',
         'mock_data',
+        'exit_on_tranche_end',
     ],
 )
 def test_apertus_validation_guards_use_real_cli_names(unsupported):
@@ -202,24 +219,117 @@ def test_apertus_validation_guards_use_real_cli_names(unsupported):
     args.create_attention_mask_in_dataloader = True
     if unsupported:
         setattr(args, unsupported, True)
-    tree = ast.parse((ROOT / 'megatron/training/arguments.py').read_text())
-    validate = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == 'validate_args'
-    )
-    guard = next(
-        node
-        for node in validate.body
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "getattr(args, 'ap_sft', False)"
-    )
-    code = compile(ast.Module(body=[guard], type_ignores=[]), 'ap_sft_validation', 'exec')
+    validate = load_function('megatron/training/arguments.py', '_validate_ap_sft_args', {})
     if unsupported:
         with pytest.raises(AssertionError, match=unsupported):
-            exec(code, {'args': args})
+            validate(args)
     else:
-        exec(code, {'args': args})
+        validate(args)
         assert not args.create_attention_mask_in_dataloader
+
+
+def test_apertus_rejects_pretraining_bfd_packing():
+    add_args = load_function('megatron/training/arguments.py', '_add_sft_args', {})
+    args = add_args(argparse.ArgumentParser()).parse_args(['--ap-sft'])
+    args.calculate_per_token_loss = True
+    args.pretraining_packing_strategy = 'bfd'
+    validate = load_function('megatron/training/arguments.py', '_validate_ap_sft_args', {})
+    with pytest.raises(AssertionError, match='--ap-sft-packing-strategy'):
+        validate(args)
+
+
+@pytest.mark.parametrize('ap_sft', [False, True])
+def test_torch_fsdp2_guard_is_scoped_to_apertus_sft(ap_sft):
+    add_args = load_function('megatron/training/arguments.py', '_add_sft_args', {})
+    args = add_args(argparse.ArgumentParser()).parse_args(['--ap-sft'] if ap_sft else [])
+    args.calculate_per_token_loss = True
+    args.use_torch_fsdp2 = True
+    validate = load_function('megatron/training/arguments.py', '_validate_ap_sft_args', {})
+    if ap_sft:
+        with pytest.raises(AssertionError, match='--use-torch-fsdp2.*per-token'):
+            validate(args)
+    else:
+        validate(args)
+
+
+@pytest.mark.parametrize('packing', [None, 'greedy', 'bfd'])
+@pytest.mark.parametrize('stored', [False, True])
+@pytest.mark.parametrize('cp', [1, 2])
+@pytest.mark.parametrize('exclude_all', [False, True])
+def test_excluded_target_ids_normalize_loss_and_logits_gradients(
+    tmp_path, packing, stored, cp, exclude_all
+):
+    from tests.unit_tests.data.test_apertus_sft_dataset import make_dataset
+
+    rows = [[3, 90, 3, 0, 91, 92], [5, 90, 3, 91, 92]]
+    weights = [[0, 0.25, 2, 0.5, 1, 0], [0, 1, 0.25, 2, 0.5]] if stored else None
+    dataset = make_dataset(
+        tmp_path, rows, weights, context_parallel_size=cp,
+        sft_pack_samples=packing is not None, sft_packing_strategy=packing or 'greedy',
+        sft_report_assistant_loss=True,
+    )
+    indices = [*range(len(dataset)), None]  # Include the exact-epoch dummy path.
+    baseline = torch.utils.data.default_collate([dataset[i] for i in indices])
+    excluded = tuple(range(128)) if exclude_all else (3, 91)
+    dataset.config.loss_mask_token_ids = excluded
+    masked = torch.utils.data.default_collate([dataset[i] for i in indices])
+    for key in baseline:
+        if key != 'loss_mask':
+            torch.testing.assert_close(masked[key], baseline[key])
+    expected_weights = torch.tensor([
+        0.0 if target in excluded else weight
+        for target, weight in zip(baseline['labels'].flatten(), baseline['loss_mask'].flatten())
+    ])
+    torch.testing.assert_close(masked['loss_mask'].flatten(), expected_weights)
+    dataset.config.loss_mask_token_ids = None
+    torch.testing.assert_close(
+        torch.utils.data.default_collate([dataset[i] for i in indices])['loss_mask'],
+        baseline['loss_mask'],
+    )  # Stored/indexed weights must not be mutated.
+
+    batch = core_utils.flatten_batch_for_packed_sequences(masked)
+    targets = batch['labels'].flatten()
+    logits = torch.linspace(-1, 1, targets.numel() * 128).reshape(-1, 128).requires_grad_()
+    cross_entropy = torch.nn.functional.cross_entropy(logits, targets, reduction='none')
+    args = loss_args()
+    args.context_parallel_size = cp
+    loss_func = load_function(
+        'pretrain_gpt.py', 'loss_func',
+        {'torch': torch, 'GPTModel': object, 'get_args': lambda: args,
+         'has_nvidia_modelopt': False, 'get_rerun_state_machine': lambda: None},
+    )
+    sums, counts, reports = [], [], []
+    for rank in range(cp):
+        # CPU equivalent of THD's per-segment zigzag partition.
+        partitions = []
+        for start, end in zip(batch['cu_seqlens'][0][:-1], batch['cu_seqlens'][0][1:]):
+            segment = torch.arange(start, end)
+            if cp > 1:
+                chunks = segment.chunk(2 * cp)
+                segment = torch.cat((chunks[rank], chunks[2 * cp - rank - 1]))
+            partitions.append(segment)
+        selection = torch.cat(partitions)
+        loss, count, report = loss_func(
+            batch['loss_mask'].flatten()[selection], cross_entropy[selection],
+            assistant_mask=batch['assistant_mask'].flatten()[selection],
+        )
+        sums.append(loss)
+        counts.append(count)
+        reports.append(report)
+    count = torch.stack(counts).sum()
+    assert count == (expected_weights > 0).sum()
+    loss = torch.stack(sums).sum() / count.clamp_min(1)
+    torch.testing.assert_close(loss, (cross_entropy * expected_weights).sum() / count.clamp_min(1))
+    reported = torch.stack([report['lm loss'] for report in reports]).sum(0)
+    torch.testing.assert_close(reported[0] / reported[1].clamp_min(1), loss.detach())
+    assistant = batch['assistant_mask'].flatten()
+    reported_assistant = torch.stack([report['assistant_loss'] for report in reports]).sum(0)
+    torch.testing.assert_close(reported_assistant[0], cross_entropy.detach()[assistant].sum())
+    assert reported_assistant[1] == assistant.sum()
+    loss.backward()
+    expected_grad = logits.detach().softmax(-1) - torch.nn.functional.one_hot(targets, 128)
+    expected_grad *= expected_weights[:, None] / count.clamp_min(1)
+    torch.testing.assert_close(logits.grad, expected_grad)
 
 
 @pytest.mark.parametrize('ap_sft,packing', [(False, 'greedy'), (False, 'bfd'), (True, 'greedy')])
@@ -256,9 +366,7 @@ def test_padding_graph_warmup_guard(ap_sft, packing, graph_impl, warmup):
 
 @pytest.mark.parametrize("weights", [[0.25, 2, 0, 0.5], [0, 0, 0, 0]])
 def test_weighted_loss_counts_positive_targets_and_backpropagates(weights):
-    args = SimpleNamespace(
-        ap_sft=True, check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-    )
+    args = loss_args()
     loss_func = load_function(
         "pretrain_gpt.py",
         "loss_func",
@@ -283,9 +391,7 @@ def test_weighted_loss_counts_positive_targets_and_backpropagates(weights):
 
 @pytest.mark.parametrize('assistant', [[True, True, False, True], [False] * 4])
 def test_assistant_loss_is_unweighted_detached_and_does_not_change_gradients(assistant):
-    args = SimpleNamespace(
-        ap_sft=True, check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-    )
+    args = loss_args()
     loss_func = load_function(
         'pretrain_gpt.py',
         'loss_func',
@@ -311,9 +417,7 @@ def test_assistant_loss_is_unweighted_detached_and_does_not_change_gradients(ass
 
 
 def test_assistant_loss_aggregates_sums_and_counts_across_partitions():
-    args = SimpleNamespace(
-        ap_sft=True, check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-    )
+    args = loss_args()
     loss_func = load_function(
         'pretrain_gpt.py',
         'loss_func',
@@ -338,13 +442,7 @@ def test_assistant_loss_aggregates_sums_and_counts_across_partitions():
 
 @pytest.mark.parametrize('schedule_plan', [False, True])
 def test_forward_step_passes_assistant_mask_to_reporting_callback(schedule_plan):
-    args = SimpleNamespace(
-        ap_sft=True,
-        use_legacy_models=False,
-        overlap_moe_expert_parallel_comm=True,
-        check_for_nan_in_loss_and_grad=False,
-        check_for_spiky_loss=False,
-    )
+    args = loss_args(use_legacy_models=False, overlap_moe_expert_parallel_comm=True)
     namespace = {
         'torch': torch,
         'GPTModel': object,

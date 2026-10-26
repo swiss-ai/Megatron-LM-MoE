@@ -1346,16 +1346,12 @@ class _ParamAndGradBuffer:
     def scale_gradients(self, scaling_factor: Union[float, torch.Tensor]) -> None:
         """Scale the gradient data by `scaling_factor`.
 
-        `scaling_factor` may be a CUDA tensor: with --calculate-per-token-loss, finalize_model_grads
-        passes 1.0 / num_tokens, where num_tokens is all-reduced on the device. A gradient buffer may
-        meanwhile live in host memory (--moe-offload-main-grad stages the expert main grads there), and
-        an in-place CPU `*=` CUDA raises "Expected all tensors to be on the same device". Move the scalar
-        to each buffer's device instead. The .to() is a no-op for same-device buffers, so the common
-        all-CUDA case is unchanged.
+        With --calculate-per-token-loss the factor is a CUDA tensor, while
+        --moe-offload-main-grad keeps some gradient buffers in host memory.
         """
 
         def _scalar_for(tensor: torch.Tensor):
-            if torch.is_tensor(scaling_factor) and scaling_factor.device != tensor.device:
+            if torch.is_tensor(scaling_factor):
                 return scaling_factor.to(tensor.device)
             return scaling_factor
 

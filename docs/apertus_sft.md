@@ -1,4 +1,4 @@
-# SFT modes and loss weighting
+# Apertus-2 SFT
 
 ## Training modes
 
@@ -22,12 +22,14 @@ document boundaries. Pass the `tokens` prefix as the data path.
 ## Weighting and normalization
 
 Stored weights describe each token before target shifting. Zero suppresses it;
-positive values scale its loss. This supports different weights for thinking,
-replies, tool calls, and claims, including suppressing a turn corrected later.
-Weights must be finite, nonnegative, and representable as float32.
+positive values scale its loss. Weights must be finite, nonnegative, and
+representable as float32.
 
 Without stored weights, entire output frames (headers/controls included) and
 every `<|wait|>` get weight one; inputs get zero. IDs come from tokenizer metadata.
+
+`--mask-loss-token-ids` zeroes training weights for matching target tokens in
+either loading mode. It leaves input tokens and `assistant_loss` unchanged.
 
 AP requires `--calculate-per-token-loss`:
 
@@ -39,52 +41,43 @@ Dividing by the weight sum cancels uniform scaling; converting it to an integer
 truncates fractional weights. Positive-target counts avoid both problems.
 Gradients and reporting use the same global numerator/count across microbatches
 and DP/CP ranks. An all-zero mask contributes zero language-model loss.
+The count excludes targets suppressed by `--mask-loss-token-ids`.
+AP rejects `--use-torch-fsdp2` because its wrapper does not implement this
+gradient normalization.
 
 `--ap-sft-report-assistant-loss` adds `assistant_loss`: unweighted mean
 cross-entropy over output targets, including those suppressed by training weights.
-It uses a separate shifted mask and the same global sum/count reporting reduction.
 This optional metric requires Apertus control metadata in either loading mode.
 
-## Reuse and changes
+## Packing and parallelism
 
-- **Old Apertus trainer:** Reused whole-conversation sampling, greedy/BFD packing,
-  cached indices, and independently shuffled epochs. Replaced concatenated
-  `[tokens, mask]` storage with indexed pairs. Labels/weights shift per
-  conversation, with a zero-weight final target. Lengths define attention
-  boundaries and position resets; physical CP/SP padding is separate from weights.
-- **MM branch:** Adopted the supervised-token denominator from this repo's
-  `origin/multimodality/main`, commit `c8d533834`; `4e3ab6796` scoped it to GPT.
-  AP enables it automatically. The old SwissAI MM branch still uses
-  `int(loss_mask.sum())`. Modality lookup/reporting and sample equalization
-  were not ported.
-- **MCore:** Reused existing global gradient normalization in
-  [schedules.py](../megatron/core/pipeline_parallel/schedules.py) and
-  [finalize_model_grads.py](../megatron/core/distributed/finalize_model_grads.py).
-  Added AP's denominator and zero-count reporting protection.
+Each sample is one conversation, or with `--ap-sft-pack-samples` several whole
+conversations packed `greedy` or `bfd` (`--ap-sft-packing-strategy`). Labels and
+weights shift per conversation, conversation boundaries reset attention and
+positions, and long conversations keep their prefix. Indices are cached; every
+epoch is shuffled independently. AP needs THD-capable attention and rejects
+`--pretraining-packing-strategy bfd`.
 
-Optional packing: `--ap-sft-pack-samples --ap-sft-packing-strategy greedy|bfd`.
-Long conversations retain their prefix. AP requires THD-capable attention.
-Transformer Engine CUDA graphs require `--cuda-graph-warmup-steps` ≥ 1 so capture
-includes the MoE padding mask. Captured scopes must leave attention outside the
-graph: current TE attention/full-layer replay rejects packed-sequence metadata.
-CPU encoding/export tests pass; CUDA training remains unverified.
+With CP or sequence parallelism, each conversation is padded to a multiple of
+`lcm(2 × CP, CP × SP)` with CP > 1, else SP (SP = TP size with
+`--sequence-parallel`, else 1). Padding has zero weight and is marked in the MoE
+padding mask, so CP works without `--dataloader-inter-document-masking` or
+`--cp-doc-aware`.
+
+Transformer Engine CUDA graphs need `--cuda-graph-warmup-steps` ≥ 1 so capture
+includes the MoE padding mask. Set `--cuda-graph-scope` to scopes without `attn`
+(e.g. `moe_router moe_preprocess`): the default captures whole layers, and TE
+replay does not accept packed-sequence metadata.
 
 ## Exact epochs
 
-Use `--ap-sft --ap-sft-epochs 1 --calculate-per-token-loss` to train on every
-conversation in the **training split** exactly once. With packing, every pack is
-used once; packing and prefix truncation stay the same. `--ap-sft-epochs N`
-independently shuffles each epoch and fills its final global batch with dummy
-samples whose training/assistant masks are zero. Real samples are never repeated
-to fill a batch. For example, 1,000 samples with global batch 64 take 16 steps,
-including 24 dummy samples.
+`--ap-sft-epochs N` (with `--ap-sft --calculate-per-token-loss`) replaces
+`--train-iters`/`--train-samples` and trains every conversation or pack of the
+training split exactly once per epoch. The last global batch of each epoch is
+filled with zero-loss samples instead of repeats, e.g. 1,000 samples at global
+batch 64 take 16 steps including 24 dummy samples.
 
-This replaces `--train-iters`/`--train-samples`. Use the `single` loader (default),
-a fixed global batch divisible by micro-batch size × DP size, and training
-prefixes without explicit blend weights; stored token loss weights are supported.
-Multiple unweighted datasets are covered exhaustively;
-validation/test sizing is unchanged. Batch rampup, training phases, and automatic
-batch reduction are unsupported. LR settings use iteration-based flags; the
-schedule length is derived before optimizer setup. Consumed-sample counters
-include dummy slots, and resuming with the same data/config continues at the
-saved offset. Without this option, existing sample/iteration behavior remains.
+Requirements: the `single` loader, a global batch divisible by micro-batch size ×
+DP size, and training data without blend weights. Batch rampup, training phases
+and automatic batch reduction are unsupported. Consumed-sample counters include
+the dummy samples, so resuming with the same data and settings continues exactly.

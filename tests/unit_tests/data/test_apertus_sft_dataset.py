@@ -5,6 +5,7 @@ The dataset is loaded directly to avoid training-package GPU initialization.
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -232,7 +233,6 @@ def test_default_collation_handles_different_conversation_counts(tmp_path):
     assert batch["padding_mask"].shape == (1, 32)
     assert batch["cu_seqlens"].shape == (1, 4)
     assert batch["cu_seqlens"][0, -1] == 32
-    assert torch.equal(batch["cu_seqlens"], batch["cu_seqlens_padded"])
 
 
 @pytest.mark.parametrize("bad", [-0.1, float("nan"), float("inf"), 1e100, 1e-100])
@@ -275,7 +275,15 @@ def test_cache_reload_epoch_shuffle_and_source_invalidation(tmp_path, monkeypatc
             data.dataset, data.dataset_path, data.indices, 24, Split.train, data.config
         )
     np.testing.assert_array_equal(reopened.shuffle_index, data.shuffle_index)
-    changed = make_dataset(tmp_path, rows, requested=24)
+    # Bump mtimes explicitly: some file systems store whole seconds only.
+    for suffix in (".idx", ".bin"):
+        source = tmp_path / ("tokens" + suffix)
+        stat = source.stat()
+        os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+    changed = ApertusSFTDataset(
+        ApertusSFTLowLevelDataset(data.dataset_path, data.config),
+        data.dataset_path, data.indices, 24, Split.train, data.config,
+    )
     assert changed.unique_description_hash != first_hash
     np.testing.assert_array_equal(changed.shuffle_index, data.shuffle_index)
 

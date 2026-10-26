@@ -70,7 +70,9 @@ def test_cu_seqlens_reaches_every_pipeline_stage(mbs, ap_sft, report_assistant):
     if world < 4 or world % tp != 0:
         pytest.skip(f"needs a world size divisible by {tp} and >= 4, got {world}")
 
-    Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
+    )
     seq_length, doc_lengths = 64, [17, 20, 27]
     args = _Args(pp, mbs, seq_length)
     args.ap_sft = ap_sft
@@ -83,7 +85,6 @@ def test_cu_seqlens_reaches_every_pipeline_stage(mbs, ap_sft, report_assistant):
     if mpu.get_tensor_model_parallel_rank() == 0:
         batch = _fake_batch(mbs, seq_length, doc_lengths)
         if ap_sft:
-            batch['cu_seqlens_padded'] = batch['cu_seqlens'].clone()
             batch['padding_mask'] = torch.zeros(mbs, seq_length, dtype=torch.bool)
             batch['padding_mask'][:, -5:] = True
             if report_assistant:
@@ -102,7 +103,6 @@ def test_cu_seqlens_reaches_every_pipeline_stage(mbs, ap_sft, report_assistant):
     )
     assert got["max_seqlen"] is not None
     if ap_sft:
-        assert torch.equal(got['cu_seqlens'], got['cu_seqlens_padded'])
         expected_padding = torch.zeros(mbs, seq_length, dtype=torch.bool, device='cuda')
         expected_padding[:, -5:] = True
         assert torch.equal(got['padding_mask'], expected_padding.reshape(1, -1))
