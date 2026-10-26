@@ -1,20 +1,29 @@
 """Exact Apertus SFT epochs with a zero-loss tail for each global batch."""
 
+import logging
+
 import numpy as np
 import torch
+
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
+
+
+def _padded_epoch_size(samples, global_batch_size):
+    """Round an epoch up to whole global batches."""
+    return (samples + global_batch_size - 1) // global_batch_size * global_batch_size
 
 
 class ApertusSFTEpochDataset(torch.utils.data.Dataset):
     """Permute one exhaustive source epoch, then pad its last global batch."""
 
     def __init__(self, dataset, epochs, global_batch_size, seed):
-        if len(dataset) == 0 or epochs <= 0 or global_batch_size <= 0:
+        if len(dataset) == 0 or global_batch_size <= 0:
             raise ValueError("exact SFT epochs require nonempty data and positive sizes")
         self.dataset = dataset
         self.real_samples_per_epoch = len(dataset)
-        self.samples_per_epoch = (
-            (len(dataset) + global_batch_size - 1) // global_batch_size * global_batch_size
-        )
+        self.samples_per_epoch = _padded_epoch_size(len(dataset), global_batch_size)
         rng = np.random.RandomState(seed)
         self.order = np.stack([rng.permutation(len(dataset)) for _ in range(epochs)])
         self.split = getattr(dataset, "index_split", getattr(dataset, "split", None))
@@ -28,7 +37,7 @@ class ApertusSFTEpochDataset(torch.utils.data.Dataset):
         epoch, position = divmod(index, self.samples_per_epoch)
         if position < self.real_samples_per_epoch:
             return self.dataset[int(self.order[epoch, position])]
-        # BlendedDataset needs an integer index; its AP leaves accept None.
+        # BlendedDataset rejects a None index; ask its first source for the padding sample.
         if hasattr(self.dataset, "datasets"):
             return {"dataset_id": 0, **self.dataset.datasets[0][None]}
         return self.dataset[None]
@@ -51,13 +60,15 @@ def prepare_apertus_sft_epochs(provider, args):
         raise ValueError("--ap-sft-epochs requires a nonempty training split")
     if source is not None and len(source) != real_count:
         raise ValueError("Apertus SFT training length differs across ranks")
-    samples_per_epoch = (
-        (real_count + args.global_batch_size - 1)
-        // args.global_batch_size * args.global_batch_size
-    )
-    args.ap_sft_real_samples_per_epoch = real_count
-    args.ap_sft_samples_per_epoch = samples_per_epoch
+    samples_per_epoch = _padded_epoch_size(real_count, args.global_batch_size)
     args.train_iters = args.ap_sft_epochs * samples_per_epoch // args.global_batch_size
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f'Apertus SFT: {args.ap_sft_epochs} exact epochs, {real_count} real samples/packs and '
+        f'{samples_per_epoch - real_count} zero-loss samples per epoch; '
+        f'{args.train_iters} iterations',
+    )
     training = (
         ApertusSFTEpochDataset(source, args.ap_sft_epochs, args.global_batch_size, args.seed)
         if source is not None else None

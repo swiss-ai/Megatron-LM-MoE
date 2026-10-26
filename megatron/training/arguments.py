@@ -1065,7 +1065,7 @@ def validate_args(args, defaults={}):
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
-    if (args.train_iters or getattr(args, 'ap_sft_epochs', None)) and not args.skip_train:
+    if (args.train_iters or args.ap_sft_epochs) and not args.skip_train:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
         assert args.train_samples is None, \
@@ -1139,8 +1139,8 @@ def validate_args(args, defaults={}):
         # enabled; disable the flag to avoid a TP broadcast mismatch.
         if args.create_attention_mask_in_dataloader:
             args.create_attention_mask_in_dataloader = False
-        assert not (args.sft or getattr(args, 'ap_sft', False)), (
-            '--dataloader-inter-document-masking and SFT both produce cu_seqlens; '
+        assert not args.sft, (
+            '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
             'SFT packing already restricts attention to each packed sequence.'
         )
         if args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1:
@@ -1164,29 +1164,12 @@ def validate_args(args, defaults={}):
         assert not args.mtp_num_layers, '--cp-doc-aware does not support multi-token prediction.'
         assert not args.hybrid_context_parallel, '--cp-doc-aware replaces hybrid CP.'
 
-    assert not (args.sft and getattr(args, 'ap_sft', False)), (
-        '--sft and --ap-sft are mutually exclusive'
-    )
-    assert not getattr(args, 'ap_sft_report_assistant_loss', False) or getattr(args, 'ap_sft', False), (
-        '--ap-sft-report-assistant-loss requires --ap-sft'
-    )
-    validate_apertus_sft_epochs(args)
-    if getattr(args, 'ap_sft', False):
-        assert args.calculate_per_token_loss, '--ap-sft requires --calculate-per-token-loss'
-        args.create_attention_mask_in_dataloader = False
-        for option in (
-            'hybrid_context_parallel', 'mtp_num_layers', 'modelopt_enabled',
-            'fim_data', 'goldfish_loss', 'dataloader_inter_document_masking',
-            'mock_data', 'use_legacy_models', 'exit_on_tranche_end',
-            'dataloader_fast_cache_load', 'dataloader_defer_npy_index_mmap',
-        ):
-            assert not getattr(args, option, False), f'--ap-sft does not support {option}'
-        assert args.max_docs_per_bin_sft >= 0, '--max-docs-per-bin-sft must be nonnegative'
+    _validate_ap_sft_args(args)
 
     # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
     # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
     if args.attention_backend == AttnBackend.auto and (
-        args.sft or getattr(args, 'ap_sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+        args.sft or args.ap_sft or getattr(args, 'dataloader_inter_document_masking', False)
     ):
         args.attention_backend = AttnBackend.flash
         if args.rank == 0:
@@ -1819,10 +1802,7 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-            if (
-                getattr(args, 'ap_sft', False)
-                or getattr(args, 'pretraining_packing_strategy', None) == 'bfd'
-            ):
+            if args.ap_sft or getattr(args, 'pretraining_packing_strategy', None) == 'bfd':
                 # Capture takes a routing padding_mask only for MoE layers that have already
                 # routed with one, which needs at least one real forward before the graphs
                 # are recorded. With no warmup step the graphs are captured unmasked and TE
@@ -1881,6 +1861,46 @@ def validate_args(args, defaults={}):
     _print_args("arguments", args)
 
     return args
+
+
+def _validate_ap_sft_args(args):
+    """Check --ap-sft and its options; --ap-sft-epochs also replaces --train-iters."""
+    assert not (args.sft and args.ap_sft), '--sft and --ap-sft are mutually exclusive'
+    assert args.ap_sft or not args.ap_sft_report_assistant_loss, (
+        '--ap-sft-report-assistant-loss requires --ap-sft'
+    )
+    if args.ap_sft:
+        assert args.calculate_per_token_loss, '--ap-sft requires --calculate-per-token-loss'
+        assert not getattr(args, 'use_torch_fsdp2', False), (
+            '--ap-sft does not support --use-torch-fsdp2: Torch FSDP2 does not '
+            'implement per-token gradient normalization'
+        )
+        args.create_attention_mask_in_dataloader = False
+        for option in (
+            'hybrid_context_parallel', 'mtp_num_layers', 'modelopt_enabled',
+            'fim_data', 'goldfish_loss', 'dataloader_inter_document_masking',
+            'mock_data', 'use_legacy_models', 'exit_on_tranche_end',
+            'dataloader_fast_cache_load', 'dataloader_defer_npy_index_mmap',
+        ):
+            assert not getattr(args, option, False), f'--ap-sft does not support {option}'
+        assert getattr(args, 'pretraining_packing_strategy', None) != 'bfd', (
+            '--ap-sft packs conversations itself (--ap-sft-packing-strategy); '
+            'do not set --pretraining-packing-strategy bfd'
+        )
+    if args.ap_sft_epochs is None:
+        return
+    assert args.ap_sft, '--ap-sft-epochs requires --ap-sft'
+    assert args.ap_sft_epochs > 0, '--ap-sft-epochs must be positive'
+    assert args.train_iters is None and args.train_samples is None, (
+        '--ap-sft-epochs replaces --train-iters and --train-samples'
+    )
+    assert args.dataloader_type == 'single', '--ap-sft-epochs requires --dataloader-type single'
+    for option in ('rampup_batch_size', 'phase_transition_iterations', 'skip_train',
+                   'perform_rl_step', 'decrease_batch_size_if_needed'):
+        assert not getattr(args, option, False), f'--ap-sft-epochs does not support {option}'
+    assert args.global_batch_size % (args.micro_batch_size * args.data_parallel_size) == 0, (
+        '--ap-sft-epochs requires a global batch divisible by micro-batch-size * DP size'
+    )
 
 
 def _print_args(title, args):
@@ -4025,24 +4045,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
         )
     return parser
 
-def validate_apertus_sft_epochs(args):
-    epochs = getattr(args, 'ap_sft_epochs', None)
-    if epochs is None:
-        return
-    assert getattr(args, 'ap_sft', False), '--ap-sft-epochs requires --ap-sft'
-    assert epochs > 0, '--ap-sft-epochs must be positive'
-    assert args.train_iters is None and args.train_samples is None, (
-        '--ap-sft-epochs replaces --train-iters and --train-samples'
-    )
-    assert args.dataloader_type == 'single', '--ap-sft-epochs requires --dataloader-type single'
-    for option in ('rampup_batch_size', 'phase_transition_iterations', 'skip_train',
-                   'perform_rl_step', 'decrease_batch_size_if_needed'):
-        assert not getattr(args, option, False), f'--ap-sft-epochs does not support {option}'
-    assert args.global_batch_size % (args.micro_batch_size * args.data_parallel_size) == 0, (
-        '--ap-sft-epochs requires a global batch divisible by micro-batch-size * DP size'
-    )
-
-
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
@@ -4052,8 +4054,11 @@ def _add_sft_args(parser):
                             'global batch of each epoch with zero-loss samples')
     group.add_argument('--ap-sft-pack-samples', action="store_true",
                        help='Pack complete Apertus conversations into THD samples')
-    group.add_argument('--ap-sft-packing-strategy', choices=['greedy', 'bfd'], default='greedy')
-    group.add_argument('--max-docs-per-bin-sft', type=int, default=0)
+    group.add_argument('--ap-sft-packing-strategy', choices=['greedy', 'bfd'], default='greedy',
+                       help='How --ap-sft-pack-samples packs conversations: greedy in shuffled '
+                            'order or best-fit decreasing')
+    group.add_argument('--max-docs-per-bin-sft', type=int, default=0,
+                       help='Maximum conversations per --ap-sft bfd pack; 0 means no limit')
     group.add_argument('--ap-sft-load-loss-mask', action="store_true",
                        help='Load sibling indexed loss_weights data')
     group.add_argument('--ap-sft-report-assistant-loss', action='store_true',

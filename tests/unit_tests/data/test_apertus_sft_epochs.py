@@ -1,6 +1,5 @@
 """Exact epoch coverage through indexed data, the production sampler and provider."""
 
-import ast
 import copy
 import importlib.util
 from functools import partial
@@ -12,7 +11,7 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from tests.unit_tests.data.test_apertus_sft_batch import ROOT, load_function
+from tests.unit_tests.data.test_apertus_sft_batch import ROOT, load_function, loss_args
 from tests.unit_tests.data.test_apertus_sft_dataset import (
     ApertusSFTDataset,
     Tokenizer,
@@ -27,15 +26,9 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 EpochDataset = module.ApertusSFTEpochDataset
 
-tree = ast.parse((ROOT / 'megatron/training/datasets/data_samplers.py').read_text())
-sampler_class = next(
-    node
-    for node in tree.body
-    if isinstance(node, ast.ClassDef) and node.name == 'MegatronPretrainingSampler'
+Sampler = load_function(
+    'megatron/training/datasets/data_samplers.py', 'MegatronPretrainingSampler', {}
 )
-namespace = {}
-exec(compile(ast.Module(body=[sampler_class], type_ignores=[]), 'sampler', 'exec'), namespace)
-Sampler = namespace['MegatronPretrainingSampler']
 
 
 @pytest.mark.parametrize('packing', [None, 'greedy', 'bfd'])
@@ -112,9 +105,7 @@ def test_preparation_resolves_schedule_and_reuses_training(
     monkeypatch.setattr(torch.distributed, 'all_reduce', lambda count, **_: count.fill_(5))
     wrapped = module.prepare_apertus_sft_epochs(provider, args)
     assert calls[0] == ((None, 0, 0), {'vp_stage': 0} if virtual else {})
-    assert args.train_iters == 4
-    assert args.ap_sft_real_samples_per_epoch == 5
-    assert args.ap_sft_samples_per_epoch == 8
+    assert args.train_iters == 4  # two epochs of 5 real + 3 zero-loss samples, GBS 4
     train, valid, test = wrapped((16, 24, 4), vp_stage=0)
     assert (valid, test) == ('valid', 'test')
     assert calls[-1] == ((0, 24, 4), {'vp_stage': 0} if virtual else {})
@@ -153,6 +144,7 @@ def test_real_provider_builds_exhaustive_training_and_preserves_validation(
     args = SimpleNamespace(
         ap_sft=True,
         ap_sft_epochs=2,
+        exit_on_tranche_end=False,
         goldfish_loss=False,
         virtual_pipeline_model_parallel_size=None,
         global_batch_size=4,
@@ -214,9 +206,12 @@ def test_real_provider_builds_exhaustive_training_and_preserves_validation(
     ],
 )
 def test_epoch_cli_rejects_incompatible_options(bad):
-    validate = load_function('megatron/training/arguments.py', 'validate_apertus_sft_epochs', {})
+    validate = load_function('megatron/training/arguments.py', '_validate_ap_sft_args', {})
     args = SimpleNamespace(
+        sft=False,
         ap_sft=True,
+        ap_sft_report_assistant_loss=False,
+        calculate_per_token_loss=True,
         ap_sft_epochs=1,
         train_iters=None,
         train_samples=None,
@@ -233,20 +228,24 @@ def test_epoch_cli_rejects_incompatible_options(bad):
 
 
 def test_epoch_cli_default_leaves_existing_modes_alone():
-    validate = load_function('megatron/training/arguments.py', 'validate_apertus_sft_epochs', {})
-    validate(SimpleNamespace())
+    validate = load_function('megatron/training/arguments.py', '_validate_ap_sft_args', {})
+    validate(
+        SimpleNamespace(
+            sft=False, ap_sft=False, ap_sft_report_assistant_loss=False, ap_sft_epochs=None
+        )
+    )
 
 
 @pytest.mark.parametrize('blend', [None, (['tokens'], [1.0])])
 def test_provider_rejects_missing_or_weighted_training(blend):
-    args = SimpleNamespace(ap_sft_epochs=1)
+    args = SimpleNamespace(ap_sft_epochs=1, exit_on_tranche_end=False)
     config = SimpleNamespace(blend=blend, blend_per_split=None)
     provider = load_function(
         'pretrain_gpt.py',
         'train_valid_test_datasets_provider',
         {'get_args': lambda: args, 'core_gpt_dataset_config_from_args': lambda _: config},
     )
-    with pytest.raises(ValueError, match='without blend weights'):
+    with pytest.raises(ValueError, match='ap-sft-epochs requires an unweighted'):
         provider((None, 0, 0))
 
 
@@ -267,6 +266,7 @@ def test_training_loader_resumes_and_accepts_completed_epoch_run(tmp_path, monke
     dataset = EpochDataset(source, 2, 4, seed=123)
     args = SimpleNamespace(
         ap_sft_epochs=2,
+        exit_on_tranche_end=False,
         train_iters=4,
         global_batch_size=4,
         train_samples=None,
@@ -321,9 +321,7 @@ def test_dummy_tail_does_not_change_loss_denominator_or_gradients(tmp_path):
     )
     dataset = EpochDataset(source, 1, 4, seed=123)
     batch = torch.utils.data.default_collate([dataset[i] for i in range(len(dataset))])
-    args = SimpleNamespace(
-        ap_sft=True, check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
-    )
+    args = loss_args()
     loss_func = load_function(
         'pretrain_gpt.py',
         'loss_func',

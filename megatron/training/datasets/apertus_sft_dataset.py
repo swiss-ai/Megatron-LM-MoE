@@ -1,7 +1,5 @@
 """Length-delimited Apertus-2 SFT with stored or token-scanned loss weights."""
 
-from __future__ import annotations
-
 import hashlib
 import json
 import logging
@@ -16,6 +14,7 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, _build_sample_idx_bfd
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +77,6 @@ class ApertusSFTLowLevelDataset:
     def sequence_lengths(self):
         return self.tokens.sequence_lengths
 
-    def __getitem__(self, index):
-        return self.tokens[index]
-
     def get(self, index: int, offset: int = 0, length: Optional[int] = None):
         tokens = self.tokens.get(index, offset, length)
         if self.weights is None:
@@ -130,7 +126,7 @@ class ApertusSFTDataset(MegatronDataset):
         return [
             "random_seed", "sequence_length", "split", "split_matrix", "tokenizer",
             "sft_load_loss_mask", "sft_packing_strategy", "sft_pack_samples",
-            "sft_truncate_right", "max_docs_per_bin_sft",
+            "max_docs_per_bin_sft",
             "context_parallel_size", "sequence_parallel_size",
         ]
 
@@ -143,7 +139,7 @@ class ApertusSFTDataset(MegatronDataset):
             default=lambda obj: obj.unique_identifiers,
         )
         self.unique_description_hash = hashlib.md5(
-            self.unique_description.encode("utf-8")
+            self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
         self._control_ids = (
             self._read_controls(config.tokenizer)
@@ -159,24 +155,23 @@ class ApertusSFTDataset(MegatronDataset):
             raise ValueError("unknown SFT packing strategy")
         if config.max_docs_per_bin_sft < 0:
             raise ValueError("max_docs_per_bin_sft must be nonnegative")
-        self._packing_lengths = np.minimum(dataset.sequence_lengths, config.sequence_length)
+        retained = np.minimum(dataset.sequence_lengths, config.sequence_length).astype(np.int64)
         self._packing_lengths = (
-            (self._packing_lengths.astype(np.int64) + self._segment_granularity - 1)
-            // self._segment_granularity * self._segment_granularity
+            -(-retained // self._segment_granularity) * self._segment_granularity
         )
         self._build_indices()
         if len(self.document_index):
-            retained = np.minimum(dataset.sequence_lengths[self.document_index], config.sequence_length)
-            truncated = int(np.count_nonzero(
-                dataset.sequence_lengths[self.document_index] > config.sequence_length
-            ))
+            lengths = dataset.sequence_lengths[self.document_index]
+            retained_tokens = int(np.minimum(lengths, config.sequence_length).sum())
+            truncated = int(np.count_nonzero(lengths > config.sequence_length))
             physical = (len(self.sample_index) - 1) * config.sequence_length
-            logger.info(
-                "Apertus SFT %s: %d conversations, %d packs, %d truncated, %d padding "
-                "tokens, %.2f%% utilization",
-                index_split.name, len(self.document_index), len(self.sample_index) - 1,
-                truncated, physical - int(retained.sum()),
-                100 * float(retained.sum()) / physical,
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Apertus SFT {index_split.name}: {len(self.document_index)} conversations, "
+                f"{len(self.sample_index) - 1} packs, {truncated} truncated, "
+                f"{physical - retained_tokens} padding tokens, "
+                f"{100 * retained_tokens / physical:.2f}% utilization",
             )
 
     def _build_indices(self):
@@ -286,16 +281,15 @@ class ApertusSFTDataset(MegatronDataset):
         tokens, weights = self.dataset.get(int(document_id))
         tokens = np.asarray(tokens, dtype=np.int64)
         if (tokens < 0).any() or (tokens >= self._vocab_size).any():
-            raise ValueError(f"out-of-vocabulary tokens: {self.dataset_path}, document {document_id}")
+            raise ValueError(
+                f"out-of-vocabulary tokens: {self.dataset_path}, document {document_id}"
+            )
         assistant_mask = (
             self._output_mask(tokens) if self._control_ids is not None else None
         )
         if weights is None:
             weights = assistant_mask.astype(np.float32)
-        window = (
-            slice(None, self.config.sequence_length) if self.config.sft_truncate_right
-            else slice(-self.config.sequence_length, None)
-        )
+        window = slice(None, self.config.sequence_length)
         return (
             tokens[window], weights[window],
             assistant_mask[window] if self.config.sft_report_assistant_loss else None,
@@ -331,13 +325,16 @@ class ApertusSFTDataset(MegatronDataset):
                 padding[cursor:cursor + length] = False
                 cursor += padded
                 boundaries.append(cursor)
+        # Exclude prediction targets without changing inputs or assistant reporting.
+        if self.config.loss_mask_token_ids:
+            for token_id in self.config.loss_mask_token_ids:
+                loss_mask[labels == token_id] = 0.0
         if len(boundaries) == 1:
             boundaries.append(target)
         else:
             # Kernels consume the entire physical tensor, including its final padding.
             boundaries[-1] = target
-        # Fixed-size metadata can use the default DataLoader collator. Flattening
-        # removes the repeated terminal offsets before constructing PackedSeqParams.
+        # Fixed size for the default collator; flattening drops the repeated end offsets.
         cu = np.full(target + 1, target, dtype=np.int32)
         cu[:len(boundaries)] = boundaries
         batch = {
@@ -347,7 +344,6 @@ class ApertusSFTDataset(MegatronDataset):
             "position_ids": torch.from_numpy(positions),
             "padding_mask": torch.from_numpy(padding),
             "cu_seqlens": torch.from_numpy(cu),
-            "cu_seqlens_padded": torch.from_numpy(cu.copy()),
             "max_seqlen": torch.tensor(max(np.diff(boundaries)), dtype=torch.int32),
         }
         if assistant_mask is not None:

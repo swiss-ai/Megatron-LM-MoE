@@ -99,8 +99,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             route through ``get_thd_batch_on_this_cp_rank`` to produce a
             ``PackedSeqParams`` object that carries ``cu_seqlens`` and
             ``max_seqlen`` to the attention kernel.
-          - Middle PP stages also fetch BFD metadata so their MoE routers can
-            reconstruct the padding mask.
+          - Middle PP stages also fetch BFD metadata (with ``--ap-sft``, the
+            padding mask itself) so their MoE routers can mask padding.
           - With context parallelism, every document is first padded to the
             divisibility the per-document zigzag partition needs.
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
@@ -108,13 +108,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    ap_sft = getattr(args, 'ap_sft', False)
-    has_cu_seqlens = args.sft or ap_sft or args.dataloader_inter_document_masking
+    has_cu_seqlens = args.sft or args.ap_sft or args.dataloader_inter_document_masking
     is_mtp = mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
     is_first_last = is_first_or_last_pipeline_stage(vp_stage)
 
     is_packed_sequence = has_cu_seqlens
-    has_bfd_padding = args.pretraining_packing_strategy == "bfd" and not ap_sft
+    has_bfd_padding = args.pretraining_packing_strategy == "bfd"
     if not is_first_last and not is_packed_sequence and not is_mtp and not has_bfd_padding:
         return None, None, None, None, None, None, None, None
 
@@ -137,10 +136,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
         ), "cu_seqlens must be (1, N) after flatten_batch_for_packed_sequences"
         cu_seqlens = cu_seqlens[0]
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded[0]
         assert max_seqlen.dim() == 1
         cp_size = parallel_state.get_context_parallel_world_size()
+        if args.ap_sft and cp_size > 1:
+            # The dataset already pads every conversation to the CP alignment.
+            cu_seqlens_padded = cu_seqlens
         if args.cp_doc_aware and cp_size > 1:
             # Short documents whole on one CP rank, long ones split (megatron/core/doc_aware_cp.py).
             batch, packed_seq_params = get_doc_aware_batch_on_this_cp_rank(
@@ -153,7 +153,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 max_local_len=args.cp_doc_aware_max_local_len,
                 max_padding=args.cp_doc_aware_max_padding,
             )
-            return _batch_outputs(batch, packed_seq_params, is_first_last)
+            return _batch_outputs(batch, packed_seq_params)
         if args.dataloader_inter_document_masking and cp_size > 1:
             batch, cu_seqlens, max_seqlen = pad_thd_batch_for_cp(
                 batch,
@@ -172,15 +172,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         and is_packed_sequence
         and parallel_state.get_context_parallel_world_size() == 1
     ):
-        return None, None, None, None, None, batch.get('padding_mask'), PackedSeqParams(
+        return _batch_outputs({'padding_mask': batch.get('padding_mask')}, PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
             max_seqlen_q=int(max_seqlen[0].item()),
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
-        ), None
+        ))
 
     if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism
@@ -191,18 +189,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
-    return _batch_outputs(batch, packed_seq_params, is_first_last or not is_packed_sequence)
+    return _batch_outputs(batch, packed_seq_params)
 
 
-def _batch_outputs(batch, packed_seq_params, has_tokens):
-    """Order a processed batch as get_batch returns it; stages without tokens get only the masks."""
-    padding_mask = batch.get('padding_mask')
-    if not has_tokens:
-        return None, None, None, None, None, padding_mask, packed_seq_params, None
+def _batch_outputs(batch, packed_seq_params):
+    """Order a processed batch as get_batch returns it."""
     return (
-        batch['tokens'], batch['labels'], batch['loss_mask'],
-        batch['attention_mask'], batch['position_ids'], padding_mask, packed_seq_params,
-        batch.get('assistant_mask'),
+        batch.get('tokens'), batch.get('labels'), batch.get('loss_mask'),
+        batch.get('attention_mask'), batch.get('position_ids'), batch.get('padding_mask'),
+        packed_seq_params, batch.get('assistant_mask'),
     )
 
 
@@ -237,7 +232,7 @@ def loss_func(
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
 
-        if getattr(args, "ap_sft", False):
+        if args.ap_sft:
             num_tokens = (loss_mask > 0).sum().detach().to(torch.int)
         else:
             num_tokens = loss_mask.sum().clone().detach().to(torch.int)
@@ -248,7 +243,7 @@ def loss_func(
             # parallel reduction averages gradients over CP ranks, hence the rescale.
             torch.distributed.all_reduce(num_tokens, group=parallel_state.get_context_parallel_group())
             loss = loss * args.context_parallel_size
-        if getattr(args, 'ap_sft', False) and assistant_mask is not None:
+        if assistant_mask is not None:
             with torch.no_grad():
                 assistant_mask = assistant_mask.view(-1).bool()
                 assistant_sum = torch.where(assistant_mask, losses.detach(), 0).sum()
@@ -402,7 +397,6 @@ def core_gpt_dataset_config_from_args(args):
         "max_docs_per_bin_sft": args.max_docs_per_bin_sft,
         "sft_load_loss_mask": args.ap_sft_load_loss_mask,
         "sft_report_assistant_loss": args.ap_sft_report_assistant_loss,
-        "sft_truncate_right": args.ap_sft_truncate_right,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "goldfish_loss": args.goldfish_loss,
         "goldfish_k": args.goldfish_k,
@@ -411,7 +405,7 @@ def core_gpt_dataset_config_from_args(args):
         # dataset derives the Goldfish exemption set from them.
         "tokenizer_extra_metadata": getattr(args, "tokenizer_extra_metadata", None),
     }
-    assert not (args.goldfish_loss and (args.sft or args.ap_sft)), (
+    assert not (args.goldfish_loss and args.sft), (
         "--goldfish-loss is not supported with --sft: SFTDataset builds its own loss "
         "mask and would silently skip goldfish dropping."
     )
@@ -449,14 +443,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     args = get_args()
 
     config = core_gpt_dataset_config_from_args(args)
-    if getattr(args, 'ap_sft_epochs', None) is not None:
-        training_blend = config.blend or (
+
+    if args.exit_on_tranche_end or args.ap_sft_epochs is not None:
+        train_blend = config.blend or (
             config.blend_per_split[0] if config.blend_per_split else None
         )
-        if training_blend is None or training_blend[1] is not None:
-            raise ValueError('--ap-sft-epochs requires training data without blend weights')
-        # The epoch-size probe builds only training; subsequent calls build only
-        # evaluation. Omit unused splits rather than creating empty blends.
+        if train_blend is None or train_blend[1] is not None:
+            option = '--exit-on-tranche-end' if args.exit_on_tranche_end else '--ap-sft-epochs'
+            raise ValueError(f'{option} requires an unweighted training data blend')
+
+    if args.ap_sft_epochs is not None:
+        # Build only the requested splits instead of empty blends.
         if config.blend:
             config.split_matrix = [
                 None if size == 0 else interval
@@ -467,12 +464,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
                 None if size == 0 else blend
                 for size, blend in zip(train_val_test_num_samples, config.blend_per_split)
             ]
-
-    if args.exit_on_tranche_end:
-        train_blend = config.blend if config.blend is not None else config.blend_per_split[0]
-        if train_blend is None or train_blend[1] is not None:
-            raise ValueError('--exit-on-tranche-end requires an unweighted training data blend')
-
 
     is_packed_sequence = False
     if args.ap_sft:
