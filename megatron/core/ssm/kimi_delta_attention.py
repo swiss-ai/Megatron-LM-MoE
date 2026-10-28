@@ -56,6 +56,7 @@ from megatron.core.ssm.gated_delta_net import (
 )
 from megatron.core.utils import deprecate_inference_params
 from megatron.core import tensor_parallel
+from megatron.core.ssm.kda_query_reweight import mass_ratio
 
 try:
     from fla.ops.kda import chunk_kda
@@ -460,6 +461,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             and _env_flag("KDA_USE_GATE_IN_KERNEL", True)
             and (not self._alog_per_channel or _KDA_GATE_SUPPORTS_PER_CHANNEL)
         )
+        # Query reweighting needs the decay materialized ([b, s, h, d_k]) to compute the
+        # mass ratio, so the in-kernel gate is off; fused_kda_gate or the torch gate (below)
+        # computes it instead.
+        self._reweight_window = self.config.linear_attention_query_reweight_window
+        if self._reweight_window > 0:
+            self._use_fused_decay_gate = False
         # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
         # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
         # lower_bound); we only route to the torch reparameterization when the
@@ -525,6 +532,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             and self.qk_rmsnorm is None
             and _env_flag("KDA_QK_L2NORM_IN_KERNEL", True)
         )
+        if self._reweight_window > 0:
+            # The query is rescaled per channel after its L2-norm; an in-kernel norm would undo it.
+            self._qk_l2norm_in_kernel = False
 
         # Prefer the causal_conv1d CUDA package over FLA's Triton conv: same op,
         # faster backend.
@@ -943,6 +953,11 @@ class KimiDeltaAttention(GatedDeltaNet):
         # so the dataloader's global cu_seqlens is what both kernels want.
         cu_seqlens = self._resolve_packed_cu_seqlens(packed_seq_params, seq_len, batch)
         if cu_seqlens is not None:
+            if self._reweight_window > 0:
+                raise NotImplementedError(
+                    "linear_attention_query_reweight_window counts tokens from the sequence "
+                    "start and does not restart at cu_seqlens document boundaries."
+                )
             if self.config.deterministic_mode:
                 raise NotImplementedError(
                     "KDA packed sequence requires the FLA kernels; deterministic_mode's "
@@ -1107,6 +1122,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         if not self._use_fused_beta_sigmoid:
             beta = self._activate_beta(beta)
         beta = beta.contiguous()
+        if self._reweight_window > 0:
+            # read every state row as if it held at most `window` tokens (q is unit-norm here)
+            query = query * mass_ratio(g.float(), self._reweight_window).to(query.dtype)
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="chunk_kda")
