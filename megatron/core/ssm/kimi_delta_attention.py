@@ -55,7 +55,8 @@ from megatron.core.ssm.gated_delta_net import (
     tensor_a2a_hp2cp,
 )
 from megatron.core.utils import deprecate_inference_params
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.ssm import state_recycle
 
 try:
     from fla.ops.kda import chunk_kda
@@ -594,6 +595,16 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         self.qkv_checkpoint = None
 
+        # Recycle the final state of a share of every global batch into the next one
+        # (megatron/core/ssm/state_recycle.py).
+        self._recycle_fraction = self.config.linear_attention_state_recycle_fraction
+        self._recycle = state_recycle.RecycleBuffer() if self._recycle_fraction > 0 else None
+        if self._recycle is not None:
+            assert self.initial_state_param is None and not self._carry_enabled, (
+                "linear_attention_state_recycle_fraction is exclusive with "
+                "linear_attention_learnable_initial_state and linear_attention_carry_state."
+            )
+
 
     def _in_proj_sharded_split(self):
         """KDA repacks in_proj, so the inherited GDN split does not apply.
@@ -949,11 +960,11 @@ class KimiDeltaAttention(GatedDeltaNet):
                     "F.conv1d fallback ignores cu_seqlens and leaks the convolution "
                     "window across document boundaries."
                 )
-            if self.initial_state_param is not None or self._carry_enabled:
+            if self.initial_state_param is not None or self._carry_enabled or self._recycle is not None:
                 raise NotImplementedError(
                     "KDA packed sequence does not support a recurrent initial state: "
                     "cu_seqlens makes chunk_kda expect one state per document, while "
-                    "the learnable/carried state is per batch element."
+                    "the learnable/carried/recycled state is per batch element."
                 )
 
         # 1. in_proj + conv1d + split
@@ -1015,8 +1026,29 @@ class KimiDeltaAttention(GatedDeltaNet):
         else:
             initial_state = None
 
+        # State recycling: the recycled positions of this micro-batch start from the final
+        # state the same positions produced in the previous iteration; the rest from zero.
+        recycle_slots, recycle_mb = [], -1
+        if self._recycle is not None and self.training:
+            iteration, recycle_mb, global_batch_size = state_recycle.current()
+            if iteration is not None and recycle_mb >= 0:
+                self._recycle.start(iteration)
+                recycle_slots = state_recycle.local_recycled_slots(
+                    recycle_mb,
+                    parallel_state.get_data_parallel_rank(),
+                    parallel_state.get_data_parallel_world_size(),
+                    batch,
+                    state_recycle.num_recycled(self._recycle_fraction, global_batch_size),
+                )
+        if recycle_slots:
+            initial_state = self._recycle.initial_state(
+                recycle_mb, recycle_slots,
+                (batch, value.shape[2], self.key_head_dim, self.value_head_dim),
+                value.device,
+            )
+
         log_state_stats = os.environ.get("APERTUS_LOG_STATE_STATS", "0") == "1"
-        need_final_state = self._carry_enabled or log_state_stats
+        need_final_state = self._carry_enabled or log_state_stats or bool(recycle_slots)
 
         # chunk_kda requires initial_state in float32 (asserted inside FLA).
         initial_state_f32 = initial_state.float() if initial_state is not None else None
@@ -1047,6 +1079,9 @@ class KimiDeltaAttention(GatedDeltaNet):
                     flat = flat * scale
                     new_state = flat.reshape_as(new_state).to(new_state.dtype)
                 self._carried_state = new_state
+
+        if recycle_slots and last_recurrent_state is not None:
+            self._recycle.store(recycle_mb, recycle_slots, last_recurrent_state)
 
         if log_state_stats and last_recurrent_state is not None:
             with torch.no_grad():

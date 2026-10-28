@@ -593,6 +593,16 @@ class TransformerConfig(ModelParallelConfig):
     over the new batch) as initial_state, then writes the new last state into a non-persistent
     buffer. Per-rank carry (no DP all-reduce). Mutually exclusive with linear_attention_learnable_initial_state."""
 
+    linear_attention_state_recycle_fraction: float = 0.0
+    """Share of every global batch whose KDA recurrent state is recycled: the first
+    ceil(fraction * global_batch_size) sample positions start from the final state that the same
+    positions produced in the previous iteration (detached, one state per position, kept on the
+    producing rank; see megatron/core/ssm/state_recycle.py). The other positions start from zero as
+    usual. Breaks the "count since the sequence start" that the state otherwise encodes and trains
+    the model to carry a state across unrelated context. 0 (default) disables it. Exclusive with
+    linear_attention_carry_state and linear_attention_learnable_initial_state; not supported with
+    cross-document masking (cu_seqlens)."""
+
     ####################
     # initialization
     ####################
