@@ -28,6 +28,7 @@ from megatron.core.doc_aware_cp import get_doc_aware_batch_on_this_cp_rank
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm import state_recycle
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import (
@@ -269,6 +270,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     """
     args = get_args()
     timers = get_timers()
+    state_recycle.next_microbatch()
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()

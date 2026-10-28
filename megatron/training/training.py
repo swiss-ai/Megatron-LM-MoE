@@ -248,6 +248,7 @@ except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.ssm import state_recycle
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -1950,6 +1951,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        state_recycle.begin_iteration(iteration, get_current_global_batch_size())
         from megatron.training.nan_debug import nan_debug_new_step
         # Reset diagnostics for every attempt, including reruns of the same step.
         nan_debug_new_step(iteration + 1, model)
