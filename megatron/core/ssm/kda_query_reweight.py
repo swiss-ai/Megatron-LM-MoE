@@ -11,19 +11,31 @@ absolute position. Scaling key channel j of the (unit-norm) query by
 reads every row as if it had only accumulated the last ``w`` tokens: ``c = 1`` for ``t < w`` and
 for rows that forget within ``w`` tokens, ``c ~ w / t`` for a row that has held since the start.
 The state, the recurrence, the keys and the values are untouched; only how strongly each row is
-read changes. ``c`` is treated as a constant (no gradient).
+read changes. ``c`` is treated as a constant (no gradient). With cross-document masking
+(``cu_seqlens``) every document restarts the recurrence, so the count restarts with it: ``W`` and
+``W^(w)`` are taken from the start of each document.
 """
 
 import torch
 
 
-def mass_ratio(log_alpha: torch.Tensor, window: int) -> torch.Tensor:
+def mass_ratio(log_alpha: torch.Tensor, window: int, cu_seqlens=None) -> torch.Tensor:
     """``W^(window) / W`` per token and key channel, same shape as ``log_alpha`` ([b, s, h, d]).
+
+    With ``cu_seqlens`` (packed documents, b == 1), computed per document ``[cu[i], cu[i+1])``.
 
     Computed in log space in fp64: with ``G_t = sum_{s<=t} log alpha_s``,
     ``log W_t = G_t + logcumsumexp(-G)_t`` and the mass older than the window is
     ``exp(G_t - G_{t-w}) W_{t-w}``, so ``W^(w)/W = 1 - exp(lse_{t-w} - lse_t)``.
     """
+    if cu_seqlens is not None:
+        assert log_alpha.shape[0] == 1, "packed sequences have one row"
+        bounds = cu_seqlens.tolist()
+        out = torch.ones_like(log_alpha)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            if end - start > window:
+                out[:, start:end] = mass_ratio(log_alpha[:, start:end], window)
+        return out
     seq_len = log_alpha.shape[1]
     if seq_len <= window:
         return torch.ones_like(log_alpha)

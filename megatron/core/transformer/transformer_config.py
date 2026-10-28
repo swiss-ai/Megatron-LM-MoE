@@ -615,8 +615,9 @@ class TransformerConfig(ModelParallelConfig):
     divided by its count since the sequence start (W_t = alpha_t W_{t-1} + 1), so every row is read
     as if it had accumulated at most `window` tokens. 1 for the first `window` tokens and for rows
     that forget within the window. The state and the recurrence are untouched; the scale carries no
-    gradient (see megatron/core/ssm/kda_query_reweight.py). Training only (needs the whole sequence:
-    no KCP with CP > 1, no cross-document masking, not in the dynamic inference engine).
+    gradient (see megatron/core/ssm/kda_query_reweight.py). With cross-document masking the counts
+    start at every document. Training only (needs the whole sequence: no KCP with CP > 1; not in
+    the dynamic inference engine).
     0 (default) disables it."""
 
     ####################

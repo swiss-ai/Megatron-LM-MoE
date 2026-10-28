@@ -1149,13 +1149,10 @@ class KimiDeltaAttention(GatedDeltaNet):
             raise NotImplementedError(
                 "Document-aware CP needs linear_attention_cp_impl='kcp' for KDA layers."
             )
-        if self._reweight_window > 0 and (
-            (self._kcp and self.cp_size > 1) or packed_seq_params is not None
-        ):
+        if self._reweight_window > 0 and self._kcp and self.cp_size > 1:
             raise NotImplementedError(
-                "linear_attention_query_reweight_window needs each sequence whole on one rank and "
-                "counts from the sequence start: use linear_attention_cp_impl='a2a' and no "
-                "cross-document masking."
+                "linear_attention_query_reweight_window needs each sequence whole on one rank: "
+                "use linear_attention_cp_impl='a2a'."
             )
         if self._kcp and self.cp_size > 1:
             if self.initial_state_param is not None or self._carry_enabled:
@@ -1348,7 +1345,7 @@ class KimiDeltaAttention(GatedDeltaNet):
         )
         if self._reweight_window > 0:
             # read every state row as if it held at most `window` tokens (q is unit-norm here)
-            query = query * mass_ratio(g.float(), self._reweight_window).to(query.dtype)
+            query = query * mass_ratio(g.float(), self._reweight_window, cu_seqlens).to(query.dtype)
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="chunk_kda")

@@ -45,3 +45,25 @@ def test_window_and_limits():
     assert torch.all(c_fast > 1 - 2.0 ** -w - 1e-3)
     # sequences no longer than the window are untouched
     assert torch.all(mass_ratio(torch.zeros(1, w, 1, 1), w) == 1)
+
+
+def test_packed_documents_count_from_their_own_start():
+    # cross-document masking: the ratio of a packed sequence is the per-document ratios side by side
+    torch.manual_seed(1)
+    docs, w = [30, 5, 17, 12], 8
+    log_alpha = -torch.rand(1, sum(docs), 2, 3) * 0.3
+    cu = torch.tensor([0] + torch.tensor(docs).cumsum(0).tolist(), dtype=torch.int32)
+    packed = mass_ratio(log_alpha, w, cu)
+    parts = [mass_ratio(log_alpha[:, s:e], w) for s, e in zip(cu[:-1].tolist(), cu[1:].tolist())]
+    torch.testing.assert_close(packed, torch.cat(parts, dim=1), rtol=0, atol=0)
+    torch.testing.assert_close(packed.double(), _reference_packed(log_alpha, w, docs), rtol=1e-6, atol=1e-6)
+    assert torch.all(packed[:, 30:35] == 1)                 # a 5-token document is inside the window
+    assert not torch.allclose(packed, mass_ratio(log_alpha, w))
+
+
+def _reference_packed(log_alpha, window, docs):
+    out, start = [], 0
+    for n in docs:
+        out.append(_reference(log_alpha[:, start : start + n], window))
+        start += n
+    return torch.cat(out, dim=1)
