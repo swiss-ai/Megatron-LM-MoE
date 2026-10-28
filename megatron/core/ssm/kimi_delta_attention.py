@@ -460,6 +460,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             and _env_flag("KDA_USE_GATE_IN_KERNEL", True)
             and (not self._alog_per_channel or _KDA_GATE_SUPPORTS_PER_CHANNEL)
         )
+        # The decay floor is added to the materialized decay ([b, s, h, d_k]), so the
+        # in-kernel gate is off; fused_kda_gate or the torch gate (below) computes it instead.
+        tau = self.config.linear_attention_decay_floor_tau
+        self._decay_floor = 1.0 / tau if tau > 0 else 0.0
+        if self._decay_floor > 0:
+            self._use_fused_decay_gate = False
         # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
         # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
         # lower_bound); we only route to the torch reparameterization when the
@@ -515,6 +521,10 @@ class KimiDeltaAttention(GatedDeltaNet):
                 f"KDA_DECAY_DTYPE={_decay_dtype_name!r} is not one of "
                 "fp32/bf16/fp16."
             )
+        if self._decay_floor > 0 and self._decay_dtype is not None:
+            # 1/tau (~1e-4) is below bf16/fp16 resolution next to log alpha; keep the decay fp32.
+            logger.warning("linear_attention_decay_floor_tau: ignoring KDA_DECAY_DTYPE, decay stays fp32")
+            self._decay_dtype = None
 
         # Q/K L2-norm inside chunk_kda. Only the plain L2 path has an in-kernel
         # equivalent; the Schlag-style learnable qk_rmsnorm variant must stay
@@ -1104,6 +1114,8 @@ class KimiDeltaAttention(GatedDeltaNet):
             if self._use_fused_decay_gate
             else self._activate_decay(alpha, A_log_local_cp, dt_bias_local_cp)
         )
+        if self._decay_floor > 0:
+            g = g - self._decay_floor                      # alpha_t <- alpha_t * exp(-1/tau)
         if not self._use_fused_beta_sigmoid:
             beta = self._activate_beta(beta)
         beta = beta.contiguous()

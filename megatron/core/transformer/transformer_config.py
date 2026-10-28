@@ -593,6 +593,14 @@ class TransformerConfig(ModelParallelConfig):
     over the new batch) as initial_state, then writes the new last state into a non-persistent
     buffer. Per-rank carry (no DP all-reduce). Mutually exclusive with linear_attention_learnable_initial_state."""
 
+    linear_attention_decay_floor_tau: float = 0.0
+    """Upper bound, in tokens, on the memory of every KDA state row: log alpha_t -= 1/tau on every
+    token and channel, i.e. alpha_t <- alpha_t * exp(-1/tau). A row whose input-driven rate gives
+    it a memory of tau_j tokens then has tau_j * tau / (tau_j + tau) <= tau, so every row saturates
+    within about 3*tau tokens and none can keep counting beyond the training length; rows much
+    shorter than tau are almost unchanged. The gate keeps its input dependence and its gradient.
+    0 (default) disables it."""
+
     ####################
     # initialization
     ####################
