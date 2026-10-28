@@ -19,6 +19,72 @@ except:
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 
+@pytest.mark.parametrize('overlap', [False, True])
+@pytest.mark.parametrize('fp32_update', [False, True])
+@pytest.mark.parametrize('pin_state', [False, True])
+def test_cpu_optimizer_state_pinning(overlap, fp32_update, pin_state):
+    """Pin lazy and restored state without reallocating it on every update."""
+    param = torch.nn.Parameter(torch.ones(16, device='cuda', dtype=torch.bfloat16))
+    optimizer = HybridDeviceOptimizer(
+        [param],
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        offload_fraction=1.0,
+        pin_cpu_grads=False,
+        pin_cpu_optimizer_state=pin_state,
+        param_update_in_fp32=fp32_update,
+        overlap_cpu_optimizer_d2h_h2d=overlap,
+        fused=True,
+        lr=1e-3,
+    )
+    reference_param = torch.nn.Parameter(
+        torch.ones(16, dtype=torch.float32 if fp32_update else torch.bfloat16)
+    )
+    reference = Adam([reference_param], fused=True, lr=1e-3)
+    reference_param.grad = torch.ones_like(reference_param)
+    assert not optimizer.state
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    reference.step()
+    for key in ('step', 'exp_avg', 'exp_avg_sq'):
+        assert optimizer.state[param][key].is_pinned() == pin_state
+
+    moments = [optimizer.state[param][key] for key in ('exp_avg', 'exp_avg_sq')]
+    optimizer.step()
+    reference.step()
+    for key, moment in zip(('exp_avg', 'exp_avg_sq'), moments):
+        assert optimizer.state[param][key] is moment
+        torch.testing.assert_close(moment, reference.state[reference_param][key])
+    torch.testing.assert_close(optimizer.gpu_params_map_cpu_copy[param], reference_param)
+
+    # Load non-pinned checkpoint state, preserving values and the requested policy.
+    checkpoint = optimizer.state_dict()
+    expected = {}
+    for state in checkpoint['state'].values():
+        for key in ('step', 'exp_avg', 'exp_avg_sq'):
+            expected[key] = state[key].clone()
+            state[key] = state[key].to('cuda')
+    optimizer.load_state_dict(checkpoint)
+    for key, value in expected.items():
+        restored = optimizer.state[param][key]
+        assert restored.device.type == 'cpu'
+        assert restored.is_pinned() == pin_state
+        torch.testing.assert_close(restored, value)
+
+    # Replaced moments must be pinned after the next CPU update too.
+    cpu_optimizer = optimizer.cpu_optimizers[0]
+    cpu_param = optimizer.gpu_params_map_cpu_copy[param]
+    replacement = torch.zeros(cpu_param.shape, dtype=cpu_param.dtype, device='cpu')
+    cpu_optimizer.state[cpu_param]['exp_avg'] = replacement
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    assert optimizer.state[param]['exp_avg'].is_pinned() == pin_state
+    if not pin_state:
+        assert optimizer.state[param]['exp_avg'] is replacement
+    if fp32_update:
+        assert optimizer.state[param]['master_param'] is cpu_param
+
+
 class Net(nn.Module):
     def __init__(self):
         super().__init__()

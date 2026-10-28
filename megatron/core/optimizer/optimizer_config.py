@@ -487,6 +487,13 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    pin_cpu_optimizer_state: bool = False
+    """Copy pageable CPU optimizer state into CUDA host storage after updates and loads.
+
+    New or replaced state requires a copy and temporarily uses both allocations.
+    Already-pinned state is reused on subsequent updates.
+    """
+
     ################
     # Miscellaneous
     ################
