@@ -518,6 +518,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             and _env_flag("KDA_USE_GATE_IN_KERNEL", True)
             and (not self._alog_per_channel or _KDA_GATE_SUPPORTS_PER_CHANNEL)
         )
+        # Decay floor (linear_attention_decay_floor_tau): added to the materialized decay, so the
+        # in-kernel gate is off in training and decode; fused_kda_gate or torch computes it.
+        tau = self.config.linear_attention_decay_floor_tau
+        self._decay_floor = 1.0 / tau if tau > 0 else 0.0
+        if self._decay_floor > 0:
+            self._use_fused_decay_gate = False
         # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
         # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
         # lower_bound); we only route to the torch reparameterization when the
@@ -579,6 +585,10 @@ class KimiDeltaAttention(GatedDeltaNet):
             "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
             "fp16": torch.float16, "float16": torch.float16,
         }.get(_decay_dtype_name)
+        if self._decay_floor > 0 and self._decay_dtype is not None:
+            # 1/tau (~1e-4) is below bf16/fp16 resolution next to log alpha: keep the decay fp32.
+            logger.warning("linear_attention_decay_floor_tau: ignoring KDA_DECAY_DTYPE, the decay stays fp32")
+            self._decay_dtype = None
         if _decay_dtype_name and self._decay_dtype is None and _decay_dtype_name not in (
             "fp32", "float32"
         ):
@@ -910,6 +920,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             if gate_in_kernel
             else self._activate_decay(alpha, A_log, dt_bias)
         )
+        if self._decay_floor > 0:
+            assert not gate_in_kernel, "the decay floor needs the materialized decay"
+            g = g - self._decay_floor                      # alpha_t <- alpha_t * exp(-1/tau)
         if not self._use_fused_beta_sigmoid:
             beta = self._activate_beta(beta)
         return g, beta.contiguous()
