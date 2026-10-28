@@ -609,6 +609,16 @@ class TransformerConfig(ModelParallelConfig):
     over the new batch) as initial_state, then writes the new last state into a non-persistent
     buffer. Per-rank carry (no DP all-reduce). Mutually exclusive with linear_attention_learnable_initial_state."""
 
+    linear_attention_query_reweight_window: int = 0
+    """Sliding-window mass normalisation of the KDA read-out: key channel j of the unit-norm query
+    is scaled by W^(window)_j / W_j, the row's decayed token count over the last `window` tokens
+    divided by its count since the sequence start (W_t = alpha_t W_{t-1} + 1), so every row is read
+    as if it had accumulated at most `window` tokens. 1 for the first `window` tokens and for rows
+    that forget within the window. The state and the recurrence are untouched; the scale carries no
+    gradient (see megatron/core/ssm/kda_query_reweight.py). Training only (needs the whole sequence:
+    no KCP with CP > 1, no cross-document masking, not in the dynamic inference engine).
+    0 (default) disables it."""
+
     ####################
     # initialization
     ####################

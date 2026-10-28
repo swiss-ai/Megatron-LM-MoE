@@ -68,6 +68,7 @@ from megatron.core.ssm.gated_delta_net import (
 from megatron.core.ssm.cp_relayout import build_relayout_plan, relayout
 from megatron.core.utils import deprecate_inference_params, is_using_quantization_scales
 from megatron.core import tensor_parallel
+from megatron.core.ssm.kda_query_reweight import mass_ratio
 
 try:
     from fla.ops.kda import chunk_kda
@@ -518,6 +519,11 @@ class KimiDeltaAttention(GatedDeltaNet):
             and _env_flag("KDA_USE_GATE_IN_KERNEL", True)
             and (not self._alog_per_channel or _KDA_GATE_SUPPORTS_PER_CHANNEL)
         )
+        # Query reweighting (linear_attention_query_reweight_window) needs the decay
+        # materialized to compute the mass ratio, so the in-kernel gate is off.
+        self._reweight_window = self.config.linear_attention_query_reweight_window
+        if self._reweight_window > 0:
+            self._use_fused_decay_gate = False
         # Kimi-K3 safe decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)).
         # FLA computes this natively (chunk_kda safe_gate/lower_bound; fused_kda_gate
         # lower_bound); we only route to the torch reparameterization when the
@@ -596,6 +602,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             and self.qk_rmsnorm is None
             and _env_flag("KDA_QK_L2NORM_IN_KERNEL", True)
         )
+        if self._reweight_window > 0:
+            # The query is rescaled per channel after its L2-norm; an in-kernel norm would undo it.
+            self._qk_l2norm_in_kernel = False
 
         # Prefer the causal_conv1d CUDA package over FLA's Triton conv: same op,
         # faster backend.
@@ -1140,6 +1149,14 @@ class KimiDeltaAttention(GatedDeltaNet):
             raise NotImplementedError(
                 "Document-aware CP needs linear_attention_cp_impl='kcp' for KDA layers."
             )
+        if self._reweight_window > 0 and (
+            (self._kcp and self.cp_size > 1) or packed_seq_params is not None
+        ):
+            raise NotImplementedError(
+                "linear_attention_query_reweight_window needs each sequence whole on one rank and "
+                "counts from the sequence start: use linear_attention_cp_impl='a2a' and no "
+                "cross-document masking."
+            )
         if self._kcp and self.cp_size > 1:
             if self.initial_state_param is not None or self._carry_enabled:
                 raise NotImplementedError("KCP does not support a recurrent initial state.")
@@ -1329,6 +1346,9 @@ class KimiDeltaAttention(GatedDeltaNet):
         g, beta = self._prepare_g_and_beta(
             alpha, beta, A_log_local_cp, dt_bias_local_cp
         )
+        if self._reweight_window > 0:
+            # read every state row as if it held at most `window` tokens (q is unit-norm here)
+            query = query * mass_ratio(g.float(), self._reweight_window).to(query.dtype)
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="chunk_kda")
@@ -1533,6 +1553,11 @@ class KimiDeltaAttention(GatedDeltaNet):
         self, hidden_states: Tensor, context: DynamicInferenceContext
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Execute mixed dynamic batches with decode rows followed by packed prefill rows."""
+        if self._reweight_window > 0:
+            raise NotImplementedError(
+                "linear_attention_query_reweight_window is not implemented in the dynamic "
+                "inference engine (decode would need a running per-channel window count)."
+            )
         conv_state, recurrent_state = context.kda_states_cache(self.layer_number)
         padded_dims = context.padded_batch_dimensions
         decode_req_count = padded_dims.decode_req_count
