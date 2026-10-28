@@ -1122,6 +1122,13 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    if getattr(args, 'ap_sft_epochs', None) is not None:
+        from megatron.training.datasets.apertus_sft_epochs import prepare_apertus_sft_epochs
+
+        train_valid_test_dataset_provider = prepare_apertus_sft_epochs(
+            train_valid_test_dataset_provider, args
+        )
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -1932,6 +1939,7 @@ def _pipeline_shape_args(args):
     is_packed = (
         getattr(args, 'dataloader_inter_document_masking', False)
         or getattr(args, 'sft', False)
+        or getattr(args, 'ap_sft', False)
     )
     if is_packed and args.micro_batch_size > 1:
         return args.seq_length * args.micro_batch_size, 1
@@ -2182,7 +2190,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     val,
                     group=mpu.get_data_parallel_group(with_context_parallel=True)
                 )
-                loss_reduced[key] = val[0] / val[1]
+                loss_reduced[key] = val[0] / val[1].clamp_min(1)
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -4017,7 +4025,7 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / denominator.clamp_min(1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
@@ -4242,7 +4250,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.exit_on_tranche_end and train_ds is not None:
                 tranche_size = len(train_ds)
-            if args.skip_train:
+            epochs_done = (
+                getattr(args, 'ap_sft_epochs', None) is not None
+                and consumed_train_samples_in_current_phase
+                == args.train_iters * args.global_batch_size
+            )
+            if args.skip_train or epochs_done:
                 train_dataloader = None
             else:
                 loader_consumed = consumed_train_samples_in_current_phase
