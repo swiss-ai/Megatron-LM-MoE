@@ -12,8 +12,12 @@ Which samples: the first ``ceil(fraction * global_batch_size)`` positions of eve
 Position p is the p-th sample in the order the sampler hands them out; with Megatron's sampler,
 micro-batch m on data-parallel rank r holds positions ``(m * dp_size + r) * mbs + [0, mbs)``.
 Position p of iteration n starts from the final state that position p of iteration n-1 produced:
-one state per recycled position, not per document (packed documents inside a sequence already
-share the recurrence when cross-document masking is off). States stay on the rank that produced
+one state per recycled position, not per document. Without cross-document masking the packed
+documents inside a sequence share the recurrence, and the stored state is the one at the end of
+the sequence. With cross-document masking (cu_seqlens) every document restarts the recurrence:
+the stored state is the final state of the sequence's first document, and in the next iteration
+every document of that position's sequence starts from it (the non-recycled positions start every
+document from zero, as usual). States stay on the rank that produced
 them, so there is no communication; under context parallelism every CP rank keeps its own heads.
 They are detached (no gradient across iterations) and are not checkpointed: after a restart the
 recycled positions begin from zero for one iteration.
@@ -94,6 +98,7 @@ class RecycleBuffer:
         return state
 
     def store(self, microbatch: int, slots: List[int], final_state: torch.Tensor) -> None:
+        """Keep ``final_state[b]`` for every slot b (with cu_seqlens: row 0 = the first document)."""
         for b in slots:
             self._next[(microbatch, b)] = final_state[b].detach().float().clone()
 

@@ -1191,11 +1191,11 @@ class KimiDeltaAttention(GatedDeltaNet):
                     "F.conv1d fallback ignores cu_seqlens and leaks the convolution "
                     "window across document boundaries."
                 )
-            if self.initial_state_param is not None or self._carry_enabled or self._recycle is not None:
+            if self.initial_state_param is not None or self._carry_enabled:
                 raise NotImplementedError(
                     "KDA packed sequence does not support a recurrent initial state: "
                     "cu_seqlens makes chunk_kda expect one state per document, while "
-                    "the learnable/carried/recycled state is per batch element."
+                    "the learnable/carried state is per batch element."
                 )
 
         # 1. in_proj + conv1d + split
@@ -1274,6 +1274,11 @@ class KimiDeltaAttention(GatedDeltaNet):
                 (batch, value.shape[2], self.key_head_dim, self.value_head_dim),
                 value.device,
             )
+            if cu_seqlens is not None:
+                # Cross-document masking: chunk_kda takes one state per document. Every document of
+                # the recycled sequence starts from the one stored state (see state_recycle.py).
+                assert batch == 1, "packed sequences fold the micro-batch into one row"
+                initial_state = initial_state.expand(cu_seqlens.numel() - 1, -1, -1, -1).contiguous()
             if self.layer_number == 1 and iteration <= 3:
                 # one line per recycling rank for the first iterations: shows the feature is live
                 print(
@@ -1319,6 +1324,7 @@ class KimiDeltaAttention(GatedDeltaNet):
                 self._carried_state = new_state
 
         if recycle_slots and last_recurrent_state is not None:
+            # with cu_seqlens, row 0 is the final state of the first document
             self._recycle.store(recycle_mb, recycle_slots, last_recurrent_state)
 
         if log_state_stats and last_recurrent_state is not None:

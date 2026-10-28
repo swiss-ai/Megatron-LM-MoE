@@ -615,8 +615,10 @@ class TransformerConfig(ModelParallelConfig):
     positions produced in the previous iteration (detached, one state per position, kept on the
     producing rank; see megatron/core/ssm/state_recycle.py). The other positions start from zero as
     usual. Breaks the "count since the sequence start" that the state otherwise encodes and trains
-    the model to carry a state across unrelated context. Training only; needs each sequence whole
-    on one rank (linear_attention_cp_impl='a2a' or CP=1) and no cross-document masking. Exclusive
+    the model to carry a state across unrelated context. With cross-document masking the stored
+    state is the final state of the first document, and every document of the recycled sequence
+    starts from it. Training only; needs each sequence whole on one rank
+    (linear_attention_cp_impl='a2a' or CP=1, not document-aware CP). Exclusive
     with linear_attention_carry_state and linear_attention_learnable_initial_state.
     0 (default) disables it."""
 
