@@ -3141,6 +3141,9 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--pin-cpu-optimizer-state', action='store_true',
+                       help='Copy pageable CPU optimizer state into CUDA host storage after '
+                            'updates and loads. Each new allocation temporarily needs both copies.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
