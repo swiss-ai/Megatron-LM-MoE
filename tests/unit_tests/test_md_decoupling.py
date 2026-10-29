@@ -2537,7 +2537,7 @@ def test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags(monkeypatc
 # Attention-in gain revive (--md-attention-in-gain-revive-threshold)
 
 
-def _revive_qkv_optimizer(param, threshold=1e-12, mean_mode="all"):
+def _revive_qkv_optimizer(param, threshold=1e-12, mean_mode="all", revive_iteration=48000):
     optimizer = _gqa_qkv_optimizer(
         param,
         hypersphere_mode="row",
@@ -2546,6 +2546,7 @@ def _revive_qkv_optimizer(param, threshold=1e-12, mean_mode="all"):
         use_orthogonal_updates=False,
         attention_in_gain_revive_threshold=threshold,
         attention_in_gain_revive_mean=mean_mode,
+        attention_in_gain_revive_iteration=revive_iteration,
     )
     optimizer._maybe_init_gain_state(param)
     return optimizer
@@ -2601,12 +2602,25 @@ def test_md_decoupling_step_rebuilds_weight_with_revived_col_gain():
     state["col_gain"][3] = optimizer._phi_inv(torch.tensor(1e-20))
     optimizer._apply_gains(param)  # bake the collapsed gain into p
     param.grad = torch.randn_like(param)
+    # Not armed (process loaded another iteration): step() must leave the collapsed gain alone.
+    assert optimizer.arm_attention_in_gain_revive(48100) is False
+    optimizer.step()
+    assert optimizer._phi(state["col_gain"])[3] < 1e-12
+    # Armed on the configured iteration: the next step revives, the one after does not.
+    assert optimizer.arm_attention_in_gain_revive(48000) is True
+    param.grad = torch.randn_like(param)
     optimizer.step()
     phi_r = optimizer._phi(state["row_gain"])
     phi_c = optimizer._phi(state["col_gain"])
     assert phi_c[3] > 1e-3, "collapsed column gain was not revived"
     bare = param.detach() / phi_r[:, None] / phi_c[None, :]
     torch.testing.assert_close(bare.norm(dim=1), torch.ones(8), rtol=1e-5, atol=1e-5)
+    assert optimizer._revive_armed is False
+    state["col_gain"][1] = optimizer._phi_inv(torch.tensor(1e-20))
+    optimizer._apply_gains(param)
+    param.grad = torch.randn_like(param)
+    optimizer.step()
+    assert optimizer._phi(state["col_gain"])[1] < 1e-12, "revive must run once only"
 
 
 def test_attention_in_pre_norm_gain_tag_predicate():
@@ -2635,12 +2649,17 @@ def test_attention_in_pre_norm_gain_revive_hook(offset):
     gamma.md_layernorm_gain_offset = offset
     other = torch.nn.Parameter(torch.tensor([1e-14, 1.0]))
     adam = torch.optim.AdamW([gamma, other], lr=0.01, weight_decay=0.0)
-    hook = md_module.make_attention_in_pre_norm_gain_revive_hook(1e-8, "all", log_interval=1)
-    adam.register_step_post_hook(hook)
+    hook = md_module.make_attention_in_pre_norm_gain_revive_hook(1e-8, "all", revive_iteration=48000)
+    hook.attach(adam)
     # Tiny gradients on the collapsed entries (as in a run where their Adam v sits far below eps),
     # so the Adam step itself leaves them below the threshold.
     gamma.grad = torch.tensor([0.1, 1e-16, -0.2, 0.3, 1e-16, 0.05])
     other.grad = torch.tensor([1e-16, 0.1])
+    # Wrong loaded iteration -> not armed -> the step leaves the dead entries dead.
+    assert hook.arm(48100) is False
+    adam.step()
+    assert (gamma.detach() + offset)[1].abs() < 1e-8
+    assert hook.arm(48000) is True
     adam.step()
 
     eff = gamma.detach() + offset
@@ -2653,7 +2672,14 @@ def test_attention_in_pre_norm_gain_revive_hook(offset):
     assert state["exp_avg"][dead].abs().max() == 0 and state["exp_avg_sq"][dead].abs().max() == 0
     assert state["exp_avg"][~dead].abs().min() > 0
     assert abs(float(other[0])) < 1e-8, "untagged param must not be revived"
-    assert int(hook.revive_counter["steps"]) == 1
+    assert hook.revive_state["revived"] == 2 and not hook.revive_state["pending"]
+    # Once only: a new collapse after the revive step is not reset to the mean (~1); it only moves
+    # by its ordinary Adam step (its moments are still those of a live entry).
+    gamma.data[2] = 1e-14 - offset
+    gamma.grad = torch.tensor([0.1, 0.1, 1e-16, 0.3, 0.1, 0.05])
+    adam.step()
+    assert (gamma.detach() + offset)[2].abs() < 0.1
+    assert hook.revive_state["revived"] == 2
 
 
 # ---------------------------------------------------------------------------------------------

@@ -1644,6 +1644,10 @@ def validate_args(args, defaults={}):
                 "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
                 "softplus gains are positive, so the clamp only changes values below 1e-8."
             )
+        if args.md_attention_in_gain_revive_threshold is not None:
+            assert args.md_attention_in_gain_revive_iteration is not None, (
+                "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
+                "(the checkpoint iteration after which the one-shot revive runs).")
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
                 "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
@@ -3109,10 +3113,16 @@ def _add_training_args(parser):
                        'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
                        'including small or negative gains.')
     group.add_argument('--md-attention-in-gain-revive-threshold', type=float, default=None,
-                       help='md_decoupling: every step, reset the attention-in pre-norm gamma and '
-                       'column gain entries whose effective value is below this magnitude to the '
-                       'mean of their gain vector, and zero their Adam moments. Only the fused '
-                       'attention input projections (softmax linear_qkv, KDA in_proj). Off when unset.')
+                       help='md_decoupling: ONCE, on the first optimizer step after loading the '
+                       'checkpoint named by --md-attention-in-gain-revive-iteration, reset the '
+                       'attention-in pre-norm gamma and column gain entries whose effective value is '
+                       'below this magnitude to the mean of their gain vector, and zero their Adam '
+                       'moments. Only the fused attention input projections (softmax linear_qkv, '
+                       'KDA in_proj). Off when unset.')
+    group.add_argument('--md-attention-in-gain-revive-iteration', type=int, default=None,
+                       help='Checkpoint iteration the one-shot revive is tied to: it fires only in a '
+                       'process that loaded exactly this iteration; a resume from any later (or '
+                       'earlier) checkpoint never revives again. Required with the threshold.')
     group.add_argument('--md-attention-in-gain-revive-mean', type=str, default='all',
                        choices=['all', 'live'],
                        help='Entries the revive mean averages over: the whole gain vector (all) '

@@ -1876,6 +1876,17 @@ def setup_model_and_optimizer(
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
+    if getattr(args, 'md_attention_in_gain_revive_threshold', None) is not None:
+        # One-shot attention-in gain revive: fires on the first optimizer step only when the
+        # checkpoint just loaded is --md-attention-in-gain-revive-iteration (see md_decoupling).
+        from megatron.core.optimizer.md_decoupling import arm_attention_in_gain_revive
+        armed = arm_attention_in_gain_revive(args.iteration)
+        print_rank_0(
+            f'attention-in gain revive: loaded iteration {args.iteration}, revive iteration '
+            f'{args.md_attention_in_gain_revive_iteration} -> '
+            f'{"ARMED for the first step" if armed else "not armed (already applied or other checkpoint)"}'
+        )
+
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
