@@ -2654,3 +2654,61 @@ def test_attention_in_pre_norm_gain_revive_hook(offset):
     assert state["exp_avg"][~dead].abs().min() > 0
     assert abs(float(other[0])) < 1e-8, "untagged param must not be revived"
     assert int(hook.revive_counter["steps"]) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# Attention-in gain pull (--md-attention-in-gain-pull-coeff / --md-attention-in-gain-pull-target)
+
+
+def test_md_decoupling_pulls_attention_in_col_gain_toward_target():
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _gqa_qkv_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus", use_orthogonal_updates=False,
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0,
+    )
+    optimizer._maybe_init_gain_state(param)
+    state = optimizer.state[param]
+    raw = torch.tensor([-3.0, 0.0, 2.0, 5.0])
+    state["col_gain"].copy_(raw)
+    group = optimizer.param_groups[0]
+    lr = optimizer._gains_lr(group)
+    assert lr == group["lr"] == 0.01
+
+    optimizer._pull_attention_in_col_gain(param, group)
+
+    c_target = optimizer._phi_inv(torch.tensor(1.0))  # softplus_inv(1) ~ 0.5413
+    torch.testing.assert_close(state["col_gain"], raw - lr * 0.5 * (raw - c_target))
+    # the row gain and untagged params are untouched; coeff 0 is a no-op
+    untagged = torch.nn.Parameter(torch.randn(8, 4))
+    optimizer.add_param_group({"params": [untagged]})
+    optimizer._maybe_init_gain_state(untagged)
+    before = optimizer.state[untagged]["col_gain"].clone()
+    optimizer._pull_attention_in_col_gain(untagged, optimizer.param_groups[1])
+    torch.testing.assert_close(optimizer.state[untagged]["col_gain"], before)
+    optimizer.attention_in_gain_pull_coeff = 0.0
+    before = state["col_gain"].clone()
+    optimizer._pull_attention_in_col_gain(param, group)
+    torch.testing.assert_close(state["col_gain"], before)
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_attention_in_pre_norm_gain_pull_hook(offset):
+    """gamma <- gamma - lr * coeff * (gamma_eff - target) after the Adam step, no revive."""
+    values = torch.tensor([1.5, -0.5, 2.0, 1.0])
+    gamma = torch.nn.Parameter(values - offset)
+    gamma.md_attention_in_pre_norm_gain = True
+    gamma.md_layernorm_gain_offset = offset
+    other = torch.nn.Parameter(values.clone())
+    lr = 0.01
+    adam = torch.optim.AdamW([gamma, other], lr=lr, weight_decay=0.0)
+    adam.register_step_post_hook(md_module.make_attention_in_pre_norm_gain_revive_hook(
+        None, pull_coeff=0.5, pull_target=1.0))
+    gamma.grad = torch.tensor([0.1, -0.2, 0.3, 0.05])
+    other.grad = gamma.grad.clone()
+    adam.step()
+    # same Adam step on both params; gamma additionally gets the pull on its effective value
+    expected_eff = (other.detach() - offset + offset)  # other == plain Adam result (eff units)
+    expected_eff = expected_eff - lr * 0.5 * (expected_eff - 1.0)
+    torch.testing.assert_close(gamma.detach() + offset, expected_eff)

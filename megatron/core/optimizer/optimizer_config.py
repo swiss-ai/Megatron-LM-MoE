@@ -449,6 +449,16 @@ class OptimizerConfig:
     """Which entries the revive mean averages over: 'all' (the whole gain vector, including the
     collapsed entries) or 'live' (only the entries at or above the threshold)."""
 
+    md_attention_in_gain_pull_coeff: float = 0.0
+    """Decoupled pull of the attention-in gains toward a target value, applied after their Adam
+    update like AdamW weight decay: x <- x - lr * coeff * (x - c) on the stored parameter, where lr
+    is that parameter's scheduled LR. For the pre-norm gamma x is the gamma itself (c is the target);
+    for a softplus column gain x is the raw gain and c = softplus_inv(target), so the effective gain
+    tends to the target. 0 disables."""
+
+    md_attention_in_gain_pull_target: float = 1.0
+    """Target value c of the attention-in gain pull (effective-gain units)."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed

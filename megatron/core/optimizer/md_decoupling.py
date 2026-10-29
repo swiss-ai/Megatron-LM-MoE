@@ -163,16 +163,22 @@ def _is_attention_in_pre_norm_gain(name: str, param: torch.Tensor) -> bool:
     )
 
 
-def make_attention_in_pre_norm_gain_revive_hook(threshold: float, mean_mode: str = "all",
-                                                log_interval: int = 200):
+def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean_mode: str = "all",
+                                                log_interval: int = 200, pull_coeff: float = 0.0,
+                                                pull_target: float = 1.0):
     """Post-step hook for the chained Adam that owns the attention-in pre-norm gammas.
 
-    For every param tagged ``md_attention_in_pre_norm_gain``, entries whose effective gain
-    (stored value + zero-centered offset) is below ``threshold`` in magnitude are reset to the mean
-    effective gain of that vector and their Adam moments are zeroed. The gamma is replicated across
-    TP (and whole per rank under the layer-wise optimizer), so the mean is local and identical on
-    every rank that holds it. Runs between the inner ``step()`` and the wrapper's main -> model
-    copy / all-gather, so the revived value is what the model sees. Companion of
+    For every param tagged ``md_attention_in_pre_norm_gain``, in this order:
+      1. pull (if ``pull_coeff`` > 0): x <- x - lr * pull_coeff * (x - pull_target) on the effective
+         gain (stored value + zero-centered offset), lr = the param group's scheduled LR — the
+         decoupled AdamW-style pull toward a target value;
+      2. revive (if ``threshold`` is set): entries whose effective gain is below ``threshold`` in
+         magnitude are reset to the mean effective gain of that vector and their Adam moments are
+         zeroed.
+    The gamma is replicated across TP (and whole per rank under the layer-wise optimizer), so the
+    mean is local and identical on every rank that holds it. Runs between the inner ``step()`` and
+    the wrapper's main -> model copy / all-gather, so the new value is what the model sees.
+    Companion of :meth:`MDDecoupling._pull_attention_in_col_gain` /
     :meth:`MDDecoupling._revive_attention_in_col_gain`.
     """
     counter = {"steps": 0, "count": None}
@@ -185,6 +191,11 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: float, mean_mode: str
                 if not getattr(p, "md_attention_in_pre_norm_gain", False):
                     continue
                 offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
+                if pull_coeff:
+                    # (p + offset) - target == p - (target - offset)
+                    p.sub_((p - (pull_target - offset)) * (group["lr"] * pull_coeff))
+                if threshold is None:
+                    continue
                 eff = p + offset if offset else p
                 dead = eff.abs() < threshold
                 weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
@@ -1283,10 +1294,15 @@ class MDDecoupling(_MDDecouplingBase):
         attention_in_gain_revive_threshold: Optional[float] = None,
         attention_in_gain_revive_mean: Literal["all", "live"] = "all",
         revive_log_interval: int = 200,
+        # Decoupled pull of attention-in column gains toward a target (see _pull_attention_in_col_gain).
+        attention_in_gain_pull_coeff: float = 0.0,
+        attention_in_gain_pull_target: float = 1.0,
         **kwargs,
     ):
         self.attention_in_gain_revive_threshold = attention_in_gain_revive_threshold
         self.attention_in_gain_revive_mean = attention_in_gain_revive_mean
+        self.attention_in_gain_pull_coeff = attention_in_gain_pull_coeff
+        self.attention_in_gain_pull_target = attention_in_gain_pull_target
         self.revive_log_interval = revive_log_interval
         self._revive_steps = 0
         self._revive_count = None  # GPU-side counter of revived column-gain entries
@@ -1528,12 +1544,29 @@ class MDDecoupling(_MDDecouplingBase):
                     self._param_step(p, group)
                     self._gains_step(p, group, gain_grads)
                     # Between the gains step and the re-apply, so the effective weight is
-                    # rebuilt with the revived phi(c): p = bare_p * phi(r) * phi(c_new).
+                    # rebuilt with the pulled / revived phi(c): p = bare_p * phi(r) * phi(c_new).
+                    self._pull_attention_in_col_gain(p, group)
                     self._revive_attention_in_col_gain(p)
                     self._apply_gains(p)
         self._log_revive_counts()
 
         return loss
+
+    @torch.no_grad()
+    def _pull_attention_in_col_gain(self, p, group):
+        """Decoupled pull of the attention-in column gain toward the target, after its Adam step:
+        c <- c - lr * coeff * (c - c_target) on the stored (raw) gain, with c_target =
+        phi_inv(target) so the effective gain phi(c) tends to the target. lr is the gains LR of
+        this step (same schedule as _gains_step), so the pull decays with the schedule like AdamW
+        weight decay does."""
+        coeff = self.attention_in_gain_pull_coeff
+        if coeff == 0.0 or not (self.is_qkv_fn(p) or self.is_kda_in_proj_fn(p)):
+            return
+        col = self.state[p].get("col_gain")
+        if col is None:
+            return
+        target = self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=col.dtype, device=col.device))
+        col.sub_((col - target) * (self._gains_lr(group) * coeff))
 
     @torch.no_grad()
     def _revive_attention_in_col_gain(self, p):
@@ -1680,16 +1713,7 @@ class MDDecoupling(_MDDecouplingBase):
         # so gains decay gains_lr -> gains_min_lr exactly like a real param group (and honour
         # --min-lr-mode absolute, i.e. a fixed gains_min_lr floor — NOT the gains_lr * lr/max_lr
         # rescaling, which would floor at gains_lr * min_lr/max_lr and ignore min_lr).
-        if self.gains_lr is None:
-            lr = group["lr"]
-        else:
-            gmax = group.get("max_lr", group["lr"])
-            gmin = group.get("min_lr", 0.0)
-            denom = gmax - gmin
-            coeff = ((group["lr"] - gmin) / denom) if denom > 0 else 1.0
-            coeff = min(1.0, max(0.0, coeff))
-            gains_floor = self.gains_min_lr if self.gains_min_lr is not None else 0.0
-            lr = gains_floor + coeff * (self.gains_lr - gains_floor)
+        lr = self._gains_lr(group)
 
         bias_correction1 = 1.0 - beta1 ** step
         bias_correction2 = 1.0 - beta2 ** step
@@ -1715,6 +1739,18 @@ class MDDecoupling(_MDDecouplingBase):
                 self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
                 beta1, beta2, eps, wd,
             )
+
+    def _gains_lr(self, group) -> float:
+        """Gains LR of this step (see the schedule note in _gains_step)."""
+        if self.gains_lr is None:
+            return group["lr"]
+        gmax = group.get("max_lr", group["lr"])
+        gmin = group.get("min_lr", 0.0)
+        denom = gmax - gmin
+        coeff = ((group["lr"] - gmin) / denom) if denom > 0 else 1.0
+        coeff = min(1.0, max(0.0, coeff))
+        gains_floor = self.gains_min_lr if self.gains_min_lr is not None else 0.0
+        return gains_floor + coeff * (self.gains_lr - gains_floor)
 
     @torch.no_grad()
     def _apply_gains(self, p):
@@ -2213,6 +2249,8 @@ def get_megatron_mddecoupling_optimizer(
         attention_in_gain_revive_threshold=config.md_attention_in_gain_revive_threshold,
         attention_in_gain_revive_mean=config.md_attention_in_gain_revive_mean,
         revive_log_interval=getattr(config, "muon_log_interval", 200) or 200,
+        attention_in_gain_pull_coeff=config.md_attention_in_gain_pull_coeff,
+        attention_in_gain_pull_target=config.md_attention_in_gain_pull_target,
     )
 
     optimizers = []
@@ -2278,10 +2316,11 @@ def get_megatron_mddecoupling_optimizer(
     for param in linear_params:
         param.requires_grad = True
 
-    if config.md_attention_in_gain_revive_threshold is not None:
+    if (config.md_attention_in_gain_revive_threshold is not None
+            or config.md_attention_in_gain_pull_coeff):
         # The pre-norm gamma lives in the chained Adam. A torch post-step hook on the inner
         # optimizer runs right after its step() and before the Float16 wrapper copies main ->
-        # model params (or the layer-wise wrapper all-gathers), so the revived value is what gets
+        # model params (or the layer-wise wrapper all-gathers), so the new value is what gets
         # published. The inner optimizer object survives the layer-wise re-wrap (it unwraps the
         # FP32Optimizer and wraps the same torch optimizer), and routing attrs are propagated onto
         # the fp32 main params, so the hook finds the tagged params in its param_groups.
@@ -2289,6 +2328,8 @@ def get_megatron_mddecoupling_optimizer(
             config.md_attention_in_gain_revive_threshold,
             config.md_attention_in_gain_revive_mean,
             getattr(config, "muon_log_interval", 200) or 200,
+            pull_coeff=config.md_attention_in_gain_pull_coeff,
+            pull_target=config.md_attention_in_gain_pull_target,
         )
         for adam in chained_adam.chained_optimizers:
             adam.optimizer.register_step_post_hook(hook)
