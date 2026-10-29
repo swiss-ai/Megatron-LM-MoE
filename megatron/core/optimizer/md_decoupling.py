@@ -217,11 +217,11 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean
         if total is not None:
             counter["count"] = total if counter["count"] is None else counter["count"] + total
         if counter["steps"] % log_interval == 0 and counter["count"] is not None:
-            # Logged by every rank that owns a tagged gamma (see _log_revive_counts).
-            logger.info(
-                f"attention-in pre-norm gain revive: {int(counter['count'])} entries on rank "
-                f"{_global_rank()} over the last {log_interval} steps"
-            )
+            # Printed by every rank that revived something (see _log_revive_counts).
+            n = int(counter["count"])
+            if n:
+                print(f"[rank {_global_rank()}] attention-in pre-norm gain revive: {n} entries over the "
+                      f"last {log_interval} steps", flush=True)
             counter["count"] = None
 
     hook.revive_counter = counter
@@ -1613,12 +1613,13 @@ class MDDecoupling(_MDDecouplingBase):
             return
         self._revive_steps += 1
         if self._revive_steps % self.revive_log_interval == 0 and self._revive_count is not None:
-            # Per-rank count, logged by every rank that owns such a matrix: under the layer-wise
-            # optimizer the attention-in weights are spread over the DP ranks, so rank 0 may own none.
-            logger.info(
-                f"attention-in col-gain revive: {int(self._revive_count)} entries on rank "
-                f"{_global_rank()} over the last {self.revive_log_interval} steps"
-            )
+            # Printed by every rank that revived something: under the layer-wise optimizer the
+            # attention-in weights are spread over the DP ranks (rank 0 may own none) and only rank 0
+            # has INFO logging enabled. Silent when nothing was revived.
+            n = int(self._revive_count)
+            if n:
+                print(f"[rank {_global_rank()}] attention-in col-gain revive: {n} entries over the last "
+                      f"{self.revive_log_interval} steps", flush=True)
             self._revive_count = None
 
     @torch.no_grad()
