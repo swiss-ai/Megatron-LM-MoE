@@ -2253,7 +2253,7 @@ def get_megatron_mddecoupling_optimizer(
         gains_no_clamp_min=config.gains_no_clamp_min,
         attention_in_gain_revive_threshold=config.md_attention_in_gain_revive_threshold,
         attention_in_gain_revive_mean=config.md_attention_in_gain_revive_mean,
-        revive_log_interval=getattr(config, "muon_log_interval", 200) or 200,
+        revive_log_interval=config.muon_log_interval or 200,
         attention_in_gain_pull_coeff=config.md_attention_in_gain_pull_coeff,
         attention_in_gain_pull_target=config.md_attention_in_gain_pull_target,
     )
@@ -2332,7 +2332,7 @@ def get_megatron_mddecoupling_optimizer(
         hook = make_attention_in_pre_norm_gain_revive_hook(
             config.md_attention_in_gain_revive_threshold,
             config.md_attention_in_gain_revive_mean,
-            getattr(config, "muon_log_interval", 200) or 200,
+            config.muon_log_interval or 200,
             pull_coeff=config.md_attention_in_gain_pull_coeff,
             pull_target=config.md_attention_in_gain_pull_target,
         )

@@ -459,6 +459,10 @@ class OptimizerConfig:
     md_attention_in_gain_pull_target: float = 1.0
     """Target value c of the attention-in gain pull (effective-gain units)."""
 
+    muon_log_interval: Optional[int] = None
+    """Step interval of the per-rank attention-in gain revive report (filled from --muon-log-interval;
+    None -> 200)."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed
