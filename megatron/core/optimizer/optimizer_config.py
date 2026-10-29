@@ -438,6 +438,17 @@ class OptimizerConfig:
     through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
     nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
+    md_attention_in_gain_revive_threshold: Optional[float] = None
+    """Revive collapsed attention-in gains every step. Applies to the two per-input-channel
+    gains in front of the fused attention input projection (softmax linear_qkv and KDA in_proj):
+    the pre-norm gamma (chained Adam) and the MDDecoupling column gain phi(c). An entry whose
+    effective gain is below this threshold in magnitude is reset to the mean of its gain vector
+    and its Adam moments are zeroed. None disables."""
+
+    md_attention_in_gain_revive_mean: str = 'all'
+    """Which entries the revive mean averages over: 'all' (the whole gain vector, including the
+    collapsed entries) or 'live' (only the entries at or above the threshold)."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed

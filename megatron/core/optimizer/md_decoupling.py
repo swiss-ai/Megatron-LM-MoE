@@ -152,6 +152,67 @@ def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") 
     return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
 
 
+def _is_attention_in_pre_norm_gain(name: str, param: torch.Tensor) -> bool:
+    """The norm gain fused in front of the attention input projection (TELayerNormColumnParallel
+    linear_qkv for softmax attention, in_proj for KDA/GDN). It multiplies the same per-input-channel
+    axis as that projection's MDDecoupling column gain."""
+    return (
+        param.ndim == 1
+        and ".self_attention." in name
+        and (name.endswith("linear_qkv.layer_norm_weight") or name.endswith("in_proj.layer_norm_weight"))
+    )
+
+
+def make_attention_in_pre_norm_gain_revive_hook(threshold: float, mean_mode: str = "all",
+                                                log_interval: int = 200):
+    """Post-step hook for the chained Adam that owns the attention-in pre-norm gammas.
+
+    For every param tagged ``md_attention_in_pre_norm_gain``, entries whose effective gain
+    (stored value + zero-centered offset) is below ``threshold`` in magnitude are reset to the mean
+    effective gain of that vector and their Adam moments are zeroed. The gamma is replicated across
+    TP (and whole per rank under the layer-wise optimizer), so the mean is local and identical on
+    every rank that holds it. Runs between the inner ``step()`` and the wrapper's main -> model
+    copy / all-gather, so the revived value is what the model sees. Companion of
+    :meth:`MDDecoupling._revive_attention_in_col_gain`.
+    """
+    counter = {"steps": 0, "count": None}
+
+    @torch.no_grad()
+    def hook(optimizer, args, kwargs):
+        total = None
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if not getattr(p, "md_attention_in_pre_norm_gain", False):
+                    continue
+                offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
+                eff = p + offset if offset else p
+                dead = eff.abs() < threshold
+                weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
+                mean_eff = (eff * weight).sum() / weight.sum().clamp_min(1.0)
+                p.copy_(torch.where(dead, (mean_eff - offset).to(p.dtype), p))
+                state = optimizer.state.get(p)
+                if state:
+                    keep = ~dead
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        if key in state and torch.is_tensor(state[key]) and state[key].shape == p.shape:
+                            state[key].mul_(keep.to(state[key].dtype))
+                n = dead.sum()
+                total = n if total is None else total + n
+        counter["steps"] += 1
+        if total is not None:
+            counter["count"] = total if counter["count"] is None else counter["count"] + total
+        if counter["steps"] % log_interval == 0 and counter["count"] is not None:
+            log_single_rank(
+                logger, logging.INFO,
+                f"attention-in pre-norm gain revive: {int(counter['count'])} entries on this rank "
+                f"over the last {log_interval} steps",
+            )
+            counter["count"] = None
+
+    hook.revive_counter = counter
+    return hook
+
+
 def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
     """Dimension along which TP shards ``p``, or None when ``p`` is not TP-sharded.
 
@@ -1218,8 +1279,17 @@ class MDDecoupling(_MDDecouplingBase):
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
         gains_no_clamp_min: bool = False,
+        # Revive collapsed attention-in column gains (see _revive_attention_in_col_gain).
+        attention_in_gain_revive_threshold: Optional[float] = None,
+        attention_in_gain_revive_mean: Literal["all", "live"] = "all",
+        revive_log_interval: int = 200,
         **kwargs,
     ):
+        self.attention_in_gain_revive_threshold = attention_in_gain_revive_threshold
+        self.attention_in_gain_revive_mean = attention_in_gain_revive_mean
+        self.revive_log_interval = revive_log_interval
+        self._revive_steps = 0
+        self._revive_count = None  # GPU-side counter of revived column-gain entries
         self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
         self.hypersphere_gains_mode_output = (
             None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
@@ -1457,9 +1527,62 @@ class MDDecoupling(_MDDecouplingBase):
                     gain_grads = self._preprocess_gains(p)
                     self._param_step(p, group)
                     self._gains_step(p, group, gain_grads)
+                    # Between the gains step and the re-apply, so the effective weight is
+                    # rebuilt with the revived phi(c): p = bare_p * phi(r) * phi(c_new).
+                    self._revive_attention_in_col_gain(p)
                     self._apply_gains(p)
+        self._log_revive_counts()
 
         return loss
+
+    @torch.no_grad()
+    def _revive_attention_in_col_gain(self, p):
+        """Reset collapsed column gains of the fused attention input projections.
+
+        Mirror of the pre-norm gamma revive in :func:`make_attention_in_pre_norm_gain_revive_hook`
+        for the MDDecoupling column gain phi(c) of linear_qkv / KDA in_proj. Entries with
+        phi(c) < threshold are set to phi_inv(mean phi(c)) and their Adam moments are zeroed. With
+        a dead pre-norm gamma AND a dead column gain the bare column receives no gradient and the
+        row-sphere projection shrinks it every step, so the pair is an absorbing state; reviving
+        the gain restores the gradient into that bare column. No host sync: masks are applied
+        with torch.where / mul_.
+        """
+        thr = self.attention_in_gain_revive_threshold
+        if thr is None or not (self.is_qkv_fn(p) or self.is_kda_in_proj_fn(p)):
+            return
+        state = self.state[p]
+        col = state.get("col_gain")
+        if col is None:
+            return
+        eff = self._phi(col)
+        dead = eff.abs() < thr
+        weight = torch.ones_like(eff) if self.attention_in_gain_revive_mean == "all" else (~dead).to(eff.dtype)
+        total = torch.stack([(eff * weight).sum(), weight.sum()])
+        # The column gain is sharded only when the matrix is row-parallel (partition_dim == 1);
+        # reduce so every TP rank revives to the same global mean.
+        if self.pg_collection is not None and _tp_partition_dim(p) == 1:
+            tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
+            torch.distributed.all_reduce(total, group=tp_group)
+        mean_eff = total[0] / total[1].clamp_min(1.0)
+        col.copy_(torch.where(dead, self._phi_inv(mean_eff).to(col.dtype), col))
+        keep = (~dead).to(col.dtype)
+        state["col_gain_m"].mul_(keep)
+        state["col_gain_v"].mul_(keep)
+        n = dead.sum()
+        self._revive_count = n if self._revive_count is None else self._revive_count + n
+
+    def _log_revive_counts(self):
+        if self.attention_in_gain_revive_threshold is None:
+            return
+        self._revive_steps += 1
+        if self._revive_steps % self.revive_log_interval == 0 and self._revive_count is not None:
+            # Per-rank count: under the layer-wise optimizer each rank owns different matrices.
+            log_single_rank(
+                logger, logging.INFO,
+                f"attention-in col-gain revive: {int(self._revive_count)} entries on this rank over "
+                f"the last {self.revive_log_interval} steps",
+            )
+            self._revive_count = None
 
     @torch.no_grad()
     def _preprocess_gains(self, p):
@@ -1989,6 +2112,10 @@ def get_megatron_mddecoupling_optimizer(
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
+            if _is_attention_in_pre_norm_gain(name, param):
+                # The gamma fused in front of the attention-in projection: revived together with
+                # the projection's column gain (both are per-input-channel gains on the same input).
+                param.md_attention_in_pre_norm_gain = True
             if param.md_gain_log_family == "layernorm":
                 # This tagging is just to be able to log layernorm gain under muon_logging
                 param.md_layernorm_gain_offset = float(
@@ -2083,6 +2210,9 @@ def get_megatron_mddecoupling_optimizer(
         gains_weight_decay=config.weight_decay,
         gain_parametrization=config.gain_parametrization,
         gains_no_clamp_min=config.gains_no_clamp_min,
+        attention_in_gain_revive_threshold=config.md_attention_in_gain_revive_threshold,
+        attention_in_gain_revive_mean=config.md_attention_in_gain_revive_mean,
+        revive_log_interval=getattr(config, "muon_log_interval", 200) or 200,
     )
 
     optimizers = []
@@ -2147,6 +2277,21 @@ def get_megatron_mddecoupling_optimizer(
     # Unfreeze everything.
     for param in linear_params:
         param.requires_grad = True
+
+    if config.md_attention_in_gain_revive_threshold is not None:
+        # The pre-norm gamma lives in the chained Adam. A torch post-step hook on the inner
+        # optimizer runs right after its step() and before the Float16 wrapper copies main ->
+        # model params (or the layer-wise wrapper all-gathers), so the revived value is what gets
+        # published. The inner optimizer object survives the layer-wise re-wrap (it unwraps the
+        # FP32Optimizer and wraps the same torch optimizer), and routing attrs are propagated onto
+        # the fp32 main params, so the hook finds the tagged params in its param_groups.
+        hook = make_attention_in_pre_norm_gain_revive_hook(
+            config.md_attention_in_gain_revive_threshold,
+            config.md_attention_in_gain_revive_mean,
+            getattr(config, "muon_log_interval", 200) or 200,
+        )
+        for adam in chained_adam.chained_optimizers:
+            adam.optimizer.register_step_post_hook(hook)
 
     init_fns = [_md_init_state_fn] + len(chained_adam.chained_optimizers) * [_adam_init_state_fn]
     optimizers += chained_adam.chained_optimizers

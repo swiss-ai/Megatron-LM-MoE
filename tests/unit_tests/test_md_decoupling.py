@@ -2531,3 +2531,126 @@ def test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags(monkeypatc
     assert any(p is kv_up for p in sharded_params) and kv_up.is_kv_up_proj
     assert any(p is q_up for p in sharded_params) and q_up.is_q_up_proj
     assert any(p is qkv_down for p in sharded_params) and qkv_down.is_qkv_down_proj
+
+
+# ---------------------------------------------------------------------------------------------
+# Attention-in gain revive (--md-attention-in-gain-revive-threshold)
+
+
+def _revive_qkv_optimizer(param, threshold=1e-12, mean_mode="all"):
+    optimizer = _gqa_qkv_optimizer(
+        param,
+        hypersphere_mode="row",
+        hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus",
+        use_orthogonal_updates=False,
+        attention_in_gain_revive_threshold=threshold,
+        attention_in_gain_revive_mean=mean_mode,
+    )
+    optimizer._maybe_init_gain_state(param)
+    return optimizer
+
+
+@pytest.mark.parametrize("mean_mode", ["all", "live"])
+def test_md_decoupling_revives_attention_in_col_gain(mean_mode):
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _revive_qkv_optimizer(param, mean_mode=mean_mode)
+    state = optimizer.state[param]
+    col = state["col_gain"]
+    col.copy_(torch.tensor([0.5, 0.0, 1.5, 0.0]))  # phi = softplus
+    col[1] = optimizer._phi_inv(torch.tensor(1e-20))  # collapsed entry
+    state["col_gain_m"].fill_(0.3)
+    state["col_gain_v"].fill_(0.7)
+    eff_before = optimizer._phi(col.clone())
+    dead = eff_before < 1e-12
+    assert dead.tolist() == [False, True, False, False]
+
+    optimizer._revive_attention_in_col_gain(param)
+
+    eff_after = optimizer._phi(state["col_gain"])
+    expected_mean = eff_before.mean() if mean_mode == "all" else eff_before[~dead].mean()
+    torch.testing.assert_close(eff_after[1], expected_mean)
+    torch.testing.assert_close(eff_after[~dead], eff_before[~dead])
+    assert state["col_gain_m"][1] == 0 and state["col_gain_v"][1] == 0
+    torch.testing.assert_close(state["col_gain_m"][~dead], torch.full((3,), 0.3))
+    torch.testing.assert_close(state["col_gain_v"][~dead], torch.full((3,), 0.7))
+    assert int(optimizer._revive_count) == 1
+
+
+def test_md_decoupling_col_gain_revive_only_touches_attention_in():
+    param = torch.nn.Parameter(torch.randn(8, 4))  # no is_qkv / is_kda_in_proj tag
+    optimizer = _revive_qkv_optimizer(param)
+    state = optimizer.state[param]
+    state["col_gain"][2] = optimizer._phi_inv(torch.tensor(1e-20))
+    before = state["col_gain"].clone()
+    optimizer._revive_attention_in_col_gain(param)
+    torch.testing.assert_close(state["col_gain"], before)
+    assert optimizer._revive_count is None
+
+
+def test_md_decoupling_step_rebuilds_weight_with_revived_col_gain():
+    """The revive runs between the gains step and _apply_gains, so after step() the effective
+    weight equals bare_p * phi(row) * phi(col_revived) with unit-norm bare rows."""
+    torch.manual_seed(1)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _revive_qkv_optimizer(param)
+    state = optimizer.state[param]
+    state["col_gain"][3] = optimizer._phi_inv(torch.tensor(1e-20))
+    optimizer._apply_gains(param)  # bake the collapsed gain into p
+    param.grad = torch.randn_like(param)
+    optimizer.step()
+    phi_r = optimizer._phi(state["row_gain"])
+    phi_c = optimizer._phi(state["col_gain"])
+    assert phi_c[3] > 1e-3, "collapsed column gain was not revived"
+    bare = param.detach() / phi_r[:, None] / phi_c[None, :]
+    torch.testing.assert_close(bare.norm(dim=1), torch.ones(8), rtol=1e-5, atol=1e-5)
+
+
+def test_attention_in_pre_norm_gain_tag_predicate():
+    one_d = torch.nn.Parameter(torch.ones(4))
+    two_d = torch.nn.Parameter(torch.ones(4, 4))
+    assert md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight", one_d)
+    assert md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d)
+    assert not md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d)
+    assert not md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.3.self_attention.q_layernorm.weight", one_d)
+    assert not md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.3.self_attention.linear_qkv.weight", two_d)
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_attention_in_pre_norm_gain_revive_hook(offset):
+    """Post-step hook on the chained Adam: collapsed gammas go to the vector mean, their moments
+    are zeroed, untagged params are untouched. Zero-centered gammas are judged and reset on the
+    effective value (stored + offset)."""
+    torch.manual_seed(2)
+    gamma = torch.nn.Parameter(torch.tensor([1.5, 1e-14, 0.5, 2.0, -1e-14, 1.0]) - offset)
+    gamma.md_attention_in_pre_norm_gain = True
+    gamma.md_layernorm_gain_offset = offset
+    other = torch.nn.Parameter(torch.tensor([1e-14, 1.0]))
+    adam = torch.optim.AdamW([gamma, other], lr=0.01, weight_decay=0.0)
+    hook = md_module.make_attention_in_pre_norm_gain_revive_hook(1e-8, "all", log_interval=1)
+    adam.register_step_post_hook(hook)
+    # Tiny gradients on the collapsed entries (as in a run where their Adam v sits far below eps),
+    # so the Adam step itself leaves them below the threshold.
+    gamma.grad = torch.tensor([0.1, 1e-16, -0.2, 0.3, 1e-16, 0.05])
+    other.grad = torch.tensor([1e-16, 0.1])
+    adam.step()
+
+    eff = gamma.detach() + offset
+    dead = torch.tensor([False, True, False, False, True, False])
+    # revived entries equal the mean of the vector as it stood right after the Adam step
+    live_sum = eff[~dead].sum()
+    # mean m satisfies m = (live_sum + 2*m_pre) / 6 where m_pre are the ~1e-14 values -> m ~ live_sum/6
+    torch.testing.assert_close(eff[dead], torch.full((2,), float(live_sum / 6)), rtol=1e-5, atol=1e-9)
+    state = adam.state[gamma]
+    assert state["exp_avg"][dead].abs().max() == 0 and state["exp_avg_sq"][dead].abs().max() == 0
+    assert state["exp_avg"][~dead].abs().min() > 0
+    assert abs(float(other[0])) < 1e-8, "untagged param must not be revived"
+    assert int(hook.revive_counter["steps"]) == 1

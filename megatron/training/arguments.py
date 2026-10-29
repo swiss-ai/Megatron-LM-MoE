@@ -3108,6 +3108,15 @@ def _add_training_args(parser):
                        help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
                        'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
                        'including small or negative gains.')
+    group.add_argument('--md-attention-in-gain-revive-threshold', type=float, default=None,
+                       help='md_decoupling: every step, reset the attention-in pre-norm gamma and '
+                       'column gain entries whose effective value is below this magnitude to the '
+                       'mean of their gain vector, and zero their Adam moments. Only the fused '
+                       'attention input projections (softmax linear_qkv, KDA in_proj). Off when unset.')
+    group.add_argument('--md-attention-in-gain-revive-mean', type=str, default='all',
+                       choices=['all', 'live'],
+                       help='Entries the revive mean averages over: the whole gain vector (all) '
+                       'or only the entries at or above the threshold (live).')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '
