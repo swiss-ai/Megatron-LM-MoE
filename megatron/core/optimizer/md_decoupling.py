@@ -152,6 +152,10 @@ def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") 
     return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
 
 
+def _global_rank() -> int:
+    return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+
 def _is_attention_in_pre_norm_gain(name: str, param: torch.Tensor) -> bool:
     """The norm gain fused in front of the attention input projection (TELayerNormColumnParallel
     linear_qkv for softmax attention, in_proj for KDA/GDN). It multiplies the same per-input-channel
@@ -213,10 +217,10 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean
         if total is not None:
             counter["count"] = total if counter["count"] is None else counter["count"] + total
         if counter["steps"] % log_interval == 0 and counter["count"] is not None:
-            log_single_rank(
-                logger, logging.INFO,
-                f"attention-in pre-norm gain revive: {int(counter['count'])} entries on this rank "
-                f"over the last {log_interval} steps",
+            # Logged by every rank that owns a tagged gamma (see _log_revive_counts).
+            logger.info(
+                f"attention-in pre-norm gain revive: {int(counter['count'])} entries on rank "
+                f"{_global_rank()} over the last {log_interval} steps"
             )
             counter["count"] = None
 
@@ -1609,11 +1613,11 @@ class MDDecoupling(_MDDecouplingBase):
             return
         self._revive_steps += 1
         if self._revive_steps % self.revive_log_interval == 0 and self._revive_count is not None:
-            # Per-rank count: under the layer-wise optimizer each rank owns different matrices.
-            log_single_rank(
-                logger, logging.INFO,
-                f"attention-in col-gain revive: {int(self._revive_count)} entries on this rank over "
-                f"the last {self.revive_log_interval} steps",
+            # Per-rank count, logged by every rank that owns such a matrix: under the layer-wise
+            # optimizer the attention-in weights are spread over the DP ranks, so rank 0 may own none.
+            logger.info(
+                f"attention-in col-gain revive: {int(self._revive_count)} entries on rank "
+                f"{_global_rank()} over the last {self.revive_log_interval} steps"
             )
             self._revive_count = None
 
