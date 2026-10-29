@@ -609,7 +609,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
-    def _apply_post_norm(self, output_with_bias, post_norm):
+    def _apply_post_norm(self, output_with_bias, post_norm, offload_name=None):
         """Apply the optional sandwich-norm and the optional fixed residual scale to a sublayer's
         ``(output, bias)`` before the residual add.
 
@@ -643,7 +643,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if has_norm:
             if bias is not None:
                 output = output + bias
-            output = apply_module(post_norm)(output)
+            # Fine-grained activation offloading of the sandwich-norm input (`--offload-modules
+            # post_attn_norm / post_mlp_norm`): the norm saves this hidden-size tensor for its backward.
+            offload = bool(
+                offload_name is not None
+                and self.training
+                and self.config.fine_grained_activation_offloading
+                and offload_name in (self.config.offload_modules or [])
+            )
+            if offload:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+                norm_in = output
+                with off_interface(True, norm_in, offload_name) as norm_in:
+                    output = apply_module(post_norm)(norm_in)
+                output = off_interface.group_commit(
+                    output, name=offload_name, forced_released_tensors=[norm_in]
+                )
+            else:
+                output = apply_module(post_norm)(output)
             if alpha is not None:
                 output = alpha * output
             return output, None
@@ -767,7 +786,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Skipped under KEEL, which instead normalizes the *summed* output after the add (below).
         if not self.keel:
             attention_output_with_bias = self._apply_post_norm(
-                attention_output_with_bias, self.post_self_attn_layernorm
+                attention_output_with_bias, self.post_self_attn_layernorm, offload_name="post_attn_norm"
             )
 
         # KEEL highway scaling: scale the residual ("carry") branch by alpha before the add, so the
@@ -1018,7 +1037,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Skipped under KEEL, which instead normalizes the *summed* output after the add (below).
         if not self.keel:
             mlp_output_with_bias = self._apply_post_norm(
-                mlp_output_with_bias, self.post_mlp_layernorm
+                mlp_output_with_bias, self.post_mlp_layernorm, offload_name="post_mlp_norm"
             )
 
         # KEEL highway scaling: scale the residual ("carry") branch by alpha before the add, so the

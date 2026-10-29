@@ -740,7 +740,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # apply the optional post norm (and residual scaling) before bias-dropout-add.
         if not layer.keel:
             mlp_output_with_bias = layer._apply_post_norm(
-                mlp_output_with_bias, layer.post_mlp_layernorm
+                mlp_output_with_bias, layer.post_mlp_layernorm, offload_name="post_mlp_norm"
             )
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()

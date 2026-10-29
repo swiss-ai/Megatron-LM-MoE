@@ -1463,6 +1463,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "kda_proj": offload the input of the KDA (linear attention) output projection.
+    "post_attn_norm" / "post_mlp_norm": offload the inputs of the sandwich (post) norms.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -2278,6 +2280,9 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "kda_proj",
+                "post_attn_norm",
+                "post_mlp_norm",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (

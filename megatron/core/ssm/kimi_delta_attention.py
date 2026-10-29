@@ -643,6 +643,13 @@ class KimiDeltaAttention(GatedDeltaNet):
                 self.config.sequence_parallel,
             )
 
+        # Fine-grained activation offloading of the out_proj input (`--offload-modules kda_proj`):
+        # the gated-norm output in sbhd layout, one hidden-size tensor per token per KDA layer.
+        self.offload_kda_proj = bool(
+            getattr(self.config, "fine_grained_activation_offloading", False)
+            and "kda_proj" in (self.config.offload_modules or [])
+        )
+
         # Checkpoint the chunk_kda core (`--recompute-modules linear_attn`).
         # Disjoint from `qkv` above: that one recomputes the PRODUCER of q/k/v
         # (in_proj -> conv1d -> prepare), this one the CONSUMER (chunk_kda ->
@@ -1309,7 +1316,14 @@ class KimiDeltaAttention(GatedDeltaNet):
                 packed_seq_params=packed_seq_params,
             )
         nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        offload_proj = self.offload_kda_proj and self.training
+        with off_interface(offload_proj, norm_out, "kda_proj") as norm_out:
+            out, out_bias = self.out_proj(norm_out)
+        if offload_proj:
+            out = off_interface.group_commit(out, name="kda_proj", forced_released_tensors=[norm_out])
         nvtx_range_pop(suffix="out_proj")
         if plan is not None:
             out = relayout(out, plan, inverse=True).view(input_shape)
