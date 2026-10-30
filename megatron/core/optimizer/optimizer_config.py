@@ -459,6 +459,12 @@ class OptimizerConfig:
     linear_qkv (pre-norm gamma + column gain) of the global softmax attention layers only;
     'all' adds the KDA/GDN in_proj."""
 
+    md_dense_mlp_in_gain_revive: bool = False
+    """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
+    coefficient and target) to the gamma fused in front of the dense MLP linear_fc1 and to that
+    matrix's column gain: the dense layers of a hybrid dense/MoE stack. MoE experts and shared
+    experts have no fused pre-norm and are never touched."""
+
     md_attention_in_gain_pull_coeff: float = 0.0
     """Decoupled pull of the attention-in gains toward a target value, applied after their Adam
     update like AdamW weight decay: x <- x - lr * coeff * (x - c) on the stored parameter, where lr

@@ -157,14 +157,23 @@ def _global_rank() -> int:
     return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
 
-def _is_attention_in_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "softmax") -> bool:
-    """The norm gain fused in front of the attention input projection. It multiplies the same
-    per-input-channel axis as that projection's MDDecoupling column gain.
+def _is_revived_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "softmax",
+                              dense_mlp_in: bool = False) -> bool:
+    """The pre-norm gains the --md-attention-in-gain-* revive and pull act on: the norm gain fused
+    in front of an input projection, which multiplies the same per-input-channel axis as that
+    projection's MDDecoupling column gain (the matrices of :meth:`MDDecoupling._is_revived_matrix`).
 
     ``scope`` selects which attention variants count: ``"softmax"`` (default) is the global softmax
     attention only (TELayerNormColumnParallel linear_qkv); ``"all"`` adds the KDA/GDN in_proj.
+    ``dense_mlp_in`` adds the gamma fused in front of the dense MLP linear_fc1 (the dense layers of
+    a hybrid dense/MoE stack; MoE experts and shared experts have no fused norm and are excluded by
+    the ``.mlp.linear_fc1`` suffix), which collapses the same way as the attention-in gamma.
     """
-    if param.ndim != 1 or ".self_attention." not in name:
+    if param.ndim != 1:
+        return False
+    if dense_mlp_in and name.endswith(".mlp.linear_fc1.layer_norm_weight"):
+        return True
+    if ".self_attention." not in name:
         return False
     if name.endswith("linear_qkv.layer_norm_weight"):
         return True
@@ -190,12 +199,13 @@ def arm_attention_in_gain_revive(loaded_iteration: int) -> bool:
     return armed
 
 
-def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean_mode: str = "all",
-                                                revive_iteration: Optional[int] = None,
-                                                pull_coeff: float = 0.0, pull_target: float = 1.0):
-    """Post-step hook for the chained Adam that owns the attention-in pre-norm gammas.
+def make_pre_norm_gain_revive_hook(threshold: Optional[float], mean_mode: str = "all",
+                                   revive_iteration: Optional[int] = None,
+                                   pull_coeff: float = 0.0, pull_target: float = 1.0):
+    """Post-step hook for the chained Adam that owns the revived pre-norm gammas (attention-in and,
+    with --md-dense-mlp-in-gain-revive, dense MLP fc1; see :func:`_is_revived_pre_norm_gain`).
 
-    For every param tagged ``md_attention_in_pre_norm_gain``, in this order:
+    For every param tagged ``md_revived_pre_norm_gain``, in this order:
       1. pull (every step, if ``pull_coeff`` > 0): x <- x - lr * pull_coeff * (x - pull_target) on
          the effective gain (stored value + zero-centered offset), lr = the param group's scheduled
          LR — the decoupled AdamW-style pull toward a target value;
@@ -206,8 +216,8 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean
     The gamma is replicated across TP (and whole per rank under the layer-wise optimizer), so the
     mean is local and identical on every rank that holds it. Runs between the inner ``step()`` and
     the wrapper's main -> model copy / all-gather, so the new value is what the model sees.
-    Companion of :meth:`MDDecoupling._pull_attention_in_col_gain` /
-    :meth:`MDDecoupling._revive_attention_in_col_gain`.
+    Companion of :meth:`MDDecoupling._pull_col_gain` /
+    :meth:`MDDecoupling._revive_col_gain`.
     """
     state = {"optimizers": [], "pending": set(), "revived": 0}
 
@@ -218,7 +228,7 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean
         total = None
         for group in optimizer.param_groups:
             for p in group["params"]:
-                if not getattr(p, "md_attention_in_pre_norm_gain", False):
+                if not getattr(p, "md_revived_pre_norm_gain", False):
                     continue
                 offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
                 # Revive BEFORE the pull: the pull moves a collapsed entry by ~lr*coeff per step
@@ -246,7 +256,7 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean
             # under the layer-wise optimizer, usually owns none of them).
             n = int(total)
             state["revived"] += n
-            print(f"[rank {_global_rank()}] attention-in pre-norm gain revive (once, after iteration "
+            print(f"[rank {_global_rank()}] pre-norm gain revive (once, after iteration "
                   f"{revive_iteration}): {n} entries reset", flush=True)
 
     def attach(torch_optimizer):
@@ -475,6 +485,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         is_kda_in_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        is_dense_fc1_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         is_kv_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         kv_up_proj_split_shapes: Optional[tuple[int, int]] = None,
         is_qkv_down_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -519,6 +530,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.qkv_dim = qkv_dim
         self.is_kda_in_proj_fn = (
             is_kda_in_proj_fn if is_kda_in_proj_fn is not None else (lambda p: False)
+        )
+        self.is_dense_fc1_fn = (
+            is_dense_fc1_fn if is_dense_fc1_fn is not None else (lambda p: False)
         )
         self.is_kv_up_proj_fn = (
             is_kv_up_proj_fn if is_kv_up_proj_fn is not None else (lambda p: False)
@@ -1334,14 +1348,16 @@ class MDDecoupling(_MDDecouplingBase):
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
         gains_no_clamp_min: bool = False,
-        # Revive collapsed attention-in column gains (see _revive_attention_in_col_gain).
+        # Revive collapsed column gains of the revived matrices (see _revive_col_gain).
         attention_in_gain_revive_threshold: Optional[float] = None,
         attention_in_gain_revive_mean: Literal["all", "live"] = "all",
         attention_in_gain_revive_iteration: Optional[int] = None,
         # Which attention-in projections the revive / pull touch: "softmax" = linear_qkv of the global
-        # softmax layers only (default); "all" adds the KDA/GDN in_proj (see _is_attention_in_matrix).
+        # softmax layers only (default); "all" adds the KDA/GDN in_proj (see _is_revived_matrix).
         attention_in_gain_scope: Literal["softmax", "all"] = "softmax",
-        # Decoupled pull of attention-in column gains toward a target (see _pull_attention_in_col_gain).
+        # Also revive / pull the column gain of the dense MLP linear_fc1 (see _is_revived_matrix).
+        dense_mlp_in_gain: bool = False,
+        # Decoupled pull of the revived matrices' column gains toward a target (see _pull_col_gain).
         attention_in_gain_pull_coeff: float = 0.0,
         attention_in_gain_pull_target: float = 1.0,
         **kwargs,
@@ -1350,8 +1366,9 @@ class MDDecoupling(_MDDecouplingBase):
         self.attention_in_gain_revive_mean = attention_in_gain_revive_mean
         self.attention_in_gain_revive_iteration = attention_in_gain_revive_iteration
         self.attention_in_gain_scope = attention_in_gain_scope
+        self.dense_mlp_in_gain = dense_mlp_in_gain
         # One-shot: armed by arm_attention_in_gain_revive(loaded_iteration) after the checkpoint
-        # load, consumed by the next step() (see _revive_attention_in_col_gain).
+        # load, consumed by the next step() (see _revive_col_gain).
         self._revive_armed = False
         if attention_in_gain_revive_threshold is not None:
             _REVIVE_ARMERS.append(weakref.WeakMethod(self.arm_attention_in_gain_revive))
@@ -1602,8 +1619,8 @@ class MDDecoupling(_MDDecouplingBase):
                     # Revive before the pull (see the gamma hook): the pull alone would lift a
                     # collapsed gain above the threshold and the one-shot revive would skip it.
                     if revive:
-                        self._revive_attention_in_col_gain(p)
-                    self._pull_attention_in_col_gain(p, group)
+                        self._revive_col_gain(p)
+                    self._pull_col_gain(p, group)
                     self._apply_gains(p)
         if revive:
             self._report_revive_count()
@@ -1611,14 +1628,14 @@ class MDDecoupling(_MDDecouplingBase):
         return loss
 
     @torch.no_grad()
-    def _pull_attention_in_col_gain(self, p, group):
-        """Decoupled pull of the attention-in column gain toward the target, after its Adam step:
+    def _pull_col_gain(self, p, group):
+        """Decoupled pull of a revived matrix's column gain toward the target, after its Adam step:
         c <- c - lr * coeff * (c - c_target) on the stored (raw) gain, with c_target =
         phi_inv(target) so the effective gain phi(c) tends to the target. lr is the gains LR of
         this step (same schedule as _gains_step), so the pull decays with the schedule like AdamW
         weight decay does."""
         coeff = self.attention_in_gain_pull_coeff
-        if coeff == 0.0 or not self._is_attention_in_matrix(p):
+        if coeff == 0.0 or not self._is_revived_matrix(p):
             return
         col = self.state[p].get("col_gain")
         if col is None:
@@ -1627,12 +1644,12 @@ class MDDecoupling(_MDDecouplingBase):
         col.sub_((col - target) * (self._gains_lr(group) * coeff))
 
     @torch.no_grad()
-    def _revive_attention_in_col_gain(self, p):
-        """Reset collapsed column gains of the fused attention input projections.
+    def _revive_col_gain(self, p):
+        """Reset collapsed column gains of the revived input projections (_is_revived_matrix).
 
-        Mirror of the pre-norm gamma revive in :func:`make_attention_in_pre_norm_gain_revive_hook`
-        for the MDDecoupling column gain phi(c) of linear_qkv / KDA in_proj; run ONCE, on the first
-        step after :meth:`arm_attention_in_gain_revive` matched the loaded iteration. Entries with
+        Mirror of the pre-norm gamma revive in :func:`make_pre_norm_gain_revive_hook`
+        for the MDDecoupling column gain phi(c) of linear_qkv / KDA in_proj / dense fc1; run ONCE,
+        on the first step after :meth:`arm_attention_in_gain_revive` matched the loaded iteration. Entries with
         phi(c) < threshold are set to phi_inv(mean phi(c)) and their Adam moments are zeroed. With
         a dead pre-norm gamma AND a dead column gain the bare column receives no gradient and the
         row-sphere projection shrinks it every step, so the pair is an absorbing state; reviving
@@ -1640,7 +1657,7 @@ class MDDecoupling(_MDDecouplingBase):
         with torch.where / mul_.
         """
         thr = self.attention_in_gain_revive_threshold
-        if thr is None or not self._is_attention_in_matrix(p):
+        if thr is None or not self._is_revived_matrix(p):
             return
         state = self.state[p]
         col = state.get("col_gain")
@@ -1663,12 +1680,16 @@ class MDDecoupling(_MDDecouplingBase):
         n = dead.sum()
         self._revive_count = n if self._revive_count is None else self._revive_count + n
 
-    def _is_attention_in_matrix(self, p) -> bool:
-        """Fused attention input projection in the configured scope: softmax linear_qkv always,
-        KDA/GDN in_proj only under attention_in_gain_scope == "all"."""
+    def _is_revived_matrix(self, p) -> bool:
+        """Matrices whose column gain the revive / pull touch: the fused attention input projection
+        in the configured scope (softmax linear_qkv always, KDA/GDN in_proj only under
+        attention_in_gain_scope == "all") and, with dense_mlp_in_gain, the dense MLP linear_fc1.
+        Its column gain is over the input channels like linear_qkv's and sits behind the same kind
+        of fused pre-norm gamma, so the dead-gamma / dead-column absorbing state is the same."""
         return bool(
             self.is_qkv_fn(p)
             or (self.attention_in_gain_scope == "all" and self.is_kda_in_proj_fn(p))
+            or (self.dense_mlp_in_gain and self.is_dense_fc1_fn(p))
         )
 
     def arm_attention_in_gain_revive(self, loaded_iteration: int) -> bool:
@@ -1684,9 +1705,9 @@ class MDDecoupling(_MDDecouplingBase):
     def _report_revive_count(self):
         if self._revive_count is None:
             return
-        # Printed by every rank that owns an attention-in matrix: under the layer-wise optimizer
+        # Printed by every rank that owns a revived matrix: under the layer-wise optimizer
         # they are spread over the DP ranks (rank 0 may own none) and only rank 0 has INFO logging.
-        print(f"[rank {_global_rank()}] attention-in col-gain revive (once, after iteration "
+        print(f"[rank {_global_rank()}] col-gain revive (once, after iteration "
               f"{self.attention_in_gain_revive_iteration}): {int(self._revive_count)} entries reset",
               flush=True)
         self._revive_count = None
@@ -2195,6 +2216,9 @@ def get_megatron_mddecoupling_optimizer(
                 param.merged_offload_expert = True
             if len(param.shape) == 2 and 'linear_qkv.weight' in name:
                 param.is_qkv = True
+            if len(param.shape) == 2 and name.endswith('.mlp.linear_fc1.weight'):
+                # Dense MLP only: experts / shared experts are '.experts.' / '.shared_experts.'.
+                param.is_dense_fc1 = True
             glu_split_dim = _glu_fc1_split_dim(
                 name, param, getattr(cfg, 'gated_linear_unit', False)
             )
@@ -2222,10 +2246,12 @@ def get_megatron_mddecoupling_optimizer(
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
-            if _is_attention_in_pre_norm_gain(name, param, config.md_attention_in_gain_scope):
-                # The gamma fused in front of the attention-in projection: revived together with
-                # the projection's column gain (both are per-input-channel gains on the same input).
-                param.md_attention_in_pre_norm_gain = True
+            if _is_revived_pre_norm_gain(name, param, config.md_attention_in_gain_scope,
+                                         config.md_dense_mlp_in_gain_revive):
+                # The gamma fused in front of the attention-in projection (and, with
+                # --md-dense-mlp-in-gain-revive, the dense MLP fc1): revived together with the
+                # projection's column gain (both are per-input-channel gains on the same input).
+                param.md_revived_pre_norm_gain = True
             if param.md_gain_log_family == "layernorm":
                 # This tagging is just to be able to log layernorm gain under muon_logging
                 param.md_layernorm_gain_offset = float(
@@ -2289,6 +2315,7 @@ def get_megatron_mddecoupling_optimizer(
         qkv_split_shapes=qkv_split_shapes,
         qkv_dim=model_chunks[0].config.kv_channels,
         is_kda_in_proj_fn=lambda p: getattr(p, "is_kda_in_proj", False),
+        is_dense_fc1_fn=lambda p: getattr(p, "is_dense_fc1", False),
         is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
         kv_up_proj_split_shapes=kv_up_proj_split_shapes,
         is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
@@ -2324,6 +2351,7 @@ def get_megatron_mddecoupling_optimizer(
         attention_in_gain_revive_mean=config.md_attention_in_gain_revive_mean,
         attention_in_gain_revive_iteration=config.md_attention_in_gain_revive_iteration,
         attention_in_gain_scope=config.md_attention_in_gain_scope,
+        dense_mlp_in_gain=config.md_dense_mlp_in_gain_revive,
         attention_in_gain_pull_coeff=config.md_attention_in_gain_pull_coeff,
         attention_in_gain_pull_target=config.md_attention_in_gain_pull_target,
     )
@@ -2399,7 +2427,7 @@ def get_megatron_mddecoupling_optimizer(
         # published. The inner optimizer object survives the layer-wise re-wrap (it unwraps the
         # FP32Optimizer and wraps the same torch optimizer), and routing attrs are propagated onto
         # the fp32 main params, so the hook finds the tagged params in its param_groups.
-        hook = make_attention_in_pre_norm_gain_revive_hook(
+        hook = make_pre_norm_gain_revive_hook(
             config.md_attention_in_gain_revive_threshold,
             config.md_attention_in_gain_revive_mean,
             revive_iteration=config.md_attention_in_gain_revive_iteration,

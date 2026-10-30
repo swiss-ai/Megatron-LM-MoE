@@ -3132,6 +3132,11 @@ def _add_training_args(parser):
                        help='Which attention-in projections the revive and the pull touch: the fused '
                        'linear_qkv of the global softmax attention layers only (softmax, default) or '
                        'also the KDA/GDN in_proj (all).')
+    group.add_argument('--md-dense-mlp-in-gain-revive', action='store_true', default=False,
+                       help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
+                       'iteration, mean, coefficient and target) to the pre-norm gamma fused in front '
+                       'of the dense MLP linear_fc1 and to its column gain (the dense layers of a '
+                       'hybrid dense/MoE stack). MoE and shared experts are not touched.')
     group.add_argument('--md-attention-in-gain-pull-coeff', type=float, default=0.0,
                        help='md_decoupling: decoupled pull x <- x - lr * coeff * (x - c) applied '
                        'after the Adam update of the attention-in pre-norm gamma and column gain '

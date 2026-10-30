@@ -2568,7 +2568,7 @@ def test_md_decoupling_revives_attention_in_col_gain(mean_mode):
     dead = eff_before < 1e-12
     assert dead.tolist() == [False, True, False, False]
 
-    optimizer._revive_attention_in_col_gain(param)
+    optimizer._revive_col_gain(param)
 
     eff_after = optimizer._phi(state["col_gain"])
     expected_mean = eff_before.mean() if mean_mode == "all" else eff_before[~dead].mean()
@@ -2586,7 +2586,7 @@ def test_md_decoupling_col_gain_revive_only_touches_attention_in():
     state = optimizer.state[param]
     state["col_gain"][2] = optimizer._phi_inv(torch.tensor(1e-20))
     before = state["col_gain"].clone()
-    optimizer._revive_attention_in_col_gain(param)
+    optimizer._revive_col_gain(param)
     torch.testing.assert_close(state["col_gain"], before)
     assert optimizer._revive_count is None
 
@@ -2610,9 +2610,39 @@ def test_md_decoupling_col_gain_scope_controls_kda_in_proj(scope):
     # collapsed entry with a finite raw value (fp32 softplus_inv underflows to -inf below ~1e-7)
     state["col_gain"][2] = optimizer._phi_inv(torch.tensor(1e-15, dtype=torch.float64)).float()
     before = state["col_gain"].clone()
-    optimizer._pull_attention_in_col_gain(param, optimizer.param_groups[0])
-    optimizer._revive_attention_in_col_gain(param)
+    optimizer._pull_col_gain(param, optimizer.param_groups[0])
+    optimizer._revive_col_gain(param)
     if scope == "softmax":
+        torch.testing.assert_close(state["col_gain"], before)
+        assert optimizer._revive_count is None
+    else:
+        assert optimizer._phi(state["col_gain"])[2] > 1e-3
+        assert not torch.equal(state["col_gain"][[0, 1, 3]], before[[0, 1, 3]])  # pulled
+        assert int(optimizer._revive_count) == 1
+
+
+@pytest.mark.parametrize("dense_mlp_in", [False, True])
+def test_md_decoupling_dense_mlp_in_gain_flag_controls_fc1(dense_mlp_in):
+    """A dense MLP fc1 matrix is neither revived nor pulled by default; dense_mlp_in_gain adds it
+    (same threshold / pull as the attention-in matrices)."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_dense_fc1 = True
+    param.glu_split_dim = 0  # fused gate/up rows like the real GLU fc1
+    optimizer = _glu_fc1_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus", use_orthogonal_updates=False,
+        is_dense_fc1_fn=lambda p: getattr(p, "is_dense_fc1", False),
+        attention_in_gain_revive_threshold=1e-12, attention_in_gain_revive_iteration=48000,
+        dense_mlp_in_gain=dense_mlp_in, attention_in_gain_pull_coeff=0.5,
+    )
+    optimizer._maybe_init_gain_state(param)
+    state = optimizer.state[param]
+    state["col_gain"].fill_(2.0)
+    state["col_gain"][2] = optimizer._phi_inv(torch.tensor(1e-15, dtype=torch.float64)).float()
+    before = state["col_gain"].clone()
+    optimizer._revive_col_gain(param)
+    optimizer._pull_col_gain(param, optimizer.param_groups[0])
+    if not dense_mlp_in:
         torch.testing.assert_close(state["col_gain"], before)
         assert optimizer._revive_count is None
     else:
@@ -2656,20 +2686,30 @@ def test_md_decoupling_step_rebuilds_weight_with_revived_col_gain():
 def test_attention_in_pre_norm_gain_tag_predicate():
     one_d = torch.nn.Parameter(torch.ones(4))
     two_d = torch.nn.Parameter(torch.ones(4, 4))
-    assert md_module._is_attention_in_pre_norm_gain(
+    assert md_module._is_revived_pre_norm_gain(
         "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight", one_d)
     # KDA/GDN in_proj only under scope "all"; the default scope is the softmax layers alone
-    assert not md_module._is_attention_in_pre_norm_gain(
+    assert not md_module._is_revived_pre_norm_gain(
         "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d)
-    assert md_module._is_attention_in_pre_norm_gain(
+    assert md_module._is_revived_pre_norm_gain(
         "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d, scope="all")
-    assert not md_module._is_attention_in_pre_norm_gain(
+    assert not md_module._is_revived_pre_norm_gain(
         "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d, scope="all")
-    assert not md_module._is_attention_in_pre_norm_gain(
+    assert not md_module._is_revived_pre_norm_gain(
         "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d)
-    assert not md_module._is_attention_in_pre_norm_gain(
+    # dense MLP fc1 gamma only with dense_mlp_in; experts / shared experts never
+    assert md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d, dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.mlp.shared_experts.linear_fc1.layer_norm_weight", one_d, dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.mlp.experts.local_experts.0.linear_fc1.layer_norm_weight", one_d,
+        dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.weight", two_d, dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
         "decoder.layers.3.self_attention.q_layernorm.weight", one_d)
-    assert not md_module._is_attention_in_pre_norm_gain(
+    assert not md_module._is_revived_pre_norm_gain(
         "decoder.layers.3.self_attention.linear_qkv.weight", two_d)
 
 
@@ -2680,11 +2720,11 @@ def test_attention_in_pre_norm_gain_revive_hook(offset):
     effective value (stored + offset)."""
     torch.manual_seed(2)
     gamma = torch.nn.Parameter(torch.tensor([1.5, 1e-14, 0.5, 2.0, -1e-14, 1.0]) - offset)
-    gamma.md_attention_in_pre_norm_gain = True
+    gamma.md_revived_pre_norm_gain = True
     gamma.md_layernorm_gain_offset = offset
     other = torch.nn.Parameter(torch.tensor([1e-14, 1.0]))
     adam = torch.optim.AdamW([gamma, other], lr=0.01, weight_decay=0.0)
-    hook = md_module.make_attention_in_pre_norm_gain_revive_hook(1e-8, "all", revive_iteration=48000)
+    hook = md_module.make_pre_norm_gain_revive_hook(1e-8, "all", revive_iteration=48000)
     hook.attach(adam)
     # Tiny gradients on the collapsed entries (as in a run where their Adam v sits far below eps),
     # so the Adam step itself leaves them below the threshold.
@@ -2737,7 +2777,7 @@ def test_md_decoupling_pulls_attention_in_col_gain_toward_target():
     lr = optimizer._gains_lr(group)
     assert lr == group["lr"] == 0.01
 
-    optimizer._pull_attention_in_col_gain(param, group)
+    optimizer._pull_col_gain(param, group)
 
     c_target = optimizer._phi_inv(torch.tensor(1.0))  # softplus_inv(1) ~ 0.5413
     torch.testing.assert_close(state["col_gain"], raw - lr * 0.5 * (raw - c_target))
@@ -2746,11 +2786,11 @@ def test_md_decoupling_pulls_attention_in_col_gain_toward_target():
     optimizer.add_param_group({"params": [untagged]})
     optimizer._maybe_init_gain_state(untagged)
     before = optimizer.state[untagged]["col_gain"].clone()
-    optimizer._pull_attention_in_col_gain(untagged, optimizer.param_groups[1])
+    optimizer._pull_col_gain(untagged, optimizer.param_groups[1])
     torch.testing.assert_close(optimizer.state[untagged]["col_gain"], before)
     optimizer.attention_in_gain_pull_coeff = 0.0
     before = state["col_gain"].clone()
-    optimizer._pull_attention_in_col_gain(param, group)
+    optimizer._pull_col_gain(param, group)
     torch.testing.assert_close(state["col_gain"], before)
 
 
@@ -2759,12 +2799,12 @@ def test_attention_in_pre_norm_gain_pull_hook(offset):
     """gamma <- gamma - lr * coeff * (gamma_eff - target) after the Adam step, no revive."""
     values = torch.tensor([1.5, -0.5, 2.0, 1.0])
     gamma = torch.nn.Parameter(values - offset)
-    gamma.md_attention_in_pre_norm_gain = True
+    gamma.md_revived_pre_norm_gain = True
     gamma.md_layernorm_gain_offset = offset
     other = torch.nn.Parameter(values.clone())
     lr = 0.01
     adam = torch.optim.AdamW([gamma, other], lr=lr, weight_decay=0.0)
-    adam.register_step_post_hook(md_module.make_attention_in_pre_norm_gain_revive_hook(
+    adam.register_step_post_hook(md_module.make_pre_norm_gain_revive_hook(
         None, pull_coeff=0.5, pull_target=1.0))
     gamma.grad = torch.tensor([0.1, -0.2, 0.3, 0.05])
     other.grad = gamma.grad.clone()
@@ -2781,10 +2821,10 @@ def test_attention_in_pre_norm_gain_revive_runs_before_pull(offset):
     moves them by lr*coeff (~2.3e-5 at the run's lr 4.63e-3 and coeff 5e-3), above a 1e-6 threshold."""
     values = torch.tensor([1.9, 1e-11, 2.4, -3e-12, 0.7])
     gamma = torch.nn.Parameter(values - offset)
-    gamma.md_attention_in_pre_norm_gain = True
+    gamma.md_revived_pre_norm_gain = True
     gamma.md_layernorm_gain_offset = offset
     adam = torch.optim.AdamW([gamma], lr=4.633e-3, weight_decay=0.0)
-    hook = md_module.make_attention_in_pre_norm_gain_revive_hook(
+    hook = md_module.make_pre_norm_gain_revive_hook(
         1e-6, "all", revive_iteration=48000, pull_coeff=5e-3, pull_target=1.0)
     hook.attach(adam)
     assert hook.arm(48000)
