@@ -439,20 +439,21 @@ class OptimizerConfig:
     nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
     md_attention_in_gain_revive_threshold: Optional[float] = None
-    """Revive collapsed attention-in gains every step. Applies to the two per-input-channel
-    gains in front of the fused attention input projection (softmax linear_qkv and KDA in_proj):
-    the pre-norm gamma (chained Adam) and the MDDecoupling column gain phi(c). An entry whose
-    effective gain is below this threshold in magnitude is reset to the mean of its gain vector
-    and its Adam moments are zeroed. None disables."""
+    """One-shot revive of collapsed input gains, applied right after loading the checkpoint named
+    by md_attention_in_gain_revive_iteration. Applies to the two per-input-channel gains in front
+    of the input projections in scope (see md_attention_in_gain_scope and
+    md_dense_mlp_in_gain_revive): the pre-norm gamma (chained Adam) and the MDDecoupling column
+    gain phi(c). An entry whose effective gain is below this threshold in magnitude is reset to the
+    mean of its gain vector and its Adam moments are zeroed. None disables."""
 
     md_attention_in_gain_revive_mean: str = 'all'
     """Which entries the revive mean averages over: 'all' (the whole gain vector, including the
     collapsed entries) or 'live' (only the entries at or above the threshold)."""
 
     md_attention_in_gain_revive_iteration: Optional[int] = None
-    """Checkpoint iteration after which the attention-in gain revive runs, once: it fires on the
-    first optimizer step of a process whose loaded checkpoint is this iteration and never again (a
-    resume from any other iteration does not revive). Required with the threshold."""
+    """Checkpoint iteration the one-shot revive is tied to: it runs right after loading exactly this
+    iteration and never again (a resume from any other iteration does not revive). Required with
+    the threshold."""
 
     md_attention_in_gain_scope: str = 'softmax'
     """Which attention-in projections the revive and the pull touch: 'softmax' = the fused
@@ -466,11 +467,11 @@ class OptimizerConfig:
     experts have no fused pre-norm and are never touched."""
 
     md_attention_in_gain_pull_coeff: float = 0.0
-    """Decoupled pull of the attention-in gains toward a target value, applied after their Adam
-    update like AdamW weight decay: x <- x - lr * coeff * (x - c) on the stored parameter, where lr
-    is that parameter's scheduled LR. For the pre-norm gamma x is the gamma itself (c is the target);
-    for a softplus column gain x is the raw gain and c = softplus_inv(target), so the effective gain
-    tends to the target. 0 disables."""
+    """Decoupled weight decay of the revive-scope gains toward a target value instead of 0:
+    x <- x - lr * coeff * (x - c) on the stored parameter, where lr is that parameter's scheduled
+    LR. For the pre-norm gamma x is the gamma itself (c is the target), applied right after the
+    chained Adam step; for a softplus column gain x is the raw gain and c = softplus_inv(target),
+    folded into the gains AdamW decay (on top of --gains-weight-decay). 0 disables."""
 
     md_attention_in_gain_pull_target: float = 1.0
     """Target value c of the attention-in gain pull (effective-gain units)."""

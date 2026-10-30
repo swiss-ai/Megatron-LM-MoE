@@ -19,7 +19,6 @@ machinery, so a single class covers both the gains and no-gains cases.
 """
 
 import logging
-import weakref
 import math
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
@@ -180,102 +179,81 @@ def _is_revived_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "soft
     return scope == "all" and name.endswith("in_proj.layer_norm_weight")
 
 
-_REVIVE_ARMERS: list = []  # weak refs to arm(loaded_iteration) callables (see arm_attention_in_gain_revive)
+@torch.no_grad()
+def _revive_pre_norm_gains(torch_optimizer: torch.optim.Optimizer, threshold: float,
+                           mean_mode: str = "all") -> Optional[torch.Tensor]:
+    """Reset the collapsed entries of every pre-norm gamma tagged ``md_revived_pre_norm_gain`` in
+    ``torch_optimizer`` (the chained Adam): entries whose effective gain (stored value + the
+    zero-centered offset) is below ``threshold`` in magnitude are set to the mean effective gain of
+    their vector and their Adam moments are zeroed. The gamma is replicated across TP and whole per
+    rank under the layer-wise optimizer, so the mean is local. Returns the number of entries reset
+    (a GPU scalar) or None when no tagged gamma lives in this optimizer."""
+    total = None
+    for group in torch_optimizer.param_groups:
+        for p in group["params"]:
+            if not getattr(p, "md_revived_pre_norm_gain", False):
+                continue
+            offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
+            eff = p + offset if offset else p
+            dead = eff.abs() < threshold
+            weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
+            mean_eff = (eff * weight).sum() / weight.sum().clamp_min(1.0)
+            p.copy_(torch.where(dead, (mean_eff - offset).to(p.dtype), p))
+            opt_state = torch_optimizer.state.get(p)
+            if opt_state:
+                keep = ~dead
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in opt_state and torch.is_tensor(opt_state[key]) and opt_state[key].shape == p.shape:
+                        opt_state[key].mul_(keep.to(opt_state[key].dtype))
+            n = dead.sum()
+            total = n if total is None else total + n
+    return total
 
 
-def arm_attention_in_gain_revive(loaded_iteration: int) -> bool:
-    """Arm the one-shot attention-in gain revive of every optimizer built in this process.
+@torch.no_grad()
+def revive_collapsed_gains(optimizer, threshold: float, mean_mode: str = "all") -> int:
+    """One-shot revive of collapsed input gains, run once right after the checkpoint is loaded
+    (see --md-attention-in-gain-revive-iteration in training.py).
 
-    Called by the training loop once the checkpoint is loaded. Each revive (the MDDecoupling column
-    gain and the chained-Adam pre-norm gamma hook) fires on its next optimizer step only when
-    ``loaded_iteration`` equals its ``--md-attention-in-gain-revive-iteration``, then disarms
-    itself; a resume from any other iteration never revives. Returns whether anything was armed.
+    Resets, on the fp32 main params that the optimizers step on, the collapsed entries of
+      - the pre-norm gammas tagged ``md_revived_pre_norm_gain`` (chained Adam), and
+      - the MDDecoupling column gains of the matrices in :meth:`MDDecoupling._is_revived_matrix`,
+    zeroes their moments, then publishes the new values to the model params: main -> model copy
+    on every wrapper, then the layer-wise all-gather so every DP rank sees the owner's values.
+    Returns the number of entries reset on this rank.
     """
-    armed = False
-    for ref in _REVIVE_ARMERS:
-        arm = ref()
-        if arm is not None:
-            armed = bool(arm(loaded_iteration)) or armed
-    return armed
+    from .distrib_optimizer import DistributedOptimizer
 
-
-def make_pre_norm_gain_revive_hook(threshold: Optional[float], mean_mode: str = "all",
-                                   revive_iteration: Optional[int] = None,
-                                   pull_coeff: float = 0.0, pull_target: float = 1.0):
-    """Post-step hook for the chained Adam that owns the revived pre-norm gammas (attention-in and,
-    with --md-dense-mlp-in-gain-revive, dense MLP fc1; see :func:`_is_revived_pre_norm_gain`).
-
-    For every param tagged ``md_revived_pre_norm_gain``, in this order:
-      1. pull (every step, if ``pull_coeff`` > 0): x <- x - lr * pull_coeff * (x - pull_target) on
-         the effective gain (stored value + zero-centered offset), lr = the param group's scheduled
-         LR — the decoupled AdamW-style pull toward a target value;
-      2. revive (ONCE, if ``threshold`` is set): on the first step after ``hook.arm(it)`` was called
-         with ``it == revive_iteration``, entries whose effective gain is below ``threshold`` in
-         magnitude are reset to the mean effective gain of that vector and their Adam moments are
-         zeroed. Attach with ``hook.attach(torch_optimizer)`` so every chained Adam fires once.
-    The gamma is replicated across TP (and whole per rank under the layer-wise optimizer), so the
-    mean is local and identical on every rank that holds it. Runs between the inner ``step()`` and
-    the wrapper's main -> model copy / all-gather, so the new value is what the model sees.
-    Companion of :meth:`MDDecoupling._pull_col_gain` /
-    :meth:`MDDecoupling._revive_col_gain`.
-    """
-    state = {"optimizers": [], "pending": set(), "revived": 0}
-
-    @torch.no_grad()
-    def hook(optimizer, args, kwargs):
-        revive = id(optimizer) in state["pending"]
-        state["pending"].discard(id(optimizer))
-        total = None
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if not getattr(p, "md_revived_pre_norm_gain", False):
-                    continue
-                offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
-                # Revive BEFORE the pull: the pull moves a collapsed entry by ~lr*coeff per step
-                # (2.3e-5 at lr 4.6e-3, coeff 5e-3), which alone lifts it above a 1e-6 threshold
-                # and would make the one-shot revive skip every collapsed entry.
-                if revive:
-                    eff = p + offset if offset else p
-                    dead = eff.abs() < threshold
-                    weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
-                    mean_eff = (eff * weight).sum() / weight.sum().clamp_min(1.0)
-                    p.copy_(torch.where(dead, (mean_eff - offset).to(p.dtype), p))
-                    opt_state = optimizer.state.get(p)
-                    if opt_state:
-                        keep = ~dead
-                        for key in ("exp_avg", "exp_avg_sq"):
-                            if key in opt_state and torch.is_tensor(opt_state[key]) and opt_state[key].shape == p.shape:
-                                opt_state[key].mul_(keep.to(opt_state[key].dtype))
-                    n = dead.sum()
-                    total = n if total is None else total + n
-                if pull_coeff:
-                    # (p + offset) - target == p - (target - offset)
-                    p.sub_((p - (pull_target - offset)) * (group["lr"] * pull_coeff))
-        if revive and total is not None:
-            # Printed by every rank that owns a tagged gamma (rank 0 alone has INFO logging and,
-            # under the layer-wise optimizer, usually owns none of them).
-            n = int(total)
-            state["revived"] += n
-            print(f"[rank {_global_rank()}] pre-norm gain revive (once, after iteration "
-                  f"{revive_iteration}): {n} entries reset", flush=True)
-
-    def attach(torch_optimizer):
-        state["optimizers"].append(torch_optimizer)
-        torch_optimizer.register_step_post_hook(hook)
-
-    def arm(loaded_iteration: int) -> bool:
-        if threshold is None or revive_iteration is None or int(loaded_iteration) != int(revive_iteration):
-            state["pending"] = set()
-            return False
-        state["pending"] = {id(o) for o in state["optimizers"]}
-        return True
-
-    hook.attach = attach
-    hook.arm = arm
-    hook.revive_state = state
-    if threshold is not None:
-        _REVIVE_ARMERS.append(weakref.ref(arm))
-    return hook
+    wrappers = list(getattr(optimizer, "chained_optimizers", [optimizer]))
+    total = None
+    for wrapper in wrappers:
+        # The DistributedOptimizer shards 1-D params across DP ranks: a per-vector mean would be
+        # computed on a fragment. The MD path uses the layer-wise optimizer (whole params).
+        assert not isinstance(wrapper, DistributedOptimizer), (
+            "the gain revive needs whole parameters per rank (layer-wise or non-distributed "
+            "optimizer), not the DistributedOptimizer")
+        if getattr(wrapper, "is_stub_optimizer", False):
+            continue
+        inner = wrapper.optimizer
+        if isinstance(inner, MDDecoupling):
+            n = inner.revive_collapsed_col_gains(threshold, mean_mode)
+        else:
+            n = _revive_pre_norm_gains(inner, threshold, mean_mode)
+        if n is not None:
+            total = n if total is None else total + n
+    for wrapper in wrappers:
+        if not getattr(wrapper, "is_stub_optimizer", False) and hasattr(
+            wrapper, "_copy_main_params_to_model_params"
+        ):
+            wrapper._copy_main_params_to_model_params()
+    if hasattr(optimizer, "allgather_params"):
+        optimizer.allgather_params()
+    n = int(total) if total is not None else 0
+    if n:
+        # Every rank that owns a revived gain prints (under the layer-wise optimizer rank 0 may
+        # own none, and only rank 0 has INFO logging).
+        print(f"[rank {_global_rank()}] gain revive: {n} entries reset", flush=True)
+    return n
 
 
 def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
@@ -1348,7 +1326,8 @@ class MDDecoupling(_MDDecouplingBase):
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
         gains_no_clamp_min: bool = False,
-        # Revive collapsed column gains of the revived matrices (see _revive_col_gain).
+        # Threshold / mean of the one-shot load-time revive (see revive_collapsed_col_gains);
+        # the iteration is only read by training.py.
         attention_in_gain_revive_threshold: Optional[float] = None,
         attention_in_gain_revive_mean: Literal["all", "live"] = "all",
         attention_in_gain_revive_iteration: Optional[int] = None,
@@ -1357,7 +1336,8 @@ class MDDecoupling(_MDDecouplingBase):
         attention_in_gain_scope: Literal["softmax", "all"] = "softmax",
         # Also revive / pull the column gain of the dense MLP linear_fc1 (see _is_revived_matrix).
         dense_mlp_in_gain: bool = False,
-        # Decoupled pull of the revived matrices' column gains toward a target (see _pull_col_gain).
+        # Decoupled pull of the revived matrices' column gains toward a target, folded into the
+        # gains weight decay (see _gains_step).
         attention_in_gain_pull_coeff: float = 0.0,
         attention_in_gain_pull_target: float = 1.0,
         **kwargs,
@@ -1367,14 +1347,8 @@ class MDDecoupling(_MDDecouplingBase):
         self.attention_in_gain_revive_iteration = attention_in_gain_revive_iteration
         self.attention_in_gain_scope = attention_in_gain_scope
         self.dense_mlp_in_gain = dense_mlp_in_gain
-        # One-shot: armed by arm_attention_in_gain_revive(loaded_iteration) after the checkpoint
-        # load, consumed by the next step() (see _revive_col_gain).
-        self._revive_armed = False
-        if attention_in_gain_revive_threshold is not None:
-            _REVIVE_ARMERS.append(weakref.WeakMethod(self.arm_attention_in_gain_revive))
         self.attention_in_gain_pull_coeff = attention_in_gain_pull_coeff
         self.attention_in_gain_pull_target = attention_in_gain_pull_target
-        self._revive_count = None  # GPU-side counter of revived column-gain entries
         self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
         self.hypersphere_gains_mode_output = (
             None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
@@ -1602,8 +1576,6 @@ class MDDecoupling(_MDDecouplingBase):
             with torch.enable_grad():
                 loss = closure()
 
-        revive = self._revive_armed
-        self._revive_armed = False
         for group in self.param_groups:
             group["step"] += 1
             if "momentum_beta" not in group:
@@ -1614,71 +1586,53 @@ class MDDecoupling(_MDDecouplingBase):
                     gain_grads = self._preprocess_gains(p)
                     self._param_step(p, group)
                     self._gains_step(p, group, gain_grads)
-                    # Between the gains step and the re-apply, so the effective weight is
-                    # rebuilt with the pulled / revived phi(c): p = bare_p * phi(r) * phi(c_new).
-                    # Revive before the pull (see the gamma hook): the pull alone would lift a
-                    # collapsed gain above the threshold and the one-shot revive would skip it.
-                    if revive:
-                        self._revive_col_gain(p)
-                    self._pull_col_gain(p, group)
                     self._apply_gains(p)
-        if revive:
-            self._report_revive_count()
 
         return loss
 
     @torch.no_grad()
-    def _pull_col_gain(self, p, group):
-        """Decoupled pull of a revived matrix's column gain toward the target, after its Adam step:
-        c <- c - lr * coeff * (c - c_target) on the stored (raw) gain, with c_target =
-        phi_inv(target) so the effective gain phi(c) tends to the target. lr is the gains LR of
-        this step (same schedule as _gains_step), so the pull decays with the schedule like AdamW
-        weight decay does."""
-        coeff = self.attention_in_gain_pull_coeff
-        if coeff == 0.0 or not self._is_revived_matrix(p):
-            return
-        col = self.state[p].get("col_gain")
-        if col is None:
-            return
-        target = self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=col.dtype, device=col.device))
-        col.sub_((col - target) * (self._gains_lr(group) * coeff))
+    def revive_collapsed_col_gains(self, threshold: float, mean_mode: str = "all") -> Optional[torch.Tensor]:
+        """Load-time half of :func:`revive_collapsed_gains` for the MDDecoupling column gains.
 
-    @torch.no_grad()
-    def _revive_col_gain(self, p):
-        """Reset collapsed column gains of the revived input projections (_is_revived_matrix).
-
-        Mirror of the pre-norm gamma revive in :func:`make_pre_norm_gain_revive_hook`
-        for the MDDecoupling column gain phi(c) of linear_qkv / KDA in_proj / dense fc1; run ONCE,
-        on the first step after :meth:`arm_attention_in_gain_revive` matched the loaded iteration. Entries with
-        phi(c) < threshold are set to phi_inv(mean phi(c)) and their Adam moments are zeroed. With
-        a dead pre-norm gamma AND a dead column gain the bare column receives no gradient and the
-        row-sphere projection shrinks it every step, so the pair is an absorbing state; reviving
-        the gain restores the gradient into that bare column. No host sync: masks are applied
-        with torch.where / mul_.
+        For every matrix in :meth:`_is_revived_matrix` with a column gain, entries with
+        phi(c) < threshold are set to phi_inv(mean phi(c)) and their gain Adam moments are zeroed.
+        The stored param is the effective weight bare * phi(r) * phi(c), so the revived columns are
+        rescaled by phi(c_new) / phi(c_old) (with _preprocess_gains' clamp on the divisor) to keep
+        the bare weight unchanged; live columns are multiplied by exactly 1. With a dead pre-norm
+        gamma AND a dead column gain the bare column receives no gradient and the row-sphere
+        projection shrinks it every step, so the pair is an absorbing state; reviving the gain
+        restores the gradient into that bare column. Returns the number of entries reset (a GPU
+        scalar) or None when this optimizer holds no such matrix.
         """
-        thr = self.attention_in_gain_revive_threshold
-        if thr is None or not self._is_revived_matrix(p):
-            return
-        state = self.state[p]
-        col = state.get("col_gain")
-        if col is None:
-            return
-        eff = self._phi(col)
-        dead = eff.abs() < thr
-        weight = torch.ones_like(eff) if self.attention_in_gain_revive_mean == "all" else (~dead).to(eff.dtype)
-        total = torch.stack([(eff * weight).sum(), weight.sum()])
-        # The column gain is sharded only when the matrix is row-parallel (partition_dim == 1);
-        # reduce so every TP rank revives to the same global mean.
-        if self.pg_collection is not None and _tp_partition_dim(p) == 1:
-            tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
-            torch.distributed.all_reduce(total, group=tp_group)
-        mean_eff = total[0] / total[1].clamp_min(1.0)
-        col.copy_(torch.where(dead, self._phi_inv(mean_eff).to(col.dtype), col))
-        keep = (~dead).to(col.dtype)
-        state["col_gain_m"].mul_(keep)
-        state["col_gain_v"].mul_(keep)
-        n = dead.sum()
-        self._revive_count = n if self._revive_count is None else self._revive_count + n
+        total = None
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not self._is_revived_matrix(p):
+                    continue
+                state = self.state.get(p)
+                col = state.get("col_gain") if state else None
+                if col is None:
+                    continue
+                old_eff = self._phi(col)
+                dead = old_eff.abs() < threshold
+                weight = torch.ones_like(old_eff) if mean_mode == "all" else (~dead).to(old_eff.dtype)
+                sums = torch.stack([(old_eff * weight).sum(), weight.sum()])
+                # The column gain is sharded only when the matrix is row-parallel (partition_dim
+                # == 1); reduce so every TP rank revives to the same global mean.
+                if self.pg_collection is not None and _tp_partition_dim(p) == 1:
+                    tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
+                    torch.distributed.all_reduce(sums, group=tp_group)
+                mean_eff = sums[0] / sums[1].clamp_min(1.0)
+                col.copy_(torch.where(dead, self._phi_inv(mean_eff).to(col.dtype), col))
+                divisor = old_eff if self.gains_no_clamp_min else old_eff.clamp_min(1e-8)
+                scale = torch.where(dead, self._phi(col) / divisor, torch.ones_like(old_eff))
+                p.mul_(scale[self._gain_layout(p)["col_bk"]].to(p.dtype))
+                keep = (~dead).to(col.dtype)
+                state["col_gain_m"].mul_(keep)
+                state["col_gain_v"].mul_(keep)
+                n = dead.sum()
+                total = n if total is None else total + n
+        return total
 
     def _is_revived_matrix(self, p) -> bool:
         """Matrices whose column gain the revive / pull touch: the fused attention input projection
@@ -1691,26 +1645,6 @@ class MDDecoupling(_MDDecouplingBase):
             or (self.attention_in_gain_scope == "all" and self.is_kda_in_proj_fn(p))
             or (self.dense_mlp_in_gain and self.is_dense_fc1_fn(p))
         )
-
-    def arm_attention_in_gain_revive(self, loaded_iteration: int) -> bool:
-        """Arm the one-shot column-gain revive for the next step() iff the checkpoint loaded in this
-        process is the configured --md-attention-in-gain-revive-iteration."""
-        self._revive_armed = (
-            self.attention_in_gain_revive_threshold is not None
-            and self.attention_in_gain_revive_iteration is not None
-            and int(loaded_iteration) == int(self.attention_in_gain_revive_iteration)
-        )
-        return self._revive_armed
-
-    def _report_revive_count(self):
-        if self._revive_count is None:
-            return
-        # Printed by every rank that owns a revived matrix: under the layer-wise optimizer
-        # they are spread over the DP ranks (rank 0 may own none) and only rank 0 has INFO logging.
-        print(f"[rank {_global_rank()}] col-gain revive (once, after iteration "
-              f"{self.attention_in_gain_revive_iteration}): {int(self._revive_count)} entries reset",
-              flush=True)
-        self._revive_count = None
 
     @torch.no_grad()
     def _preprocess_gains(self, p):
@@ -1825,14 +1759,23 @@ class MDDecoupling(_MDDecouplingBase):
         self._gain_bc1_buf.fill_(bias_correction1)
         self._gain_bc2_buf.fill_(bias_correction2)
 
+        # Pull of a revived matrix's column gain toward phi_inv(target), folded into the decoupled
+        # weight decay: g <- g - lr * (wd * g + coeff * (g - t)) = g - lr * (wd + coeff) * (g - t'),
+        # t' = coeff * t / (wd + coeff). The default path keeps the plain decay toward 0.
+        coeff = self.attention_in_gain_pull_coeff
+        pull_col = bool(coeff) and "col_gain" in gain_grads and self._is_revived_matrix(p)
         for name, grad in gain_grads.items():
             gain = state[name]
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
+            name_wd, name_target = wd, 0.0
+            if pull_col and name == "col_gain":
+                t = float(self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=torch.float64)))
+                name_wd, name_target = wd + coeff, coeff * t / (wd + coeff)
             _fused_gain_adam(
                 gain, m, v, grad,
                 self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
-                beta1, beta2, eps, wd,
+                beta1, beta2, eps, name_wd, name_target,
             )
 
     def _gains_lr(self, group) -> float:
@@ -1879,20 +1822,23 @@ class MDDecoupling(_MDDecouplingBase):
 
 
 @torch.compile(dynamic=True)
-def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
+def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd, wd_target=0.0):
     """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
 
     lr / bc1 / bc2 are 0-dim tensors (they change every step, so passing them as
     tensors instead of Python floats avoids per-step recompilation); beta1, beta2,
-    eps and wd are run constants. `dynamic=True` shares one graph across the
+    eps, wd and wd_target are run constants. `dynamic=True` shares one graph across the
     differently shaped gain tensors. Equivalent to the eager update:
-        if wd: gain *= 1 - lr*wd
+        if wd: gain -= lr*wd * (gain - wd_target)   (gain *= 1 - lr*wd when wd_target == 0)
         m  = beta1*m + (1-beta1)*grad
         v  = beta2*v + (1-beta2)*grad^2
         gain -= (lr/bc1) * m / (v.sqrt()/bc2.sqrt() + eps)
     """
     if wd != 0.0:
-        gain.mul_(1.0 - lr * wd)
+        if wd_target == 0.0:
+            gain.mul_(1.0 - lr * wd)
+        else:
+            gain.sub_((gain - wd_target) * (lr * wd))
     m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
     v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
     denom = (v.sqrt() / bc2.sqrt()).add_(eps)
@@ -2257,6 +2203,15 @@ def get_megatron_mddecoupling_optimizer(
                 param.md_layernorm_gain_offset = float(
                     getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
                 )
+            if getattr(param, "md_revived_pre_norm_gain", False) and config.md_attention_in_gain_pull_coeff:
+                # Pull of the gamma toward the target, applied by the chained Adam's wrapper right
+                # after its step (see _decay_to_target in optimizer.py), on the stored value:
+                # (p + offset) - target == p - (target - offset).
+                param.md_decay_to_target = (
+                    float(config.md_attention_in_gain_pull_coeff),
+                    float(config.md_attention_in_gain_pull_target)
+                    - float(getattr(param, "md_layernorm_gain_offset", 0.0)),
+                )
             module_name = name.rpartition('.')[0]
             while module_name:
                 module = named_modules.get(module_name)
@@ -2418,24 +2373,6 @@ def get_megatron_mddecoupling_optimizer(
     # Unfreeze everything.
     for param in linear_params:
         param.requires_grad = True
-
-    if (config.md_attention_in_gain_revive_threshold is not None
-            or config.md_attention_in_gain_pull_coeff):
-        # The pre-norm gamma lives in the chained Adam. A torch post-step hook on the inner
-        # optimizer runs right after its step() and before the Float16 wrapper copies main ->
-        # model params (or the layer-wise wrapper all-gathers), so the new value is what gets
-        # published. The inner optimizer object survives the layer-wise re-wrap (it unwraps the
-        # FP32Optimizer and wraps the same torch optimizer), and routing attrs are propagated onto
-        # the fp32 main params, so the hook finds the tagged params in its param_groups.
-        hook = make_pre_norm_gain_revive_hook(
-            config.md_attention_in_gain_revive_threshold,
-            config.md_attention_in_gain_revive_mean,
-            revive_iteration=config.md_attention_in_gain_revive_iteration,
-            pull_coeff=config.md_attention_in_gain_pull_coeff,
-            pull_target=config.md_attention_in_gain_pull_target,
-        )
-        for adam in chained_adam.chained_optimizers:
-            hook.attach(adam.optimizer)
 
     init_fns = [_md_init_state_fn] + len(chained_adam.chained_optimizers) * [_adam_init_state_fn]
     optimizers += chained_adam.chained_optimizers

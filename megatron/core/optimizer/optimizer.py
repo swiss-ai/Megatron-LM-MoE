@@ -110,6 +110,7 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'md_gain_log_layer',
     'md_layernorm_gain_offset',
     'md_revived_pre_norm_gain',
+    'md_decay_to_target',
     'is_embedding_or_output_parameter',
     'is_embedding_parameter',
     'is_md_embedding_parameter',
@@ -117,6 +118,20 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'merged_offload_expert',
     'glu_split_dim',
 )
+
+
+@torch.no_grad()
+def _decay_to_target(torch_optimizer: torch.optim.Optimizer) -> None:
+    """Decoupled weight decay toward a target for params tagged ``md_decay_to_target =
+    (coeff, target)``: p <- p - lr * coeff * (p - target), lr = the param group's scheduled LR.
+    Runs right after the inner optimizer step, before the main -> model copy. No-op for untagged
+    params (the default)."""
+    for group in torch_optimizer.param_groups:
+        for p in group["params"]:
+            spec = getattr(p, "md_decay_to_target", None)
+            if spec is not None:
+                coeff, target = spec
+                p.sub_((p - target) * (group["lr"] * coeff))
 
 
 def _propagate_routing_attrs(main_param, model_param):
@@ -625,6 +640,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
         if not self.is_stub_optimizer:
             self.optimizer.step()
+            _decay_to_target(self.optimizer)
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -1048,6 +1064,7 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         self.optimizer.step()
+        _decay_to_target(self.optimizer)
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
