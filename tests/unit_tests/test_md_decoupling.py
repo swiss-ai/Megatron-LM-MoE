@@ -2531,3 +2531,237 @@ def test_md_decoupling_layerwise_preserves_mla_and_gqa_parameter_tags(monkeypatc
     assert any(p is kv_up for p in sharded_params) and kv_up.is_kv_up_proj
     assert any(p is q_up for p in sharded_params) and q_up.is_q_up_proj
     assert any(p is qkv_down for p in sharded_params) and qkv_down.is_qkv_down_proj
+
+
+# ---------------------------------------------------------------------------------------------
+# Gain revive (--md-attention-in-gain-revive-threshold), applied once at load time
+
+
+def _revive_matrix_optimizer(param, **kwargs):
+    optimizer = _gqa_qkv_optimizer(
+        param,
+        hypersphere_mode="row",
+        hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus",
+        use_orthogonal_updates=False,
+        is_kda_in_proj_fn=lambda p: getattr(p, "is_kda_in_proj", False),
+        is_dense_fc1_fn=lambda p: getattr(p, "is_dense_fc1", False),
+        **kwargs,
+    )
+    optimizer._maybe_init_gain_state(param)
+    return optimizer
+
+
+def _collapse_col(optimizer, param, idx, value=1e-15):
+    """Collapse column gain entries ``idx`` and bake them into the effective weight."""
+    state = optimizer.state[param]
+    for i in idx:
+        # finite raw value (fp32 softplus_inv underflows to -inf below ~1e-7)
+        state["col_gain"][i] = optimizer._phi_inv(torch.tensor(value, dtype=torch.float64)).float()
+    param.data.copy_(torch.nn.functional.normalize(torch.randn_like(param), dim=1))
+    optimizer._apply_gains(param)
+    state["col_gain_m"].fill_(0.3)
+    state["col_gain_v"].fill_(0.2)
+
+
+@pytest.mark.parametrize("mean_mode", ["all", "live"])
+def test_revive_collapsed_col_gains(mean_mode):
+    """Dead column gains go to phi_inv(mean phi(c)), their moments are zeroed, the bare weight of
+    the revived columns is kept and the live columns of the effective weight are bitwise unchanged."""
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _revive_matrix_optimizer(param)
+    state = optimizer.state[param]
+    _collapse_col(optimizer, param, [1, 3])
+    old_eff = optimizer._phi(state["col_gain"]).clone()
+    old_p = param.detach().clone()
+    dead = torch.tensor([False, True, False, True])
+
+    n = optimizer.revive_collapsed_col_gains(1e-12, mean_mode)
+
+    assert int(n) == 2
+    new_eff = optimizer._phi(state["col_gain"])
+    expected_mean = old_eff.mean() if mean_mode == "all" else old_eff[~dead].mean()
+    torch.testing.assert_close(new_eff[dead], expected_mean.expand(2), rtol=1e-5, atol=1e-6)
+    assert torch.equal(new_eff[~dead], old_eff[~dead])
+    assert torch.equal(param.detach()[:, ~dead], old_p[:, ~dead]), "live columns must be untouched"
+    torch.testing.assert_close(
+        param.detach()[:, dead], old_p[:, dead] / old_eff[dead].clamp_min(1e-8) * new_eff[dead])
+    assert state["col_gain_m"][dead].abs().max() == 0 and state["col_gain_v"][dead].abs().max() == 0
+    assert state["col_gain_m"][~dead].min() > 0
+
+
+def test_revive_collapsed_col_gains_skips_other_matrices():
+    param = torch.nn.Parameter(torch.randn(8, 4))  # not tagged as an input projection
+    optimizer = _revive_matrix_optimizer(param)
+    _collapse_col(optimizer, param, [2])
+    before = optimizer.state[param]["col_gain"].clone()
+    assert optimizer.revive_collapsed_col_gains(1e-12) is None
+    torch.testing.assert_close(optimizer.state[param]["col_gain"], before)
+
+
+@pytest.mark.parametrize("tag,kwargs,included", [
+    ("is_kda_in_proj", {}, False),
+    ("is_kda_in_proj", {"attention_in_gain_scope": "all"}, True),
+    ("is_dense_fc1", {}, False),
+    ("is_dense_fc1", {"dense_mlp_in_gain": True}, True),
+])
+def test_revive_scope_flags(tag, kwargs, included):
+    """KDA in_proj only under scope 'all'; dense MLP fc1 only with dense_mlp_in_gain."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    setattr(param, tag, True)
+    if tag == "is_kda_in_proj":
+        param.kda_split_shapes = (2, 2, 2, 2)  # q, k, v, gate rows of the fused in_proj (TP 1)
+    else:
+        param.glu_split_dim = 0  # fused gate/up rows like the real GLU fc1
+    optimizer = _revive_matrix_optimizer(param, **kwargs)
+    _collapse_col(optimizer, param, [2])
+    n = optimizer.revive_collapsed_col_gains(1e-12)
+    phi_c = optimizer._phi(optimizer.state[param]["col_gain"])[2]
+    if included:
+        assert int(n) == 1 and phi_c > 1e-3
+    else:
+        assert n is None and phi_c < 1e-12
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_revive_pre_norm_gains(offset):
+    """Collapsed gammas go to the vector mean (effective units), their Adam moments are zeroed,
+    untagged params are untouched."""
+    gamma = torch.nn.Parameter(torch.tensor([1.5, 1e-14, 0.5, 2.0, -1e-14, 1.0]) - offset)
+    gamma.md_revived_pre_norm_gain = True
+    gamma.md_layernorm_gain_offset = offset
+    other = torch.nn.Parameter(torch.tensor([1e-14, 1.0]))
+    adam = torch.optim.AdamW([gamma, other], lr=0.0, weight_decay=0.0)  # lr 0: state only
+    gamma.grad = torch.full((6,), 0.1)
+    other.grad = torch.full((2,), 0.1)
+    adam.step()
+    dead = torch.tensor([False, True, False, False, True, False])
+
+    n = md_module._revive_pre_norm_gains(adam, 1e-8, "all")
+
+    assert int(n) == 2
+    eff = gamma.detach() + offset
+    torch.testing.assert_close(eff[dead], torch.full((2,), 5.0 / 6), rtol=1e-5, atol=1e-7)
+    state = adam.state[gamma]
+    assert state["exp_avg"][dead].abs().max() == 0 and state["exp_avg_sq"][dead].abs().max() == 0
+    assert state["exp_avg"][~dead].abs().min() > 0
+    assert abs(float(other[0])) < 1e-8, "untagged param must not be revived"
+
+
+def test_revive_collapsed_gains_publishes_to_model_params():
+    """The load-time entry point revives both optimizers, then copies main -> model on every
+    wrapper and all-gathers once."""
+    calls = []
+
+    class _Wrapper:
+        def __init__(self, inner):
+            self.optimizer = inner
+            self.is_stub_optimizer = False
+
+        def _copy_main_params_to_model_params(self):
+            calls.append("copy")
+
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    md = _revive_matrix_optimizer(param)
+    _collapse_col(md, param, [0])
+    gamma = torch.nn.Parameter(torch.tensor([1e-14, 1.0, 2.0]))
+    gamma.md_revived_pre_norm_gain = True
+    adam = torch.optim.AdamW([gamma], lr=0.0)
+    chained = SimpleNamespace(
+        chained_optimizers=[_Wrapper(md), _Wrapper(adam)],
+        allgather_params=lambda: calls.append("allgather"),
+    )
+
+    assert md_module.revive_collapsed_gains(chained, 1e-8) == 2
+    assert calls == ["copy", "copy", "allgather"]
+    assert md._phi(md.state[param]["col_gain"])[0] > 1e-3 and float(gamma[0]) > 1.0
+
+
+def test_attention_in_pre_norm_gain_tag_predicate():
+    one_d = torch.nn.Parameter(torch.ones(4))
+    two_d = torch.nn.Parameter(torch.ones(4, 4))
+    assert md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight", one_d)
+    # KDA/GDN in_proj only under scope "all"; the default scope is the softmax layers alone
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d)
+    assert md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d, scope="all")
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d, scope="all")
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d)
+    # dense MLP fc1 gamma only with dense_mlp_in; experts / shared experts never
+    assert md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d, dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.mlp.shared_experts.linear_fc1.layer_norm_weight", one_d, dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.mlp.experts.local_experts.0.linear_fc1.layer_norm_weight", one_d,
+        dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.weight", two_d, dense_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.self_attention.q_layernorm.weight", one_d)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.self_attention.linear_qkv.weight", two_d)
+
+
+# ---------------------------------------------------------------------------------------------
+# Pull toward a target (--md-attention-in-gain-pull-coeff / --md-attention-in-gain-pull-target)
+
+
+@pytest.mark.parametrize("gains_wd", [0.0, 0.1])
+def test_col_gain_pull_folded_into_gains_weight_decay(gains_wd):
+    """With zero gradient the gains Adam update is 0, so _gains_step leaves only the decay:
+    col gain of a revive-scope matrix g - lr*(wd*g + coeff*(g - t)), t = softplus_inv(1); the row
+    gain and other matrices keep the plain decay g*(1 - lr*wd)."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    untagged = torch.nn.Parameter(torch.randn(8, 4))
+    optimizer = _revive_matrix_optimizer(
+        param, gains_weight_decay=gains_wd,
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0)
+    optimizer.add_param_group({"params": [untagged]})
+    optimizer._maybe_init_gain_state(untagged)
+    raw = torch.tensor([-3.0, 0.0, 2.0, 5.0])
+    for p in (param, untagged):
+        optimizer.state[p]["col_gain"].copy_(raw)
+        optimizer.state[p]["row_gain"].fill_(1.5)
+    lr = 0.01
+    t = float(optimizer._phi_inv(torch.tensor(1.0, dtype=torch.float64)))
+    for p, group in ((param, optimizer.param_groups[0]), (untagged, optimizer.param_groups[1])):
+        group["step"] = 1
+        optimizer._gains_step(p, group, {"col_gain": torch.zeros(4), "row_gain": torch.zeros(8)})
+
+    torch.testing.assert_close(
+        optimizer.state[param]["col_gain"], raw - lr * (gains_wd * raw + 0.5 * (raw - t)))
+    torch.testing.assert_close(optimizer.state[untagged]["col_gain"], raw * (1 - lr * gains_wd))
+    torch.testing.assert_close(
+        optimizer.state[param]["row_gain"], torch.full((8,), 1.5 * (1 - lr * gains_wd)))
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_decay_to_target_after_inner_step(offset):
+    """gamma <- gamma - lr * coeff * (gamma_eff - target) after the Adam step; the tag stores the
+    target in stored units (target - offset); untagged params get the plain Adam step."""
+    from megatron.core.optimizer.optimizer import _decay_to_target
+
+    values = torch.tensor([1.5, -0.5, 2.0, 1.0])
+    gamma = torch.nn.Parameter(values - offset)
+    gamma.md_decay_to_target = (0.5, 1.0 - offset)
+    other = torch.nn.Parameter(values.clone())
+    lr = 0.01
+    adam = torch.optim.AdamW([gamma, other], lr=lr, weight_decay=0.0)
+    gamma.grad = torch.tensor([0.1, -0.2, 0.3, 0.05])
+    other.grad = gamma.grad.clone()
+    adam.step()
+    plain = other.detach().clone()
+
+    _decay_to_target(adam)
+
+    assert torch.equal(other.detach(), plain)
+    torch.testing.assert_close(gamma.detach() + offset, plain - lr * 0.5 * (plain - 1.0))

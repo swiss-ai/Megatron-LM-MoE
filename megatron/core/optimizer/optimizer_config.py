@@ -438,6 +438,44 @@ class OptimizerConfig:
     through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
     nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
+    md_attention_in_gain_revive_threshold: Optional[float] = None
+    """One-shot revive of collapsed input gains, applied right after loading the checkpoint named
+    by md_attention_in_gain_revive_iteration. Applies to the two per-input-channel gains in front
+    of the input projections in scope (see md_attention_in_gain_scope and
+    md_dense_mlp_in_gain_revive): the pre-norm gamma (chained Adam) and the MDDecoupling column
+    gain phi(c). An entry whose effective gain is below this threshold in magnitude is reset to the
+    mean of its gain vector and its Adam moments are zeroed. None disables."""
+
+    md_attention_in_gain_revive_mean: str = 'all'
+    """Which entries the revive mean averages over: 'all' (the whole gain vector, including the
+    collapsed entries) or 'live' (only the entries at or above the threshold)."""
+
+    md_attention_in_gain_revive_iteration: Optional[int] = None
+    """Checkpoint iteration the one-shot revive is tied to: it runs right after loading exactly this
+    iteration and never again (a resume from any other iteration does not revive). Required with
+    the threshold."""
+
+    md_attention_in_gain_scope: str = 'softmax'
+    """Which attention-in projections the revive and the pull touch: 'softmax' = the fused
+    linear_qkv (pre-norm gamma + column gain) of the global softmax attention layers only;
+    'all' adds the KDA/GDN in_proj."""
+
+    md_dense_mlp_in_gain_revive: bool = False
+    """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
+    coefficient and target) to the gamma fused in front of the dense MLP linear_fc1 and to that
+    matrix's column gain: the dense layers of a hybrid dense/MoE stack. MoE experts and shared
+    experts have no fused pre-norm and are never touched."""
+
+    md_attention_in_gain_pull_coeff: float = 0.0
+    """Decoupled weight decay of the revive-scope gains toward a target value instead of 0:
+    x <- x - lr * coeff * (x - c) on the stored parameter, where lr is that parameter's scheduled
+    LR. For the pre-norm gamma x is the gamma itself (c is the target), applied right after the
+    chained Adam step; for a softplus column gain x is the raw gain and c = softplus_inv(target),
+    folded into the gains AdamW decay (on top of --gains-weight-decay). 0 disables."""
+
+    md_attention_in_gain_pull_target: float = 1.0
+    """Target value c of the attention-in gain pull (effective-gain units)."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed

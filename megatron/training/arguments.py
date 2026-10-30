@@ -1644,6 +1644,10 @@ def validate_args(args, defaults={}):
                 "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
                 "softplus gains are positive, so the clamp only changes values below 1e-8."
             )
+        if args.md_attention_in_gain_revive_threshold is not None:
+            assert args.md_attention_in_gain_revive_iteration is not None, (
+                "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
+                "(the checkpoint iteration after which the one-shot revive runs).")
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
                 "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
@@ -3108,6 +3112,38 @@ def _add_training_args(parser):
                        help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
                        'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
                        'including small or negative gains.')
+    group.add_argument('--md-attention-in-gain-revive-threshold', type=float, default=None,
+                       help='md_decoupling: ONCE, right after loading the checkpoint named by '
+                       '--md-attention-in-gain-revive-iteration, reset the pre-norm gamma and column '
+                       'gain entries whose effective value is below this magnitude to the mean of '
+                       'their gain vector, and zero their Adam moments. Only the input projections '
+                       'in scope (see --md-attention-in-gain-scope, --md-dense-mlp-in-gain-revive). '
+                       'Off when unset.')
+    group.add_argument('--md-attention-in-gain-revive-iteration', type=int, default=None,
+                       help='Checkpoint iteration the one-shot revive is tied to: it runs only when '
+                       'exactly this iteration is loaded; a resume from any later (or earlier) '
+                       'checkpoint never revives again. Required with the threshold.')
+    group.add_argument('--md-attention-in-gain-revive-mean', type=str, default='all',
+                       choices=['all', 'live'],
+                       help='Entries the revive mean averages over: the whole gain vector (all) '
+                       'or only the entries at or above the threshold (live).')
+    group.add_argument('--md-attention-in-gain-scope', type=str, default='softmax',
+                       choices=['softmax', 'all'],
+                       help='Which attention-in projections the revive and the pull touch: the fused '
+                       'linear_qkv of the global softmax attention layers only (softmax, default) or '
+                       'also the KDA/GDN in_proj (all).')
+    group.add_argument('--md-dense-mlp-in-gain-revive', action='store_true', default=False,
+                       help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
+                       'iteration, mean, coefficient and target) to the pre-norm gamma fused in front '
+                       'of the dense MLP linear_fc1 and to its column gain (the dense layers of a '
+                       'hybrid dense/MoE stack). MoE and shared experts are not touched.')
+    group.add_argument('--md-attention-in-gain-pull-coeff', type=float, default=0.0,
+                       help='md_decoupling: decoupled weight decay toward a target, '
+                       'x <- x - lr * coeff * (x - c), on the pre-norm gamma and column gain of the '
+                       'input projections in scope (raw softplus gain pulled to softplus_inv(c)). '
+                       '0 disables.')
+    group.add_argument('--md-attention-in-gain-pull-target', type=float, default=1.0,
+                       help='Target c of --md-attention-in-gain-pull-coeff, in effective-gain units.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

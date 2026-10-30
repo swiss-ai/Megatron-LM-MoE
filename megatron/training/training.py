@@ -1876,6 +1876,24 @@ def setup_model_and_optimizer(
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
+    if getattr(args, 'md_attention_in_gain_revive_threshold', None) is not None:
+        # One-shot gain revive: applied here, on the state just loaded, only when that checkpoint
+        # is --md-attention-in-gain-revive-iteration; a resume from any other iteration never
+        # revives again (see md_decoupling.revive_collapsed_gains).
+        revive = args.iteration == args.md_attention_in_gain_revive_iteration
+        if revive:
+            from megatron.core.optimizer.md_decoupling import revive_collapsed_gains
+            revive_collapsed_gains(
+                optimizer,
+                args.md_attention_in_gain_revive_threshold,
+                args.md_attention_in_gain_revive_mean,
+            )
+        print_rank_0(
+            f'gain revive: loaded iteration {args.iteration}, revive iteration '
+            f'{args.md_attention_in_gain_revive_iteration} -> '
+            f'{"applied" if revive else "skipped (other checkpoint)"}'
+        )
+
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
