@@ -3127,6 +3127,11 @@ def _add_training_args(parser):
                        choices=['all', 'live'],
                        help='Entries the revive mean averages over: the whole gain vector (all) '
                        'or only the entries at or above the threshold (live).')
+    group.add_argument('--md-attention-in-gain-scope', type=str, default='softmax',
+                       choices=['softmax', 'all'],
+                       help='Which attention-in projections the revive and the pull touch: the fused '
+                       'linear_qkv of the global softmax attention layers only (softmax, default) or '
+                       'also the KDA/GDN in_proj (all).')
     group.add_argument('--md-attention-in-gain-pull-coeff', type=float, default=0.0,
                        help='md_decoupling: decoupled pull x <- x - lr * coeff * (x - c) applied '
                        'after the Adam update of the attention-in pre-norm gamma and column gain '

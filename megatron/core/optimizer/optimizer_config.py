@@ -454,6 +454,11 @@ class OptimizerConfig:
     first optimizer step of a process whose loaded checkpoint is this iteration and never again (a
     resume from any other iteration does not revive). Required with the threshold."""
 
+    md_attention_in_gain_scope: str = 'softmax'
+    """Which attention-in projections the revive and the pull touch: 'softmax' = the fused
+    linear_qkv (pre-norm gamma + column gain) of the global softmax attention layers only;
+    'all' adds the KDA/GDN in_proj."""
+
     md_attention_in_gain_pull_coeff: float = 0.0
     """Decoupled pull of the attention-in gains toward a target value, applied after their Adam
     update like AdamW weight decay: x <- x - lr * coeff * (x - c) on the stored parameter, where lr

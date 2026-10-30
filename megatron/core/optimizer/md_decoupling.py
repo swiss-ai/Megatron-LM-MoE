@@ -157,15 +157,18 @@ def _global_rank() -> int:
     return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
 
-def _is_attention_in_pre_norm_gain(name: str, param: torch.Tensor) -> bool:
-    """The norm gain fused in front of the attention input projection (TELayerNormColumnParallel
-    linear_qkv for softmax attention, in_proj for KDA/GDN). It multiplies the same per-input-channel
-    axis as that projection's MDDecoupling column gain."""
-    return (
-        param.ndim == 1
-        and ".self_attention." in name
-        and (name.endswith("linear_qkv.layer_norm_weight") or name.endswith("in_proj.layer_norm_weight"))
-    )
+def _is_attention_in_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "softmax") -> bool:
+    """The norm gain fused in front of the attention input projection. It multiplies the same
+    per-input-channel axis as that projection's MDDecoupling column gain.
+
+    ``scope`` selects which attention variants count: ``"softmax"`` (default) is the global softmax
+    attention only (TELayerNormColumnParallel linear_qkv); ``"all"`` adds the KDA/GDN in_proj.
+    """
+    if param.ndim != 1 or ".self_attention." not in name:
+        return False
+    if name.endswith("linear_qkv.layer_norm_weight"):
+        return True
+    return scope == "all" and name.endswith("in_proj.layer_norm_weight")
 
 
 _REVIVE_ARMERS: list = []  # weak refs to arm(loaded_iteration) callables (see arm_attention_in_gain_revive)
@@ -1333,6 +1336,9 @@ class MDDecoupling(_MDDecouplingBase):
         attention_in_gain_revive_threshold: Optional[float] = None,
         attention_in_gain_revive_mean: Literal["all", "live"] = "all",
         attention_in_gain_revive_iteration: Optional[int] = None,
+        # Which attention-in projections the revive / pull touch: "softmax" = linear_qkv of the global
+        # softmax layers only (default); "all" adds the KDA/GDN in_proj (see _is_attention_in_matrix).
+        attention_in_gain_scope: Literal["softmax", "all"] = "softmax",
         # Decoupled pull of attention-in column gains toward a target (see _pull_attention_in_col_gain).
         attention_in_gain_pull_coeff: float = 0.0,
         attention_in_gain_pull_target: float = 1.0,
@@ -1341,6 +1347,7 @@ class MDDecoupling(_MDDecouplingBase):
         self.attention_in_gain_revive_threshold = attention_in_gain_revive_threshold
         self.attention_in_gain_revive_mean = attention_in_gain_revive_mean
         self.attention_in_gain_revive_iteration = attention_in_gain_revive_iteration
+        self.attention_in_gain_scope = attention_in_gain_scope
         # One-shot: armed by arm_attention_in_gain_revive(loaded_iteration) after the checkpoint
         # load, consumed by the next step() (see _revive_attention_in_col_gain).
         self._revive_armed = False
@@ -1607,7 +1614,7 @@ class MDDecoupling(_MDDecouplingBase):
         this step (same schedule as _gains_step), so the pull decays with the schedule like AdamW
         weight decay does."""
         coeff = self.attention_in_gain_pull_coeff
-        if coeff == 0.0 or not (self.is_qkv_fn(p) or self.is_kda_in_proj_fn(p)):
+        if coeff == 0.0 or not self._is_attention_in_matrix(p):
             return
         col = self.state[p].get("col_gain")
         if col is None:
@@ -1629,7 +1636,7 @@ class MDDecoupling(_MDDecouplingBase):
         with torch.where / mul_.
         """
         thr = self.attention_in_gain_revive_threshold
-        if thr is None or not (self.is_qkv_fn(p) or self.is_kda_in_proj_fn(p)):
+        if thr is None or not self._is_attention_in_matrix(p):
             return
         state = self.state[p]
         col = state.get("col_gain")
@@ -1651,6 +1658,14 @@ class MDDecoupling(_MDDecouplingBase):
         state["col_gain_v"].mul_(keep)
         n = dead.sum()
         self._revive_count = n if self._revive_count is None else self._revive_count + n
+
+    def _is_attention_in_matrix(self, p) -> bool:
+        """Fused attention input projection in the configured scope: softmax linear_qkv always,
+        KDA/GDN in_proj only under attention_in_gain_scope == "all"."""
+        return bool(
+            self.is_qkv_fn(p)
+            or (self.attention_in_gain_scope == "all" and self.is_kda_in_proj_fn(p))
+        )
 
     def arm_attention_in_gain_revive(self, loaded_iteration: int) -> bool:
         """Arm the one-shot column-gain revive for the next step() iff the checkpoint loaded in this
@@ -2203,7 +2218,7 @@ def get_megatron_mddecoupling_optimizer(
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
-            if _is_attention_in_pre_norm_gain(name, param):
+            if _is_attention_in_pre_norm_gain(name, param, config.md_attention_in_gain_scope):
                 # The gamma fused in front of the attention-in projection: revived together with
                 # the projection's column gain (both are per-input-channel gains on the same input).
                 param.md_attention_in_pre_norm_gain = True
@@ -2304,6 +2319,7 @@ def get_megatron_mddecoupling_optimizer(
         attention_in_gain_revive_threshold=config.md_attention_in_gain_revive_threshold,
         attention_in_gain_revive_mean=config.md_attention_in_gain_revive_mean,
         attention_in_gain_revive_iteration=config.md_attention_in_gain_revive_iteration,
+        attention_in_gain_scope=config.md_attention_in_gain_scope,
         attention_in_gain_pull_coeff=config.md_attention_in_gain_pull_coeff,
         attention_in_gain_pull_target=config.md_attention_in_gain_pull_target,
     )

@@ -2591,6 +2591,36 @@ def test_md_decoupling_col_gain_revive_only_touches_attention_in():
     assert optimizer._revive_count is None
 
 
+@pytest.mark.parametrize("scope", ["softmax", "all"])
+def test_md_decoupling_col_gain_scope_controls_kda_in_proj(scope):
+    """Default scope: a KDA in_proj matrix is neither revived nor pulled; scope 'all' includes it."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_kda_in_proj = True
+    param.kda_split_shapes = (2, 2, 2, 2)  # q, k, v, gate rows of the fused in_proj (TP 1)
+    optimizer = _gqa_qkv_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus", use_orthogonal_updates=False,
+        is_kda_in_proj_fn=lambda p: getattr(p, "is_kda_in_proj", False),
+        attention_in_gain_revive_threshold=1e-12, attention_in_gain_revive_iteration=48000,
+        attention_in_gain_scope=scope, attention_in_gain_pull_coeff=0.5,
+    )
+    optimizer._maybe_init_gain_state(param)
+    state = optimizer.state[param]
+    state["col_gain"].fill_(2.0)  # away from the pull target softplus_inv(1), so a pull is visible
+    # collapsed entry with a finite raw value (fp32 softplus_inv underflows to -inf below ~1e-7)
+    state["col_gain"][2] = optimizer._phi_inv(torch.tensor(1e-15, dtype=torch.float64)).float()
+    before = state["col_gain"].clone()
+    optimizer._pull_attention_in_col_gain(param, optimizer.param_groups[0])
+    optimizer._revive_attention_in_col_gain(param)
+    if scope == "softmax":
+        torch.testing.assert_close(state["col_gain"], before)
+        assert optimizer._revive_count is None
+    else:
+        assert optimizer._phi(state["col_gain"])[2] > 1e-3
+        assert not torch.equal(state["col_gain"][[0, 1, 3]], before[[0, 1, 3]])  # pulled
+        assert int(optimizer._revive_count) == 1
+
+
 def test_md_decoupling_step_rebuilds_weight_with_revived_col_gain():
     """The revive runs between the gains step and _apply_gains, so after step() the effective
     weight equals bare_p * phi(row) * phi(col_revived) with unit-norm bare rows."""
@@ -2628,8 +2658,13 @@ def test_attention_in_pre_norm_gain_tag_predicate():
     two_d = torch.nn.Parameter(torch.ones(4, 4))
     assert md_module._is_attention_in_pre_norm_gain(
         "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight", one_d)
-    assert md_module._is_attention_in_pre_norm_gain(
+    # KDA/GDN in_proj only under scope "all"; the default scope is the softmax layers alone
+    assert not md_module._is_attention_in_pre_norm_gain(
         "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d)
+    assert md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.0.self_attention.in_proj.layer_norm_weight", one_d, scope="all")
+    assert not md_module._is_attention_in_pre_norm_gain(
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d, scope="all")
     assert not md_module._is_attention_in_pre_norm_gain(
         "decoder.layers.0.mlp.linear_fc1.layer_norm_weight", one_d)
     assert not md_module._is_attention_in_pre_norm_gain(
