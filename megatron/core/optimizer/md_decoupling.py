@@ -221,24 +221,26 @@ def make_attention_in_pre_norm_gain_revive_hook(threshold: Optional[float], mean
                 if not getattr(p, "md_attention_in_pre_norm_gain", False):
                     continue
                 offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
+                # Revive BEFORE the pull: the pull moves a collapsed entry by ~lr*coeff per step
+                # (2.3e-5 at lr 4.6e-3, coeff 5e-3), which alone lifts it above a 1e-6 threshold
+                # and would make the one-shot revive skip every collapsed entry.
+                if revive:
+                    eff = p + offset if offset else p
+                    dead = eff.abs() < threshold
+                    weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
+                    mean_eff = (eff * weight).sum() / weight.sum().clamp_min(1.0)
+                    p.copy_(torch.where(dead, (mean_eff - offset).to(p.dtype), p))
+                    opt_state = optimizer.state.get(p)
+                    if opt_state:
+                        keep = ~dead
+                        for key in ("exp_avg", "exp_avg_sq"):
+                            if key in opt_state and torch.is_tensor(opt_state[key]) and opt_state[key].shape == p.shape:
+                                opt_state[key].mul_(keep.to(opt_state[key].dtype))
+                    n = dead.sum()
+                    total = n if total is None else total + n
                 if pull_coeff:
                     # (p + offset) - target == p - (target - offset)
                     p.sub_((p - (pull_target - offset)) * (group["lr"] * pull_coeff))
-                if not revive:
-                    continue
-                eff = p + offset if offset else p
-                dead = eff.abs() < threshold
-                weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
-                mean_eff = (eff * weight).sum() / weight.sum().clamp_min(1.0)
-                p.copy_(torch.where(dead, (mean_eff - offset).to(p.dtype), p))
-                opt_state = optimizer.state.get(p)
-                if opt_state:
-                    keep = ~dead
-                    for key in ("exp_avg", "exp_avg_sq"):
-                        if key in opt_state and torch.is_tensor(opt_state[key]) and opt_state[key].shape == p.shape:
-                            opt_state[key].mul_(keep.to(opt_state[key].dtype))
-                n = dead.sum()
-                total = n if total is None else total + n
         if revive and total is not None:
             # Printed by every rank that owns a tagged gamma (rank 0 alone has INFO logging and,
             # under the layer-wise optimizer, usually owns none of them).
@@ -1597,9 +1599,11 @@ class MDDecoupling(_MDDecouplingBase):
                     self._gains_step(p, group, gain_grads)
                     # Between the gains step and the re-apply, so the effective weight is
                     # rebuilt with the pulled / revived phi(c): p = bare_p * phi(r) * phi(c_new).
-                    self._pull_attention_in_col_gain(p, group)
+                    # Revive before the pull (see the gamma hook): the pull alone would lift a
+                    # collapsed gain above the threshold and the one-shot revive would skip it.
                     if revive:
                         self._revive_attention_in_col_gain(p)
+                    self._pull_attention_in_col_gain(p, group)
                     self._apply_gains(p)
         if revive:
             self._report_revive_count()

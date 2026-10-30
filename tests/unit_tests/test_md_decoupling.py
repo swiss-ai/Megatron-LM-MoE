@@ -2773,3 +2773,46 @@ def test_attention_in_pre_norm_gain_pull_hook(offset):
     expected_eff = (other.detach() - offset + offset)  # other == plain Adam result (eff units)
     expected_eff = expected_eff - lr * 0.5 * (expected_eff - 1.0)
     torch.testing.assert_close(gamma.detach() + offset, expected_eff)
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_attention_in_pre_norm_gain_revive_runs_before_pull(offset):
+    """With the pull on, the one-shot revive must still see the collapsed entries: the pull alone
+    moves them by lr*coeff (~2.3e-5 at the run's lr 4.63e-3 and coeff 5e-3), above a 1e-6 threshold."""
+    values = torch.tensor([1.9, 1e-11, 2.4, -3e-12, 0.7])
+    gamma = torch.nn.Parameter(values - offset)
+    gamma.md_attention_in_pre_norm_gain = True
+    gamma.md_layernorm_gain_offset = offset
+    adam = torch.optim.AdamW([gamma], lr=4.633e-3, weight_decay=0.0)
+    hook = md_module.make_attention_in_pre_norm_gain_revive_hook(
+        1e-6, "all", revive_iteration=48000, pull_coeff=5e-3, pull_target=1.0)
+    hook.attach(adam)
+    assert hook.arm(48000)
+    gamma.grad = torch.tensor([0.1, 1e-20, -0.1, 1e-20, 0.05])
+    adam.step()
+    eff = gamma.detach() + offset
+    dead = torch.tensor([False, True, False, True, False])
+    assert hook.revive_state["revived"] == 2
+    assert eff[dead].min() > 0.5, "collapsed entries must be reset to the vector mean (~1)"
+    torch.testing.assert_close(eff[1], eff[3])
+
+
+def test_md_decoupling_col_gain_revive_runs_before_pull():
+    torch.manual_seed(3)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _gqa_qkv_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus", use_orthogonal_updates=False,
+        attention_in_gain_revive_threshold=1e-6, attention_in_gain_revive_iteration=48000,
+        attention_in_gain_pull_coeff=5e-3,
+    )
+    optimizer._maybe_init_gain_state(param)
+    state = optimizer.state[param]
+    # phi(c) = 5e-7: the pull alone (raw step ~lr*coeff*|c - softplus_inv(1)|) would lift it above 1e-6
+    state["col_gain"][2] = optimizer._phi_inv(torch.tensor(5e-7, dtype=torch.float64)).float()
+    optimizer._apply_gains(param)
+    param.grad = torch.randn_like(param)
+    assert optimizer.arm_attention_in_gain_revive(48000)
+    optimizer.step()
+    assert optimizer._phi(state["col_gain"])[2] > 0.1, "collapsed column gain was not revived"
