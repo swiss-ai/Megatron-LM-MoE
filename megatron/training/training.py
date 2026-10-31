@@ -1667,11 +1667,13 @@ def get_optimizer_param_scheduler(optimizer):
     else:
         raise Exception('either train-iters or train-samples should be provided.')
 
-    # log-bridge switch point, in the scheduler's unit (samples).
+    # 'log' / 'sqrt' bridge switch point, in the scheduler's unit (samples). 'log-bridge' and
+    # 'air-bridge' are the earlier names of the two styles.
     lr_bridge_switch_steps = None
-    if args.lr_decay_style == 'log-bridge':
+    if args.lr_decay_style in ('log', 'sqrt', 'log-bridge', 'air-bridge'):
         assert (args.lr_bridge_switch_iters is None) != (args.lr_bridge_switch_samples is None), (
-            'log-bridge needs exactly one of --lr-bridge-switch-iters / --lr-bridge-switch-samples'
+            f'{args.lr_decay_style} needs exactly one of --lr-bridge-switch-iters / '
+            '--lr-bridge-switch-samples'
         )
         if args.lr_bridge_switch_iters is not None:
             lr_bridge_switch_steps = args.lr_bridge_switch_iters * args.global_batch_size

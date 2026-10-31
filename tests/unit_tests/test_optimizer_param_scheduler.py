@@ -419,7 +419,7 @@ _BRIDGE_GROUPS = [(2.83e-3, 5.1e-5), (1.41e-2, 5.1e-5)]
 _BRIDGE_KW = dict(T=100_000, W=1_000, switch=20_000, factor=0.5)
 
 
-def _make_bridge_scheduler(budget="remaining", style="log-bridge", **overrides):
+def _make_bridge_scheduler(budget="remaining", style="log", **overrides):
     kw = {**_BRIDGE_KW, **overrides}
     optimizer = MagicMock()
     optimizer.param_groups = [
@@ -522,7 +522,7 @@ def test_log_bridge_resumes_linear_checkpoint():
 
     bridge = _make_bridge_scheduler()  # no override flag needed for linear -> log-bridge
     bridge.load_state_dict(sd)
-    assert bridge.lr_decay_style == 'log-bridge'
+    assert bridge.lr_decay_style == 'log'
     assert bridge.num_steps == 15_000
     for g_lin, g_br in zip(linear.optimizer.param_groups, bridge.optimizer.param_groups):
         assert g_br['lr'] == pytest.approx(g_lin['lr'], rel=1e-12)
@@ -535,3 +535,94 @@ def test_log_bridge_resumes_linear_checkpoint():
     resumed.load_state_dict(sd2)
     for g_a, g_b in zip(bridge.optimizer.param_groups, resumed.optimizer.param_groups):
         assert g_b['lr'] == pytest.approx(g_a['lr'], rel=1e-12)
+
+
+# ---------------------------------------------------------------------------------------------
+# air-bridge
+# ---------------------------------------------------------------------------------------------
+
+
+def _reference_air(step, *, switch_step, total_steps, start_lr, final_lr, alpha_frac, orig):
+    """The AIR (affine 1/sqrt) decay as specified, with the pre-switch schedule passed in."""
+    if step < switch_step:
+        return orig(step)
+    K = total_steps - switch_step
+    alpha = alpha_frac * K
+    k = min(step - switch_step, K)
+    q = (1 + k / alpha) ** -0.5
+    qK = (1 + K / alpha) ** -0.5
+    return final_lr + (start_lr - final_lr) * (q - qK) / (1 - qK)
+
+
+@pytest.mark.parametrize("budget", ["remaining", "total"])
+def test_air_bridge_matches_reference_and_budget(budget):
+    T, W, factor = (_BRIDGE_KW[k] for k in ('T', 'W', 'factor'))
+    switch = _BUDGET_SWITCH[budget]
+    scheduler = _make_bridge_scheduler(budget=budget, style='sqrt', switch=switch)
+    linear = _make_bridge_scheduler(style='linear')
+    for g, (hi, lo) in zip(scheduler.optimizer.param_groups, _BRIDGE_GROUPS):
+        scheduler.num_steps = 0
+        scheduler.get_lr(g)  # solve
+        fn = scheduler._log_bridge_cache[(hi, lo)]
+        orig = lambda t, g=g: (setattr(linear, 'num_steps', t), linear.get_lr(g))[1]
+        ref = lambda t: _reference_air(
+            t, switch_step=switch, total_steps=T, start_lr=orig(switch), final_lr=lo,
+            alpha_frac=fn.info['alpha_frac'], orig=orig,
+        )
+        for step in [0, 500, W, 3_000, switch - 1, switch, switch + 1, 50_000, T - 1, T, 2 * T]:
+            scheduler.num_steps = step
+            assert scheduler.get_lr(g) == pytest.approx(ref(step), rel=1e-12, abs=1e-15)
+        scheduler.num_steps = T
+        assert scheduler.get_lr(g) == pytest.approx(lo, rel=1e-9)
+
+        low = lambda t: factor * hi * t / W if t < W else (
+            factor * hi - (factor * hi - lo) * (t - W) / (T - W)
+        )
+        start = switch if budget == "remaining" else 0
+
+        def lr_at(t):
+            scheduler.num_steps = t
+            return scheduler.get_lr(g)
+
+        got = sum(lr_at(t) for t in range(start, T))
+        want = sum(low(t) for t in range(start, T))
+        assert got == pytest.approx(want, rel=1e-3)
+
+
+def test_air_bridge_infeasible_raises():
+    with pytest.raises(ValueError, match="infeasible"):
+        # Unlike log-bridge (fixed log tail), AIR can approach linear, so only a low peak above
+        # the actual peak (bridge would have to sit above linear) is infeasible.
+        _make_bridge_scheduler(style="sqrt", factor=1.2)
+
+
+def test_air_bridge_resumes_log_bridge_checkpoint():
+    # A log-bridge checkpoint from before the switch resumes into air-bridge without override.
+    log = _make_bridge_scheduler()
+    log.step(15_000)
+    air = _make_bridge_scheduler(style='sqrt')
+    air.load_state_dict(log.state_dict())
+    assert air.lr_decay_style == 'sqrt'
+    assert air.num_steps == 15_000
+    for g_log, g_air in zip(log.optimizer.param_groups, air.optimizer.param_groups):
+        assert g_air['lr'] == pytest.approx(g_log['lr'], rel=1e-12)
+    air.step(30_000)
+    resumed = _make_bridge_scheduler(style='sqrt')
+    resumed.load_state_dict(air.state_dict())
+    for g_a, g_b in zip(air.optimizer.param_groups, resumed.optimizer.param_groups):
+        assert g_b['lr'] == pytest.approx(g_a['lr'], rel=1e-12)
+
+
+def test_bridge_style_aliases():
+    # The earlier names map to 'log' / 'sqrt', both as args and in checkpoints.
+    for old, new in (('log-bridge', 'log'), ('air-bridge', 'sqrt')):
+        sched = _make_bridge_scheduler(style=old)
+        assert sched.lr_decay_style == new
+        sched.step(25_000)
+        sd = sched.state_dict()
+        sd['lr_decay_style'] = old  # a checkpoint written under the old name
+        resumed = _make_bridge_scheduler(style=new)
+        resumed.load_state_dict(sd)
+        assert resumed.lr_decay_style == new
+        for g_a, g_b in zip(sched.optimizer.param_groups, resumed.optimizer.param_groups):
+            assert g_b['lr'] == pytest.approx(g_a['lr'], rel=1e-12)
