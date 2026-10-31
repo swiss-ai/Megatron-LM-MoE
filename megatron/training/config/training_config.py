@@ -138,34 +138,34 @@ class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
     # ---------------- Learning rate config. ----------------
-    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD", "log", "sqrt", "log-bridge", "air-bridge"] = "linear"
-    """Learning rate decay function. 'log': the 'linear' schedule up to
+    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD", "log-bridge", "sqrt-bridge", "log", "sqrt", "air-bridge"] = "linear"
+    """Learning rate decay function. 'log-bridge': the 'linear' schedule up to
     --lr-bridge-switch-(iters|samples), then an nGPT-log bridge into a reference log-decay tail whose
     LR area matches a linear schedule with peak --lr-bridge-low-factor * max_lr (applied per
     param group). See megatron.core.optimizer_param_scheduler.build_log_bridge_schedule.
-    'sqrt': the same, but the bridge is a single affine inverse-sqrt (AIR) decay from the switch to
+    'sqrt-bridge': the same, but the bridge is a single affine inverse-sqrt (AIR) decay from the switch to
     min_lr at the end of the decay horizon (build_air_bridge_schedule); uses the same
     --lr-bridge-low-factor / --lr-bridge-switch-* / --lr-bridge-budget knobs.
-    'log-bridge' / 'air-bridge': earlier names of 'log' / 'sqrt', still accepted."""
+    'log' / 'sqrt' / 'air-bridge': accepted aliases of 'log-bridge' / 'sqrt-bridge'."""
 
     lr_bridge_low_factor: float | None = None
-    """log / sqrt: low peak LR as a fraction of each param group's max_lr (e.g. 0.5 for a low peak
-    at half the actual peak). Required for log / sqrt."""
+    """log-bridge / sqrt-bridge: low peak LR as a fraction of each param group's max_lr (e.g. 0.5 for a low peak
+    at half the actual peak). Required for log-bridge / sqrt-bridge."""
 
     lr_bridge_switch_iters: int | None = None
-    """log / sqrt: iteration at which the run leaves the original linear schedule."""
+    """log-bridge / sqrt-bridge: iteration at which the run leaves the original linear schedule."""
 
     lr_bridge_switch_samples: int | None = None
-    """log / sqrt: sample count at which the run leaves the original linear schedule."""
+    """log-bridge / sqrt-bridge: sample count at which the run leaves the original linear schedule."""
 
     lr_bridge_log_start: float = 0.70
-    """log: fraction of the LR decay horizon at which the bridge joins the reference log tail."""
+    """log-bridge: fraction of the LR decay horizon at which the bridge joins the reference log tail."""
 
     lr_bridge_rho_ref: float = 0.05
-    """log: curvature rho of the reference nGPT log decay (smaller = sharper early drop)."""
+    """log-bridge: curvature rho of the reference nGPT log decay (smaller = sharper early drop)."""
 
     lr_bridge_budget: Literal["remaining", "total"] = "remaining"
-    """log / sqrt: 'remaining' matches the low-LR schedule's area from the switch on; 'total'
+    """log-bridge / sqrt-bridge: 'remaining' matches the low-LR schedule's area from the switch on; 'total'
     matches the whole-run area (pays back the excess LR spent before the switch)."""
 
     lr_wsd_decay_style: Literal["exponential", "linear", "cosine", "minus_sqrt"] = "exponential"

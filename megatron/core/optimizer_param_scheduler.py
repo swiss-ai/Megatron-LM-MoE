@@ -110,7 +110,7 @@ def build_log_bridge_schedule(
     rho_ref: float = 0.05,
     budget: str = "remaining",
 ):
-    """Build the 'log' (log-bridge) LR schedule and return ``lr(step)``.
+    """Build the 'log-bridge' LR schedule and return ``lr(step)``.
 
     Starts a run at a high peak LR (``high_lr``) and, from ``switch_step`` on, brings it down so
     that its LR area matches that of a linear schedule with a smaller peak (``low_lr``).
@@ -131,12 +131,12 @@ def build_log_bridge_schedule(
     dict with the solved quantities.
     """
     if budget not in LOG_BRIDGE_BUDGETS:
-        raise ValueError(f"log budget must be one of {LOG_BRIDGE_BUDGETS}, got {budget!r}")
+        raise ValueError(f"log-bridge budget must be one of {LOG_BRIDGE_BUDGETS}, got {budget!r}")
     T, W, f = float(total_steps), float(warmup_steps), float(final_lr)
     ts = float(int(round(log_start * T)))
     if not W <= switch_step < ts < T:
         raise ValueError(
-            "log needs warmup <= switch_step < log_start*total_steps < total_steps, got "
+            "log-bridge needs warmup <= switch_step < log_start*total_steps < total_steps, got "
             f"warmup={W}, switch_step={switch_step}, log_start*total={ts}, total={T}"
         )
 
@@ -180,7 +180,7 @@ def build_log_bridge_schedule(
     need = ((target - tail) / L - lr_ts) / (lr0 - lr_ts)
     if not 0 < need < 0.5:
         raise ValueError(
-            f"log budget infeasible for a log shape (mean shape {need:.3f}, must be in "
+            f"log-bridge budget infeasible for a log shape (mean shape {need:.3f}, must be in "
             f"(0, 0.5)); high_lr={high_lr}, low_lr={low_lr}, final_lr={final_lr}. "
             "Change log_start, switch_step, budget or the low factor."
         )
@@ -194,7 +194,7 @@ def build_log_bridge_schedule(
     # `need` would silently saturate at rho=1e-8 and overshoot the area budget. Refuse instead.
     if abs(mean(rho_b) - need) > 1e-6:
         raise ValueError(
-            f"log budget infeasible for a log shape: the bridge needs mean shape "
+            f"log-bridge budget infeasible for a log shape: the bridge needs mean shape "
             f"{need:.4f}, but rho in [1e-8, 1e4] only reaches [{mean(1e-8):.4f}, {mean(1e4):.4f}] "
             "(it would have to be a near-step drop). Change log_start, switch_step, budget or the "
             "low factor."
@@ -227,7 +227,7 @@ def build_air_bridge_schedule(
     switch_step: float,
     budget: str = "remaining",
 ):
-    """Build the 'sqrt' (AIR-bridge) LR schedule and return ``lr(step)``.
+    """Build the 'sqrt-bridge' (affine inverse-sqrt bridge) LR schedule and return ``lr(step)``.
 
     Same idea as :func:`build_log_bridge_schedule`, but the bridge is an AIR decay (affine
     inverse square root) that runs from ``switch_step`` all the way to ``total_steps``:
@@ -245,11 +245,11 @@ def build_air_bridge_schedule(
     callable carries an ``info`` dict with the solved quantities.
     """
     if budget not in LOG_BRIDGE_BUDGETS:
-        raise ValueError(f"sqrt budget must be one of {LOG_BRIDGE_BUDGETS}, got {budget!r}")
+        raise ValueError(f"sqrt-bridge budget must be one of {LOG_BRIDGE_BUDGETS}, got {budget!r}")
     T, W, f = float(total_steps), float(warmup_steps), float(final_lr)
     if not W <= switch_step < T:
         raise ValueError(
-            "sqrt needs warmup <= switch_step < total_steps, got "
+            "sqrt-bridge needs warmup <= switch_step < total_steps, got "
             f"warmup={W}, switch_step={switch_step}, total={T}"
         )
 
@@ -279,7 +279,7 @@ def build_air_bridge_schedule(
     a = math.exp((lo + hi) / 2)
     if abs(mean(a) - need) > 1e-6:
         raise ValueError(
-            f"sqrt budget infeasible: the bridge needs mean shape {need:.4f}, but "
+            f"sqrt-bridge budget infeasible: the bridge needs mean shape {need:.4f}, but "
             f"alpha_frac in [1e-8, 1e6] only reaches [{mean(1e-8):.4f}, {mean(1e6):.4f}]; "
             f"high_lr={high_lr}, low_lr={low_lr}, final_lr={final_lr}. "
             "Change switch_step, budget or the low factor."
@@ -297,10 +297,10 @@ def build_air_bridge_schedule(
 
 
 # Decay styles that follow 'linear' up to the bridge switch step, then bridge to a low-LR budget:
-# 'log' (build_log_bridge_schedule) and 'sqrt' (build_air_bridge_schedule).
-BRIDGE_DECAY_STYLES = ("log", "sqrt")
+# 'log-bridge' (build_log_bridge_schedule) and 'sqrt-bridge' (build_air_bridge_schedule).
+BRIDGE_DECAY_STYLES = ("log-bridge", "sqrt-bridge")
 # Earlier names, still accepted (args and checkpoints) and mapped to the current ones.
-BRIDGE_DECAY_STYLE_ALIASES = {"log-bridge": "log", "air-bridge": "sqrt"}
+BRIDGE_DECAY_STYLE_ALIASES = {"log": "log-bridge", "sqrt": "sqrt-bridge", "air-bridge": "sqrt-bridge"}
 
 
 class OptimizerParamScheduler:
@@ -329,9 +329,9 @@ class OptimizerParamScheduler:
             fraction of each param group's max_lr (the group's max_lr is the high, original peak).
         lr_bridge_switch_steps (int, optional): bridge styles only. Step at which the run leaves
             the original linear schedule.
-        lr_bridge_log_start (float, optional): 'log' only. Fraction of lr_decay_steps at
+        lr_bridge_log_start (float, optional): 'log-bridge' only. Fraction of lr_decay_steps at
             which the bridge hands over to the reference log tail.
-        lr_bridge_rho_ref (float, optional): 'log' only. Curvature of the reference log
+        lr_bridge_rho_ref (float, optional): 'log-bridge' only. Curvature of the reference log
             decay.
         lr_bridge_budget (str, optional): bridge styles only. 'remaining' or 'total' (see
             build_log_bridge_schedule).
@@ -521,7 +521,7 @@ class OptimizerParamScheduler:
         return min_lr + coeff * delta_lr
 
     def _get_bridge_lr(self, max_lr: float, min_lr: float) -> float:
-        """'log' / 'sqrt' LR for a param group with the given bounds (solved once
+        """'log-bridge' / 'sqrt-bridge' LR for a param group with the given bounds (solved once
         per pair)."""
         if max_lr <= min_lr:
             # Degenerate (constant) group: nothing to bridge.
@@ -538,7 +538,7 @@ class OptimizerParamScheduler:
                 switch_step=self.lr_bridge_switch_steps,
                 budget=self.lr_bridge_budget,
             )
-            if self.lr_decay_style == 'log':
+            if self.lr_decay_style == 'log-bridge':
                 fn = build_log_bridge_schedule(
                     **common, log_start=self.lr_bridge_log_start, rho_ref=self.lr_bridge_rho_ref
                 )
