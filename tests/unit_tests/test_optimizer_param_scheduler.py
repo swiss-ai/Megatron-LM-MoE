@@ -348,3 +348,190 @@ class TestGetCanonicalLrForLogging:
         """lr=0.0 is a legitimate value, not to be confused with None."""
         param_groups = [{'lr': 0.0, 'default_config': True}]
         assert get_canonical_lr_for_logging(param_groups) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# log-bridge
+# ---------------------------------------------------------------------------
+
+
+def _reference_log_bridge(
+    high_lr,
+    low_lr,
+    final_lr,
+    total_steps,
+    warmup_steps,
+    switch_step,
+    log_start=0.70,
+    rho_ref=0.05,
+    budget="remaining",
+):
+    """The original standalone implementation the scheduler is checked against."""
+    T, W, f = total_steps, warmup_steps, final_lr
+    ts = int(round(log_start * T))
+    assert W <= switch_step < ts < T
+
+    def linear(peak):
+        return lambda t: peak * t / W if t < W else peak - (peak - f) * (t - W) / (T - W)
+
+    def area(fn, a, b):
+        pts = sorted({a, b} | ({W} if a < W < b else set()))
+        return sum((fn(x) + fn(y)) / 2 * (y - x) for x, y in zip(pts, pts[1:]))
+
+    shape = lambda rho, x: 1 - math.log1p(x / rho) / math.log1p(1 / rho)
+    mean = lambda rho: 1 / math.log1p(1 / rho) - rho
+    G = lambda rho, x: (rho + x) * math.log1p(x / rho) - x
+
+    orig, low = linear(high_lr), linear(low_lr)
+    S, D, M = area(low, 0, T), T - W, mean(rho_ref)
+    peak_ref = (S - D * f * (1 - M)) / (W / 2 + D * M)
+    ref = lambda t: peak_ref * t / W if t < W else f + (peak_ref - f) * shape(rho_ref, (t - W) / D)
+
+    x1 = (ts - W) / D
+    tail = f * (T - ts) + (peak_ref - f) * D * (
+        (1 - x1) - (G(rho_ref, 1) - G(rho_ref, x1)) / math.log1p(1 / rho_ref)
+    )
+    lr0, lr_ts, L = orig(switch_step), ref(ts), ts - switch_step
+    target = (
+        area(low, switch_step, T) if budget == "remaining" else S - area(orig, 0, switch_step)
+    )
+    need = ((target - tail) / L - lr_ts) / (lr0 - lr_ts)
+    if not 0 < need < 0.5:
+        raise ValueError("infeasible")
+    lo, hi = math.log(1e-8), math.log(1e4)
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if mean(math.exp(mid)) < need else (lo, mid)
+    rho_b = math.exp((lo + hi) / 2)
+
+    def lr(step):
+        if step < switch_step:
+            return orig(step)
+        if step < ts:
+            return lr_ts + (lr0 - lr_ts) * shape(rho_b, (step - switch_step) / L)
+        return ref(min(step, T))
+
+    return lr
+
+
+# Two param groups with different bounds (e.g. scalar LR and matrix LR), absolute min_lr floor.
+_BRIDGE_GROUPS = [(2.83e-3, 5.1e-5), (1.41e-2, 5.1e-5)]
+_BRIDGE_KW = dict(T=100_000, W=1_000, switch=20_000, factor=0.5)
+
+
+def _make_bridge_scheduler(budget="remaining", style="log-bridge", **overrides):
+    kw = {**_BRIDGE_KW, **overrides}
+    optimizer = MagicMock()
+    optimizer.param_groups = [
+        {'lr': 0.0, 'weight_decay': 0.0, 'max_lr': hi, 'min_lr': lo} for hi, lo in _BRIDGE_GROUPS
+    ]
+    return OptimizerParamScheduler(
+        optimizer=optimizer,
+        init_lr=0.0,
+        max_lr=_BRIDGE_GROUPS[0][0],
+        min_lr=_BRIDGE_GROUPS[0][1],
+        lr_warmup_steps=kw['W'],
+        lr_decay_steps=kw['T'],
+        lr_decay_style=style,
+        start_wd=0.0,
+        end_wd=0.0,
+        wd_incr_steps=kw['T'],
+        wd_incr_style='constant',
+        lr_bridge_low_factor=kw['factor'],
+        lr_bridge_switch_steps=kw['switch'],
+        lr_bridge_budget=budget,
+        # As in training (args default): checkpoint scheduler values must match the args.
+        use_checkpoint_opt_param_scheduler=False,
+    )
+
+
+# 'total' must pay back the pre-switch excess, so it needs an early switch to stay feasible.
+_BUDGET_SWITCH = {"remaining": 20_000, "total": 5_000}
+
+
+@pytest.mark.parametrize("budget", ["remaining", "total"])
+def test_log_bridge_matches_reference(budget):
+    T, W, factor = (_BRIDGE_KW[k] for k in ('T', 'W', 'factor'))
+    switch = _BUDGET_SWITCH[budget]
+    scheduler = _make_bridge_scheduler(budget=budget, switch=switch)
+    refs = [
+        _reference_log_bridge(hi, factor * hi, lo, T, W, switch, budget=budget)
+        for hi, lo in _BRIDGE_GROUPS
+    ]
+    steps = [0, 1, 500, W, W + 1, 10_000, switch - 1, switch, switch + 1, 50_000, 69_999, 70_000,
+             70_001, 90_000, T - 1, T, T + 1, 2 * T]
+    for step in steps:
+        scheduler.num_steps = step
+        for group, ref in zip(scheduler.optimizer.param_groups, refs):
+            assert scheduler.get_lr(group) == pytest.approx(ref(step), rel=1e-12, abs=1e-15)
+
+
+def test_log_bridge_is_linear_before_switch_and_continuous():
+    T, W, switch = _BRIDGE_KW['T'], _BRIDGE_KW['W'], _BRIDGE_KW['switch']
+    bridge = _make_bridge_scheduler()
+    linear = _make_bridge_scheduler(style='linear')
+    for step in range(0, switch, 997):
+        bridge.num_steps = linear.num_steps = step
+        for g in bridge.optimizer.param_groups:
+            assert bridge.get_lr(g) == pytest.approx(linear.get_lr(g), rel=1e-12)
+    # Continuous at the switch and at the log start; ends at min_lr.
+    for g in bridge.optimizer.param_groups:
+        for knot in (switch, int(round(0.7 * T))):
+            bridge.num_steps = knot - 1
+            before = bridge.get_lr(g)
+            bridge.num_steps = knot
+            assert bridge.get_lr(g) == pytest.approx(before, rel=1e-3)
+        bridge.num_steps = T
+        assert bridge.get_lr(g) == pytest.approx(g['min_lr'], rel=1e-9)
+
+
+@pytest.mark.parametrize("budget", ["remaining", "total"])
+def test_log_bridge_area_budget(budget):
+    T, W, factor = (_BRIDGE_KW[k] for k in ('T', 'W', 'factor'))
+    switch = _BUDGET_SWITCH[budget]
+    scheduler = _make_bridge_scheduler(budget=budget, switch=switch)
+    for hi, lo in _BRIDGE_GROUPS:
+        group = {'max_lr': hi, 'min_lr': lo}
+        low = lambda t: factor * hi * t / W if t < W else (
+            factor * hi - (factor * hi - lo) * (t - W) / (T - W)
+        )
+
+        def lr_at(t):
+            scheduler.num_steps = t
+            return scheduler.get_lr(group)
+
+        start = switch if budget == "remaining" else 0
+        got = sum(lr_at(t) for t in range(start, T))  # left Riemann sum, step = 1
+        want = sum(low(t) for t in range(start, T))
+        assert got == pytest.approx(want, rel=1e-3)
+
+
+def test_log_bridge_infeasible_raises():
+    # Low peak barely below the original: the bridge would need to stay above linear.
+    with pytest.raises(ValueError, match="infeasible"):
+        _make_bridge_scheduler(factor=0.999)
+    # 'total' with a late switch needs a sharper-than-reachable drop (would overshoot the budget).
+    with pytest.raises(ValueError, match="near-step drop"):
+        _make_bridge_scheduler(budget="total", switch=20_000)
+
+
+def test_log_bridge_resumes_linear_checkpoint():
+    linear = _make_bridge_scheduler(style='linear')
+    linear.step(15_000)
+    sd = linear.state_dict()
+
+    bridge = _make_bridge_scheduler()  # no override flag needed for linear -> log-bridge
+    bridge.load_state_dict(sd)
+    assert bridge.lr_decay_style == 'log-bridge'
+    assert bridge.num_steps == 15_000
+    for g_lin, g_br in zip(linear.optimizer.param_groups, bridge.optimizer.param_groups):
+        assert g_br['lr'] == pytest.approx(g_lin['lr'], rel=1e-12)
+
+    # Round-trip of a log-bridge checkpoint keeps the style and knobs.
+    bridge.step(30_000)
+    sd2 = bridge.state_dict()
+    assert sd2['lr_bridge_switch_steps'] == _BRIDGE_KW['switch']
+    resumed = _make_bridge_scheduler()
+    resumed.load_state_dict(sd2)
+    for g_a, g_b in zip(bridge.optimizer.param_groups, resumed.optimizer.param_groups):
+        assert g_b['lr'] == pytest.approx(g_a['lr'], rel=1e-12)

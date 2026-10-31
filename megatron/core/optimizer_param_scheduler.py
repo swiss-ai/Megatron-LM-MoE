@@ -96,6 +96,128 @@ def combine_param_group_overrides(
     return combined_override
 
 
+LOG_BRIDGE_BUDGETS = ("remaining", "total")
+
+
+def build_log_bridge_schedule(
+    high_lr: float,
+    low_lr: float,
+    final_lr: float,
+    total_steps: float,
+    warmup_steps: float,
+    switch_step: float,
+    log_start: float = 0.70,
+    rho_ref: float = 0.05,
+    budget: str = "remaining",
+):
+    """Build the 'log-bridge' LR schedule and return ``lr(step)``.
+
+    Starts a run at a high peak LR (``high_lr``) and, from ``switch_step`` on, brings it down so
+    that its LR area matches that of a linear schedule with a smaller peak (``low_lr``).
+
+    * Before ``switch_step``: the original schedule (linear warmup from 0 to ``high_lr``, then
+      linear decay to ``final_lr`` at ``total_steps``). Identical to the 'linear' decay style, so a
+      'linear' run can be resumed with this style at any step up to ``switch_step``.
+    * From ``switch_step`` to ``log_start * total_steps``: an nGPT-log-shaped bridge, continuous
+      at both ends. Its curvature (rho) is solved by bisection so the area budget is met.
+    * From ``log_start * total_steps`` on: the tail of a reference run (linear warmup + nGPT log
+      decay with ``rho_ref``) whose total LR area equals that of the low-LR linear schedule.
+
+    ``budget='remaining'``: the area from ``switch_step`` on equals the low-LR schedule's
+    remaining area. ``budget='total'``: the whole-run area equals the low-LR schedule's total
+    area (the excess spent before the switch is paid back).
+
+    Steps can be in any unit (Megatron passes samples). The returned callable carries an ``info``
+    dict with the solved quantities.
+    """
+    if budget not in LOG_BRIDGE_BUDGETS:
+        raise ValueError(f"log-bridge budget must be one of {LOG_BRIDGE_BUDGETS}, got {budget!r}")
+    T, W, f = float(total_steps), float(warmup_steps), float(final_lr)
+    ts = float(int(round(log_start * T)))
+    if not W <= switch_step < ts < T:
+        raise ValueError(
+            "log-bridge needs warmup <= switch_step < log_start*total_steps < total_steps, got "
+            f"warmup={W}, switch_step={switch_step}, log_start*total={ts}, total={T}"
+        )
+
+    def linear(peak):
+        return lambda t: peak * t / W if t < W else peak - (peak - f) * (t - W) / (T - W)
+
+    def area(fn, a, b):  # exact for piecewise-linear fn with a kink only at W
+        pts = sorted({a, b} | ({W} if a < W < b else set()))
+        return sum((fn(x) + fn(y)) / 2 * (y - x) for x, y in zip(pts, pts[1:]))
+
+    def shape(rho, x):
+        return 1 - math.log1p(x / rho) / math.log1p(1 / rho)
+
+    def mean(rho):  # average of shape on [0, 1]
+        return 1 / math.log1p(1 / rho) - rho
+
+    def G(rho, x):  # antiderivative of log1p(x / rho)
+        return (rho + x) * math.log1p(x / rho) - x
+
+    orig, low = linear(high_lr), linear(low_lr)
+
+    # Reference log run, peak calibrated to the low-LR schedule's total area.
+    S, D, M = area(low, 0.0, T), T - W, mean(rho_ref)
+    peak_ref = (S - D * f * (1 - M)) / (W / 2 + D * M)
+
+    def ref(t):
+        if t < W:
+            return peak_ref * t / W
+        return f + (peak_ref - f) * shape(rho_ref, (t - W) / D)
+
+    # Tail area (closed form) and bridge endpoints.
+    x1 = (ts - W) / D
+    tail = f * (T - ts) + (peak_ref - f) * D * (
+        (1 - x1) - (G(rho_ref, 1) - G(rho_ref, x1)) / math.log1p(1 / rho_ref)
+    )
+    lr0, lr_ts, L = orig(switch_step), ref(ts), ts - switch_step
+
+    target = (
+        area(low, switch_step, T) if budget == "remaining" else S - area(orig, 0.0, switch_step)
+    )
+    need = ((target - tail) / L - lr_ts) / (lr0 - lr_ts)
+    if not 0 < need < 0.5:
+        raise ValueError(
+            f"log-bridge budget infeasible for a log shape (mean shape {need:.3f}, must be in "
+            f"(0, 0.5)); high_lr={high_lr}, low_lr={low_lr}, final_lr={final_lr}. "
+            "Change log_start, switch_step, budget or the low factor."
+        )
+
+    lo, hi = math.log(1e-8), math.log(1e4)  # bisect on log(rho); mean() is increasing in rho
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if mean(math.exp(mid)) < need else (lo, mid)
+    rho_b = math.exp((lo + hi) / 2)
+    # The bisection range caps how sharp the bridge can be: mean(1e-8) ~= 0.054, so a smaller
+    # `need` would silently saturate at rho=1e-8 and overshoot the area budget. Refuse instead.
+    if abs(mean(rho_b) - need) > 1e-6:
+        raise ValueError(
+            f"log-bridge budget infeasible for a log shape: the bridge needs mean shape "
+            f"{need:.4f}, but rho in [1e-8, 1e4] only reaches [{mean(1e-8):.4f}, {mean(1e4):.4f}] "
+            "(it would have to be a near-step drop). Change log_start, switch_step, budget or the "
+            "low factor."
+        )
+
+    def lr(step):
+        if step < switch_step:
+            return orig(step)
+        if step < ts:
+            return lr_ts + (lr0 - lr_ts) * shape(rho_b, (step - switch_step) / L)
+        return ref(min(step, T))
+
+    lr.info = dict(
+        peak_ref=peak_ref,
+        rho_bridge=rho_b,
+        lr_at_switch=lr0,
+        lr_at_log_start=lr_ts,
+        tail_area=tail,
+        target_area=target,
+    )
+    return lr
+
+
 class OptimizerParamScheduler:
     """Anneals learning rate and weight decay
 
@@ -118,6 +240,16 @@ class OptimizerParamScheduler:
         wsd_decay_steps (int, optional): number of weight decay decay steps
         lr_wsd_decay_style (str, optional): decay style for learning rate during weight decay decay
             steps
+        lr_bridge_low_factor (float, optional): 'log-bridge' only. Low peak LR as a
+            fraction of each param group's max_lr (the group's max_lr is the high, original peak).
+        lr_bridge_switch_steps (int, optional): 'log-bridge' only. Step at which the run leaves
+            the original linear schedule.
+        lr_bridge_log_start (float, optional): 'log-bridge' only. Fraction of lr_decay_steps at
+            which the bridge hands over to the reference log tail.
+        lr_bridge_rho_ref (float, optional): 'log-bridge' only. Curvature of the reference log
+            decay.
+        lr_bridge_budget (str, optional): 'log-bridge' only. 'remaining' or 'total' (see
+            build_log_bridge_schedule).
 
     """
 
@@ -138,6 +270,11 @@ class OptimizerParamScheduler:
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
+        lr_bridge_low_factor: Optional[float] = None,
+        lr_bridge_switch_steps: Optional[int] = None,
+        lr_bridge_log_start: float = 0.70,
+        lr_bridge_rho_ref: float = 0.05,
+        lr_bridge_budget: str = "remaining",
     ) -> None:
 
         # Class values.
@@ -161,6 +298,20 @@ class OptimizerParamScheduler:
         self.lr_decay_style = lr_decay_style
         if self.lr_decay_style == "WSD":
             assert self.wsd_decay_steps is not None
+
+        self.lr_bridge_low_factor = lr_bridge_low_factor
+        self.lr_bridge_switch_steps = lr_bridge_switch_steps
+        self.lr_bridge_log_start = lr_bridge_log_start
+        self.lr_bridge_rho_ref = lr_bridge_rho_ref
+        self.lr_bridge_budget = lr_bridge_budget
+        # One solved schedule per distinct (max_lr, min_lr) param-group pair.
+        self._log_bridge_cache: dict = {}
+        if self.lr_decay_style == "log-bridge":
+            assert self.lr_bridge_low_factor is not None and self.lr_bridge_low_factor > 0, (
+                "log-bridge needs a positive lr_bridge_low_factor"
+            )
+            assert self.lr_bridge_switch_steps is not None, "log-bridge needs lr_bridge_switch_steps"
+            assert self.init_lr == 0.0, "log-bridge warms up from 0 (lr_warmup_init must be 0)"
 
         self.start_wd = start_wd
         self.end_wd = end_wd
@@ -225,6 +376,9 @@ class OptimizerParamScheduler:
         max_lr = param_group.get('max_lr', self.max_lr)
         min_lr = param_group.get('min_lr', self.min_lr)
 
+        if self.lr_decay_style == 'log-bridge':
+            return self._get_log_bridge_lr(max_lr, min_lr)
+
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
             return self.init_lr + (
@@ -280,6 +434,35 @@ class OptimizerParamScheduler:
 
         return min_lr + coeff * delta_lr
 
+    def _get_log_bridge_lr(self, max_lr: float, min_lr: float) -> float:
+        """'log-bridge' LR for a param group with the given bounds (solved once per pair)."""
+        if max_lr <= min_lr:
+            # Degenerate (constant) group: nothing to bridge.
+            return max_lr
+        key = (max_lr, min_lr)
+        fn = self._log_bridge_cache.get(key)
+        if fn is None:
+            fn = build_log_bridge_schedule(
+                high_lr=max_lr,
+                low_lr=self.lr_bridge_low_factor * max_lr,
+                final_lr=min_lr,
+                total_steps=self.lr_decay_steps,
+                warmup_steps=self.lr_warmup_steps,
+                switch_step=self.lr_bridge_switch_steps,
+                log_start=self.lr_bridge_log_start,
+                rho_ref=self.lr_bridge_rho_ref,
+                budget=self.lr_bridge_budget,
+            )
+            self._log_bridge_cache[key] = fn
+            info = ", ".join(f"{k}={v:.6g}" for k, v in fn.info.items())
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"> log-bridge schedule for group max_lr={max_lr:.6g} min_lr={min_lr:.6g} "
+                f"(low peak {self.lr_bridge_low_factor * max_lr:.6g}): {info}",
+            )
+        return fn(self.num_steps)
+
     def step(self, increment: int) -> None:
         """Set lr for all parameters groups.
 
@@ -312,6 +495,14 @@ class OptimizerParamScheduler:
             'wd_incr_style': self.wd_incr_style,
             'wd_incr_steps': self.wd_incr_steps,
         }
+        if self.lr_decay_style == 'log-bridge':
+            state_dict.update(
+                lr_bridge_low_factor=self.lr_bridge_low_factor,
+                lr_bridge_switch_steps=self.lr_bridge_switch_steps,
+                lr_bridge_log_start=self.lr_bridge_log_start,
+                lr_bridge_rho_ref=self.lr_bridge_rho_ref,
+                lr_bridge_budget=self.lr_bridge_budget,
+            )
         return state_dict
 
     def _check_and_set(self, cls_value: float, sd_value: float, name: str) -> float:
@@ -378,14 +569,57 @@ class OptimizerParamScheduler:
             lr_decay_style_ = state_dict['decay_style']
         else:
             lr_decay_style_ = state_dict['lr_decay_style']
-        self.lr_decay_style = self._check_and_set(
-            self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
-        )
 
         if 'num_iters' in state_dict:
             num_steps = state_dict['num_iters']
         else:
             num_steps = state_dict['num_steps']
+
+        if (
+            self.lr_decay_style == 'log-bridge'
+            and lr_decay_style_ == 'linear'
+            and not self.use_checkpoint_opt_param_scheduler
+        ):
+            # 'log-bridge' equals 'linear' up to the switch step, so a linear checkpoint can be
+            # resumed into it without --override-opt-param-scheduler.
+            log_single_rank(
+                logger,
+                logging.INFO,
+                " > switching learning rate decay style from checkpoint 'linear' to 'log-bridge'",
+            )
+            if num_steps > self.lr_bridge_switch_steps:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"log-bridge: resuming a 'linear' checkpoint at step {num_steps}, past the "
+                    f"switch step {self.lr_bridge_switch_steps}; the LR will jump.",
+                )
+        else:
+            self.lr_decay_style = self._check_and_set(
+                self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
+            )
+
+        # log-bridge knobs: taken from the checkpoint only with --use-checkpoint-opt-param-scheduler;
+        # otherwise the current args win (changing them mid-run reshapes the remaining schedule).
+        for name in (
+            'lr_bridge_low_factor',
+            'lr_bridge_switch_steps',
+            'lr_bridge_log_start',
+            'lr_bridge_rho_ref',
+            'lr_bridge_budget',
+        ):
+            if name not in state_dict:
+                continue
+            if self.use_checkpoint_opt_param_scheduler:
+                setattr(self, name, state_dict[name])
+            elif getattr(self, name) != state_dict[name]:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f" > {name}: using {getattr(self, name)} (checkpoint had {state_dict[name]})",
+                )
+        # Bounds above may have changed; re-solve the bridge schedules lazily.
+        self._log_bridge_cache.clear()
         self.step(increment=num_steps)
 
         if 'start_wd' in state_dict:

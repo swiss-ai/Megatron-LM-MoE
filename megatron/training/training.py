@@ -1667,6 +1667,17 @@ def get_optimizer_param_scheduler(optimizer):
     else:
         raise Exception('either train-iters or train-samples should be provided.')
 
+    # log-bridge switch point, in the scheduler's unit (samples).
+    lr_bridge_switch_steps = None
+    if args.lr_decay_style == 'log-bridge':
+        assert (args.lr_bridge_switch_iters is None) != (args.lr_bridge_switch_samples is None), (
+            'log-bridge needs exactly one of --lr-bridge-switch-iters / --lr-bridge-switch-samples'
+        )
+        if args.lr_bridge_switch_iters is not None:
+            lr_bridge_switch_steps = args.lr_bridge_switch_iters * args.global_batch_size
+        else:
+            lr_bridge_switch_steps = args.lr_bridge_switch_samples
+
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         init_lr=args.lr_warmup_init,
@@ -1683,6 +1694,11 @@ def get_optimizer_param_scheduler(optimizer):
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
         lr_wsd_decay_style=args.lr_wsd_decay_style,
+        lr_bridge_low_factor=args.lr_bridge_low_factor,
+        lr_bridge_switch_steps=lr_bridge_switch_steps,
+        lr_bridge_log_start=args.lr_bridge_log_start,
+        lr_bridge_rho_ref=args.lr_bridge_rho_ref,
+        lr_bridge_budget=args.lr_bridge_budget,
     )
 
     return opt_param_scheduler

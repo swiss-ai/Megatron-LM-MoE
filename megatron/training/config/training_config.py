@@ -138,8 +138,31 @@ class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
     # ---------------- Learning rate config. ----------------
-    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
-    """Learning rate decay function."""
+    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD", "log-bridge"] = "linear"
+    """Learning rate decay function. 'log-bridge': the 'linear' schedule up to
+    --lr-bridge-switch-(iters|samples), then an nGPT-log bridge into a reference log-decay tail whose
+    LR area matches a linear schedule with peak --lr-bridge-low-factor * max_lr (applied per
+    param group). See megatron.core.optimizer_param_scheduler.build_log_bridge_schedule."""
+
+    lr_bridge_low_factor: float | None = None
+    """log-bridge: low peak LR as a fraction of each param group's max_lr (e.g. 0.5 for a low peak
+    at half the actual peak). Required for log-bridge."""
+
+    lr_bridge_switch_iters: int | None = None
+    """log-bridge: iteration at which the run leaves the original linear schedule."""
+
+    lr_bridge_switch_samples: int | None = None
+    """log-bridge: sample count at which the run leaves the original linear schedule."""
+
+    lr_bridge_log_start: float = 0.70
+    """log-bridge: fraction of the LR decay horizon at which the bridge joins the reference log tail."""
+
+    lr_bridge_rho_ref: float = 0.05
+    """log-bridge: curvature rho of the reference nGPT log decay (smaller = sharper early drop)."""
+
+    lr_bridge_budget: Literal["remaining", "total"] = "remaining"
+    """log-bridge: 'remaining' matches the low-LR schedule's area from the switch on; 'total'
+    matches the whole-run area (pays back the excess LR spent before the switch)."""
 
     lr_wsd_decay_style: Literal["exponential", "linear", "cosine", "minus_sqrt"] = "exponential"
     """Decay style for the annealing phase of WSD"""
