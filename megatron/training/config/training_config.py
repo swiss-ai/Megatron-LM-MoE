@@ -234,6 +234,11 @@ class LoggerConfig:
     log_muon_per_layer: bool = False
     """If set, additionally log all Muon statistics by global layer."""
 
+    log_muon_norm_components: bool = False
+    """With log_muon_gains: also log the norm gains split by their place in the block, as
+    gains/layernorm-<component>/flat for pre-attention, pre-mlp, post-attention, post-mlp, qk,
+    mixer-output, final and other. The pooled gains/layernorm/flat is kept."""
+
     muon_log_interval: int | None = None
     """Muon logging interval. Defaults to log_interval when unset."""
 
@@ -265,6 +270,14 @@ class LoggerConfig:
         default_factory=lambda: [1e-20, 1e-10, 1e-30]
     )
     """Absolute weight thresholds used for Muon sparsity logging."""
+
+    muon_gain_near_zero_thresholds: list[float] = field(
+        default_factory=lambda: [1e-6, 1e-8, 1e-12]
+    )
+    """With log_muon_gains: for every gain family/axis (MD row/col/flat gains and the norm gains,
+    globally and per layer with log_muon_per_layer) also log abs-min, the smallest |effective
+    gain|, and for each threshold T count-abs-below-T and fraction-abs-below-T, the number and
+    fraction of gain entries with |effective gain| < T."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""

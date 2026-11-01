@@ -109,6 +109,7 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'md_gain_log_family',
     'md_gain_log_layer',
     'md_layernorm_gain_offset',
+    'md_norm_log_component',
     'md_revived_pre_norm_gain',
     'md_decay_to_target',
     'is_embedding_or_output_parameter',

@@ -11,8 +11,10 @@ from megatron.core import parallel_state
 import megatron.core.optimizer.muon_logging as md_logging_module
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.md_decoupling import MDDecoupling
+from megatron.core.optimizer.optimizer import _MAIN_PARAM_ROUTING_ATTRS
 from megatron.core.optimizer.muon_logging import _gain_log_family
 from megatron.core.optimizer.muon_logging import _include_gain_in_global_stats
+from megatron.core.optimizer.muon_logging import _norm_log_component
 from megatron.core.optimizer.muon_logging import collect_md_gain_stats
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
@@ -602,3 +604,281 @@ def test_gain_stats_reconstruct_expert_tensor_parallel_shards():
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+def _near_zero_optimizer():
+    """Softplus col gains on an attention-in matrix (layer 3) plus a norm gain (layer 3) with
+    collapsed entries of both signs."""
+    matrix = torch.nn.Parameter(torch.ones(2, 4))
+    matrix.md_gain_log_family = "attention-in"
+    matrix.md_gain_log_layer = 3
+    md_optimizer = MDDecoupling(
+        [matrix], hypersphere_gains_mode="col", gain_parametrization="softplus"
+    )
+    # softplus values 1e-9, 1e-4, 0.5, 2.0
+    md_optimizer.state[matrix]["col_gain"] = md_optimizer._phi_inv(
+        torch.tensor([1e-9, 1e-4, 0.5, 2.0], dtype=torch.float64)
+    ).float()
+
+    layernorm = torch.nn.Parameter(torch.tensor([-1e-12, 3e-7, -2e-3, 0.9, -0.4]))
+    layernorm.md_gain_log_family = _gain_log_family(
+        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight", layernorm
+    )
+    layernorm.md_layernorm_gain_offset = 0.0
+    layernorm.md_gain_log_layer = 3
+    adam = torch.optim.Adam([layernorm])
+    return SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=adam),
+        )
+    )
+
+
+def test_collect_md_gain_stats_near_zero_off_by_default():
+    optimizer = _near_zero_optimizer()
+    base = collect_md_gain_stats(optimizer, per_layer=True, log_sparsity=False)
+    explicit_off = collect_md_gain_stats(
+        optimizer, per_layer=True, log_sparsity=False, gain_near_zero_thresholds=[]
+    )
+    assert base == explicit_off
+    assert not any("abs-min" in name or "abs-below" in name for name in base)
+
+
+def test_collect_md_gain_stats_logs_near_zero_counts_on_abs_effective_gain():
+    stats = collect_md_gain_stats(
+        _near_zero_optimizer(),
+        per_layer=True,
+        log_sparsity=False,
+        gain_near_zero_thresholds=[1e-6, 1e-3, 1e-6],  # duplicate is dropped
+    )
+    for prefix in ("muon-md", "muon-md/layers/3"):
+        col = f"{prefix}/gains/attention-in/col"
+        assert stats[f"{col}/abs-min"] == pytest.approx(1e-9, rel=1e-3)
+        assert stats[f"{col}/count-abs-below-1e-06"] == 1
+        assert stats[f"{col}/count-abs-below-0.001"] == 2
+        assert stats[f"{col}/fraction-abs-below-0.001"] == pytest.approx(0.5)
+        # existing metrics unchanged by the option
+        assert stats[f"{col}/min"] == pytest.approx(1e-9, rel=1e-3)
+
+        norm = f"{prefix}/gains/layernorm/flat"
+        # signed min is -0.4: only abs-min exposes the collapsed entries
+        assert stats[f"{norm}/min"] == pytest.approx(-0.4)
+        assert stats[f"{norm}/abs-min"] == pytest.approx(1e-12)
+        assert stats[f"{norm}/count-abs-below-1e-06"] == 2
+        assert stats[f"{norm}/count-abs-below-0.001"] == 2
+        assert stats[f"{norm}/fraction-abs-below-1e-06"] == pytest.approx(2 / 5)
+    assert not any(name.endswith("abs-below-1e-06") and "/layers/0/" in name for name in stats)
+
+
+def test_collect_md_gain_stats_near_zero_uses_zero_centered_offset():
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    md_optimizer = MDDecoupling([matrix], hypersphere_gains_mode="row")
+    layernorm = torch.nn.Parameter(torch.tensor([-1.0, -1.0 + 1e-8, 0.0]))
+    layernorm.md_gain_log_family = "layernorm"
+    layernorm.md_layernorm_gain_offset = 1.0  # effective gains 0, 1e-8, 1
+    adam = torch.optim.Adam([layernorm])
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=adam),
+        )
+    )
+    stats = collect_md_gain_stats(
+        optimizer, log_sparsity=False, gain_near_zero_thresholds=[1e-6]
+    )
+    assert stats["muon-md/gains/layernorm/flat/count-abs-below-1e-06"] == 2
+    assert stats["muon-md/gains/layernorm/flat/abs-min"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("bad", [[0.0], [-1e-6], [float("inf")], [float("nan")]])
+def test_collect_md_gain_stats_rejects_bad_near_zero_thresholds(bad):
+    with pytest.raises(ValueError, match="near-zero"):
+        collect_md_gain_stats(
+            _near_zero_optimizer(), log_sparsity=False, gain_near_zero_thresholds=bad
+        )
+
+
+def test_collect_md_gain_stats_near_zero_count_is_strict():
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    md_optimizer = MDDecoupling([matrix], hypersphere_gains_mode="row")
+    layernorm = torch.nn.Parameter(torch.tensor([-0.25, 0.5, -0.5, 1.0]))
+    layernorm.md_gain_log_family = "layernorm"
+    layernorm.md_layernorm_gain_offset = 0.0
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=torch.optim.Adam([layernorm])),
+        )
+    )
+    stats = collect_md_gain_stats(
+        optimizer, log_sparsity=False, gain_near_zero_thresholds=[0.5]
+    )
+    # |gain| == T is not below T
+    assert stats["muon-md/gains/layernorm/flat/count-abs-below-0.5"] == 1
+
+
+def test_collect_md_gain_stats_near_zero_reduces_abs_min_with_min(monkeypatch):
+    launches = []
+
+    def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+        launches.append((op, tuple(tensor.shape)))
+        return SimpleNamespace(wait=lambda: None)
+
+    monkeypatch.setattr(
+        md_logging_module.torch.distributed, "is_available", lambda: True
+    )
+    monkeypatch.setattr(
+        md_logging_module.torch.distributed, "is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        md_logging_module.torch.distributed, "all_reduce", fake_all_reduce
+    )
+    collect_md_gain_stats(
+        _near_zero_optimizer(), log_sparsity=False, gain_near_zero_thresholds=[1e-6]
+    )
+    buckets = len(md_logging_module._GAIN_FAMILIES) * len(md_logging_module._GAIN_AXES)
+    # signed minima and abs-minima, both over the full (scope, bucket) grid
+    assert [
+        shape for op, shape in launches if op == torch.distributed.ReduceOp.MIN
+    ] == [(1, buckets), (1, buckets)]
+    assert len(launches) == 6
+
+
+def test_norm_log_component_places_norms_in_the_block():
+    cases = [
+        # fused into the consuming linear (TE LayerNormLinear)
+        ("decoder.layers.0.self_attention.linear_qkv.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.self_attention.in_proj.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.mixer.in_proj.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.mlp.linear_fc1.layer_norm_weight", "pre-mlp"),
+        ("decoder.layers.0.self_attention.linear_q_up_proj.layer_norm_weight", "qk"),
+        ("decoder.layers.0.self_attention.linear_kv_up_proj.layer_norm_weight", "qk"),
+        # standalone norm modules
+        ("decoder.layers.0.input_layernorm.weight", "pre-attention"),
+        ("decoder.layers.0.norm.weight", "pre-attention"),
+        ("decoder.layers.0.pre_mlp_layernorm.weight", "pre-mlp"),
+        ("decoder.layers.0.post_self_attn_layernorm.weight", "post-attention"),
+        ("decoder.layers.0.post_mlp_layernorm.weight", "post-mlp"),
+        ("decoder.layers.0.self_attention.q_layernorm.weight", "qk"),
+        ("decoder.layers.0.self_attention.k_layernorm.weight", "qk"),
+        ("decoder.layers.0.self_attention.kv_layernorm.weight", "qk"),
+        ("decoder.layers.0.self_attention.indexer.k_norm.weight", "qk"),
+        ("decoder.layers.0.self_attention.out_norm.weight", "mixer-output"),
+        ("decoder.layers.0.mixer.norm.weight", "mixer-output"),
+        ("decoder.final_layernorm.weight", "final"),
+        ("decoder.final_norm.weight", "final"),
+        ("mtp.layers.0.final_layernorm.weight", "final"),
+        ("mtp.layers.0.enorm.weight", "other"),
+        ("decoder.layers.0.pre_cross_attn_layernorm.weight", "other"),
+        ("decoder.layers.0.mlp.some_new_proj.layer_norm_weight", "other"),
+    ]
+    for name, expected in cases:
+        assert _gain_log_family(name, torch.nn.Parameter(torch.ones(4))) == "layernorm", name
+        assert _norm_log_component(name) == expected, name
+    assert "md_norm_log_component" in _MAIN_PARAM_ROUTING_ATTRS
+
+
+def _norm_component_optimizer():
+    """An MD matrix plus the norms of a KDA layer (0) and an attention layer (1) and the final
+    norm, each tagged the way the optimizer setup tags them."""
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    matrix.md_gain_log_family = "attention-in"
+    md_optimizer = MDDecoupling([matrix], hypersphere_gains_mode="row")
+    md_optimizer.state[matrix]["row_gain"] = torch.ones(2)
+    norms = []
+    for layer, name, values in [
+        (0, "self_attention.in_proj.layer_norm_weight", [1e-9, 1.0]),
+        (0, "self_attention.out_norm.weight", [0.5, 0.5]),
+        (0, "pre_mlp_layernorm.weight", [-2.0, 4.0]),
+        (0, "post_self_attn_layernorm.weight", [3.0, 3.0]),
+        (1, "self_attention.linear_qkv.layer_norm_weight", [1.0, 3.0]),
+        (1, "self_attention.q_layernorm.weight", [0.25, 0.75]),
+        (1, "self_attention.k_layernorm.weight", [1.25, 1.75]),
+        (1, "pre_mlp_layernorm.weight", [6.0, 8.0]),
+        (None, "decoder.final_layernorm.weight", [2.0, 2.0]),
+    ]:
+        if layer is not None:
+            name = f"decoder.layers.{layer}.{name}"
+        norm = torch.nn.Parameter(torch.tensor(values))
+        norm.md_gain_log_family = _gain_log_family(name, norm)
+        norm.md_layernorm_gain_offset = 0.0
+        norm.md_norm_log_component = _norm_log_component(name)
+        if layer is not None:
+            norm.md_gain_log_layer = layer
+        norms.append(norm)
+    untagged = torch.nn.Parameter(torch.tensor([7.0]))
+    untagged.md_gain_log_family = "layernorm"
+    norms.append(untagged)
+    return SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=torch.optim.Adam(norms)),
+        )
+    )
+
+
+def test_collect_md_gain_stats_norm_components_off_by_default():
+    stats = collect_md_gain_stats(_norm_component_optimizer(), per_layer=True)
+    assert not any("/layernorm-" in name for name in stats)
+
+
+def test_collect_md_gain_stats_logs_norm_components():
+    kwargs = dict(per_layer=True, log_sparsity=False, gain_near_zero_thresholds=[1e-6])
+    base = collect_md_gain_stats(_norm_component_optimizer(), **kwargs)
+    stats = collect_md_gain_stats(
+        _norm_component_optimizer(), log_norm_components=True, **kwargs
+    )
+    # the pooled bucket and every other metric are unchanged
+    assert {name: stats[name] for name in base} == base
+
+    def gains(prefix, component):
+        return f"{prefix}/gains/layernorm-{component}/flat"
+
+    for prefix in ("muon-md", "muon-md/layers/0"):
+        assert stats[f"{gains(prefix, 'pre-attention')}/count-abs-below-1e-06"] == 1
+        assert stats[f"{gains(prefix, 'mixer-output')}/mean"] == pytest.approx(0.5)
+        assert stats[f"{gains(prefix, 'post-attention')}/max"] == pytest.approx(3.0)
+    layer_0 = gains("muon-md/layers/0", "pre-mlp")
+    assert stats[f"{layer_0}/min"] == pytest.approx(-2.0)
+    assert stats[f"{layer_0}/effective-rms"] == pytest.approx(10**0.5)
+    layer_1 = "muon-md/layers/1"
+    assert stats[f"{gains(layer_1, 'pre-attention')}/mean"] == pytest.approx(2.0)
+    assert stats[f"{gains(layer_1, 'qk')}/mean"] == pytest.approx(1.0)
+    assert stats[f"{gains(layer_1, 'qk')}/min"] == pytest.approx(0.25)
+    assert f"{gains(layer_1, 'mixer-output')}/mean" not in stats
+    # global buckets pool the layers; the final norm has no layer
+    assert stats[f"{gains('muon-md', 'pre-mlp')}/mean"] == pytest.approx(4.0)
+    assert stats[f"{gains('muon-md', 'final')}/mean"] == pytest.approx(2.0)
+    assert not any("layernorm-final" in name for name in stats if "/layers/" in name)
+    # a norm without a component tag is logged as other
+    assert stats[f"{gains('muon-md', 'other')}/mean"] == pytest.approx(7.0)
+
+
+@pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed"
+)
+def test_collect_muon_stats_logs_norm_components():
+    from megatron.core.optimizer.muon import TensorParallelMuon
+    from megatron.core.optimizer.muon_logging import collect_muon_stats
+
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    matrix.md_gain_log_family = "attention-in"
+    muon = TensorParallelMuon([matrix])
+    muon.state[matrix]["momentum_buffer"] = torch.zeros_like(matrix)
+    norm = torch.nn.Parameter(torch.tensor([0.0, -0.5]))
+    norm.md_gain_log_family = "layernorm"
+    norm.md_layernorm_gain_offset = 1.0
+    norm.md_norm_log_component = "pre-mlp"
+    norm.md_gain_log_layer = 4
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=muon),
+            SimpleNamespace(optimizer=torch.optim.Adam([norm])),
+        )
+    )
+    stats = collect_muon_stats(optimizer, per_layer=True, log_norm_components=True)
+    for prefix in ("muon", "muon/layers/4"):
+        assert stats[f"{prefix}/gains/layernorm-pre-mlp/flat/mean"] == pytest.approx(0.75)
+        assert stats[f"{prefix}/gains/layernorm/flat/mean"] == pytest.approx(0.75)

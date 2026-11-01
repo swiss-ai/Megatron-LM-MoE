@@ -15,7 +15,7 @@ from megatron.core.utils import get_pg_size, log_single_rank
 
 from . import HAVE_EMERGING_OPTIMIZERS, HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .muon_logging import _gain_log_family
+from .muon_logging import _gain_log_family, _norm_log_component
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -530,6 +530,7 @@ def get_megatron_muon_optimizer(
                 param.md_layernorm_gain_offset = float(
                     getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
                 )
+                param.md_norm_log_component = _norm_log_component(name)
             module_name = name.rpartition('.')[0]
             while module_name:
                 module = named_modules.get(module_name)
