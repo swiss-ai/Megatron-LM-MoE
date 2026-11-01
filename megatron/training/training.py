@@ -3679,6 +3679,9 @@ def train(
                     log_gains=args.log_muon_gains,
                     log_sparsity=args.log_muon_sparsity,
                     log_param_rms=args.log_muon_param_rms,
+                    gain_near_zero_thresholds=getattr(
+                        args, "muon_gain_near_zero_thresholds", None
+                    ),
                 )
         router_update_stats = pop_router_update_stats()
         if router_update_stats:

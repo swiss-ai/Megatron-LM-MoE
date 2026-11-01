@@ -485,17 +485,22 @@ def _append_md_gain_stats(
     matrix_totals: List,
     sparsity_thresholds: tuple[float, ...],
     prefix: str = "muon-md",
+    abs_minima: List = None,
+    near_zero_thresholds: tuple[float, ...] = (),
 ) -> None:
     """Turn reduced sufficient statistics into the final scalar metric values.
 
     ``mean``, ``rms``, saturation, ``min``, and ``max`` describe all gain elements in a bucket.
+    With ``near_zero_thresholds``, ``abs-min`` and ``count``/``fraction-abs-below-T`` do too.
     ``effective-rms``, combined scale, gauge, and sparsity metrics instead average
     already-computed matrix values, so differently sized matrices receive equal weight.
     """
     for family_index, family in enumerate(_GAIN_FAMILIES):
         for axis_index, axis in enumerate(_GAIN_AXES):
             bucket = family_index * len(_GAIN_AXES) + axis_index
-            total, sum_square, count, softplus_count, saturated_count = totals[bucket]
+            total, sum_square, count, softplus_count, saturated_count = totals[bucket][
+                :_GAIN_STAT_COUNT
+            ]
             if count == 0:
                 continue
             gain_prefix = f"{prefix}/gains/{family}/{axis}"
@@ -509,6 +514,12 @@ def _append_md_gain_stats(
                 stats[f"{gain_prefix}/saturated-fraction"] = (
                     saturated_count / softplus_count
                 )
+            if near_zero_thresholds:
+                stats[f"{gain_prefix}/abs-min"] = abs_minima[bucket]
+                for threshold_index, threshold in enumerate(near_zero_thresholds):
+                    below = totals[bucket][_GAIN_STAT_COUNT + threshold_index]
+                    stats[f"{gain_prefix}/count-abs-below-{threshold}"] = below
+                    stats[f"{gain_prefix}/fraction-abs-below-{threshold}"] = below / count
 
         scale_sum, pair_count, combined_sum, imbalance_sum, softplus_pair_count = (
             matrix_totals[family_index][:_SPARSITY_MATRIX_COUNT]
@@ -544,6 +555,7 @@ def collect_md_gain_stats(
     log_gains: bool = True,
     log_sparsity: bool = True,
     log_param_rms: bool = True,
+    gain_near_zero_thresholds=(),
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-MD statistics."""
     from .md_decoupling import MDDecoupling
@@ -557,6 +569,7 @@ def collect_md_gain_stats(
         log_gains,
         log_sparsity,
         log_param_rms,
+        gain_near_zero_thresholds,
     )
 
 
@@ -567,6 +580,7 @@ def collect_muon_stats(
     log_gains: bool = True,
     log_sparsity: bool = True,
     log_param_rms: bool = True,
+    gain_near_zero_thresholds=(),
 ) -> Dict[str, float]:
     """Collect standard Muon LayerNorm gain, weight sparsity, and RMS statistics."""
     from .muon import TensorParallelMuon
@@ -580,6 +594,7 @@ def collect_muon_stats(
         log_gains,
         log_sparsity,
         log_param_rms,
+        gain_near_zero_thresholds,
     )
 
 
@@ -593,6 +608,7 @@ def _collect_muon_stats(
     log_gains: bool,
     log_sparsity: bool,
     log_param_rms: bool,
+    gain_near_zero_thresholds=(),
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-family statistics.
 
@@ -612,6 +628,16 @@ def _collect_muon_stats(
         or any(not math.isfinite(value) or value <= 0 for value in sparsity_thresholds)
     ):
         raise ValueError(f"{namespace} sparsity thresholds must be finite positive values")
+    # Near-zero gain counts are computed on |effective gain| (softplus value for softplus gains,
+    # stored value + zero-centered offset for norm gains), so collapsed entries of either sign
+    # are counted. Empty (default) adds no columns, no work and no metrics.
+    near_zero_thresholds = (
+        tuple(dict.fromkeys(float(value) for value in gain_near_zero_thresholds or ()))
+        if log_gains
+        else ()
+    )
+    if any(not math.isfinite(value) or value <= 0 for value in near_zero_thresholds):
+        raise ValueError(f"{namespace} gain near-zero thresholds must be finite positive values")
 
     wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
     inner_optimizers = [
@@ -670,7 +696,7 @@ def _collect_muon_stats(
             layer_count = int(layer_count_tensor.item())
     scope_count = layer_count + 1
     totals = torch.zeros(
-        (scope_count, bucket_count, _GAIN_STAT_COUNT),
+        (scope_count, bucket_count, _GAIN_STAT_COUNT + len(near_zero_thresholds)),
         dtype=torch.float64,
         device=device,
     )
@@ -678,6 +704,7 @@ def _collect_muon_stats(
         (scope_count, bucket_count), float("inf"), dtype=torch.float64, device=device
     )
     maxima = torch.full_like(minima, float("-inf"))
+    abs_minima = torch.full_like(minima, float("inf")) if near_zero_thresholds else None
     matrix_axis_totals = torch.zeros(
         (scope_count, bucket_count, _MATRIX_AXIS_STAT_COUNT),
         dtype=torch.float64,
@@ -791,20 +818,37 @@ def _collect_muon_stats(
                 torch.segment_reduce(
                     saturated.to(torch.float64), "sum", lengths=entry_counts
                 ),
+                *(
+                    torch.segment_reduce(
+                        effective_gain.abs().lt(threshold).to(torch.float64),
+                        "sum",
+                        lengths=entry_counts,
+                    )
+                    for threshold in near_zero_thresholds
+                ),
             ),
             dim=1,
         )
         gain_minima = torch.segment_reduce(effective_gain, "min", lengths=entry_counts)
         gain_maxima = torch.segment_reduce(effective_gain, "max", lengths=entry_counts)
+        gain_abs_minima = (
+            torch.segment_reduce(effective_gain.abs(), "min", lengths=entry_counts)
+            if near_zero_thresholds
+            else None
+        )
         entry_buckets = torch.tensor(
             [entry[1] for entry in gain_entries], dtype=torch.long, device=device
         )
-        flat_totals = totals.view(-1, _GAIN_STAT_COUNT)
+        flat_totals = totals.view(-1, totals.shape[-1])
         flat_minima = minima.view(-1)
         flat_maxima = maxima.view(-1)
         flat_totals.index_add_(0, entry_buckets, gain_values)
         flat_minima.scatter_reduce_(0, entry_buckets, gain_minima, reduce="amin")
         flat_maxima.scatter_reduce_(0, entry_buckets, gain_maxima, reduce="amax")
+        if near_zero_thresholds:
+            abs_minima.view(-1).scatter_reduce_(
+                0, entry_buckets, gain_abs_minima, reduce="amin"
+            )
 
         layer_entries = [
             index for index, entry in enumerate(gain_entries) if entry[2] is not None
@@ -823,6 +867,10 @@ def _collect_muon_stats(
             flat_maxima.scatter_reduce_(
                 0, layer_indices, gain_maxima[layer_entries], reduce="amax"
             )
+            if near_zero_thresholds:
+                abs_minima.view(-1).scatter_reduce_(
+                    0, layer_indices, gain_abs_minima[layer_entries], reduce="amin"
+                )
     nvtx_range_pop(f"{namespace}/logging/gain-statistics")
 
     nvtx_range_push(f"{namespace}/logging/global-reductions")
@@ -841,6 +889,12 @@ def _collect_muon_stats(
                     torch.distributed.all_reduce(matrix_axis_totals, async_op=True),
                 )
             )
+            if near_zero_thresholds:
+                works.append(
+                    torch.distributed.all_reduce(
+                        abs_minima, op=torch.distributed.ReduceOp.MIN, async_op=True
+                    )
+                )
         works.append(torch.distributed.all_reduce(matrix_totals, async_op=True))
         for work in works:
             work.wait()
@@ -851,6 +905,7 @@ def _collect_muon_stats(
         tensor.cpu().tolist()
         for tensor in (totals, minima, maxima, matrix_axis_totals, matrix_totals)
     )
+    abs_minima = abs_minima.cpu().tolist() if near_zero_thresholds else None
     nvtx_range_pop(f"{namespace}/logging/cpu-transfer")
     stats = {}
     nvtx_range_push(f"{namespace}/logging/format-statistics")
@@ -865,6 +920,8 @@ def _collect_muon_stats(
             matrix_totals[scope],
             sparsity_thresholds,
             prefix=prefix,
+            abs_minima=abs_minima[scope] if near_zero_thresholds else None,
+            near_zero_thresholds=near_zero_thresholds,
         )
     nvtx_range_pop(f"{namespace}/logging/format-statistics")
     nvtx_range_pop(f"{namespace}/logging")

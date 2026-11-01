@@ -602,3 +602,96 @@ def test_gain_stats_reconstruct_expert_tensor_parallel_shards():
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+def _near_zero_optimizer():
+    """Softplus col gains on an attention-in matrix (layer 3) plus a norm gain (layer 3) with
+    collapsed entries of both signs."""
+    matrix = torch.nn.Parameter(torch.ones(2, 4))
+    matrix.md_gain_log_family = "attention-in"
+    matrix.md_gain_log_layer = 3
+    md_optimizer = MDDecoupling(
+        [matrix], hypersphere_gains_mode="col", gain_parametrization="softplus"
+    )
+    # softplus values 1e-9, 1e-4, 0.5, 2.0
+    md_optimizer.state[matrix]["col_gain"] = md_optimizer._phi_inv(
+        torch.tensor([1e-9, 1e-4, 0.5, 2.0], dtype=torch.float64)
+    ).float()
+
+    layernorm = torch.nn.Parameter(torch.tensor([-1e-12, 3e-7, -2e-3, 0.9, -0.4]))
+    layernorm.md_gain_log_family = _gain_log_family(
+        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight", layernorm
+    )
+    layernorm.md_layernorm_gain_offset = 0.0
+    layernorm.md_gain_log_layer = 3
+    adam = torch.optim.Adam([layernorm])
+    return SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=adam),
+        )
+    )
+
+
+def test_collect_md_gain_stats_near_zero_off_by_default():
+    optimizer = _near_zero_optimizer()
+    base = collect_md_gain_stats(optimizer, per_layer=True, log_sparsity=False)
+    explicit_off = collect_md_gain_stats(
+        optimizer, per_layer=True, log_sparsity=False, gain_near_zero_thresholds=[]
+    )
+    assert base == explicit_off
+    assert not any("abs-min" in name or "abs-below" in name for name in base)
+
+
+def test_collect_md_gain_stats_logs_near_zero_counts_on_abs_effective_gain():
+    stats = collect_md_gain_stats(
+        _near_zero_optimizer(),
+        per_layer=True,
+        log_sparsity=False,
+        gain_near_zero_thresholds=[1e-6, 1e-3, 1e-6],  # duplicate is dropped
+    )
+    for prefix in ("muon-md", "muon-md/layers/3"):
+        col = f"{prefix}/gains/attention-in/col"
+        assert stats[f"{col}/abs-min"] == pytest.approx(1e-9, rel=1e-3)
+        assert stats[f"{col}/count-abs-below-1e-06"] == 1
+        assert stats[f"{col}/count-abs-below-0.001"] == 2
+        assert stats[f"{col}/fraction-abs-below-0.001"] == pytest.approx(0.5)
+        # existing metrics unchanged by the option
+        assert stats[f"{col}/min"] == pytest.approx(1e-9, rel=1e-3)
+
+        norm = f"{prefix}/gains/layernorm/flat"
+        # signed min is -0.4: only abs-min exposes the collapsed entries
+        assert stats[f"{norm}/min"] == pytest.approx(-0.4)
+        assert stats[f"{norm}/abs-min"] == pytest.approx(1e-12)
+        assert stats[f"{norm}/count-abs-below-1e-06"] == 2
+        assert stats[f"{norm}/count-abs-below-0.001"] == 2
+        assert stats[f"{norm}/fraction-abs-below-1e-06"] == pytest.approx(2 / 5)
+    assert not any(name.endswith("abs-below-1e-06") and "/layers/0/" in name for name in stats)
+
+
+def test_collect_md_gain_stats_near_zero_uses_zero_centered_offset():
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    md_optimizer = MDDecoupling([matrix], hypersphere_gains_mode="row")
+    layernorm = torch.nn.Parameter(torch.tensor([-1.0, -1.0 + 1e-8, 0.0]))
+    layernorm.md_gain_log_family = "layernorm"
+    layernorm.md_layernorm_gain_offset = 1.0  # effective gains 0, 1e-8, 1
+    adam = torch.optim.Adam([layernorm])
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=adam),
+        )
+    )
+    stats = collect_md_gain_stats(
+        optimizer, log_sparsity=False, gain_near_zero_thresholds=[1e-6]
+    )
+    assert stats["muon-md/gains/layernorm/flat/count-abs-below-1e-06"] == 2
+    assert stats["muon-md/gains/layernorm/flat/abs-min"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("bad", [[0.0], [-1e-6], [float("inf")]])
+def test_collect_md_gain_stats_rejects_bad_near_zero_thresholds(bad):
+    with pytest.raises(ValueError, match="near-zero"):
+        collect_md_gain_stats(
+            _near_zero_optimizer(), log_sparsity=False, gain_near_zero_thresholds=bad
+        )
