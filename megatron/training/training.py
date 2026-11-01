@@ -3682,6 +3682,7 @@ def train(
                     gain_near_zero_thresholds=getattr(
                         args, "muon_gain_near_zero_thresholds", None
                     ),
+                    log_norm_components=args.log_muon_norm_components,
                 )
         router_update_stats = pop_router_update_stats()
         if router_update_stats:

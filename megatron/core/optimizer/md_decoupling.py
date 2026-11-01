@@ -42,7 +42,7 @@ from . import (
     get_standard_config_overrides,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .muon_logging import _gain_log_family
+from .muon_logging import _gain_log_family, _norm_log_component
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -2203,6 +2203,7 @@ def get_megatron_mddecoupling_optimizer(
                 param.md_layernorm_gain_offset = float(
                     getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
                 )
+                param.md_norm_log_component = _norm_log_component(name)
             if getattr(param, "md_revived_pre_norm_gain", False) and config.md_attention_in_gain_pull_coeff:
                 # Pull of the gamma toward the target, applied by the chained Adam's wrapper right
                 # after its step (see _decay_to_target in optimizer.py), on the stored value:

@@ -11,8 +11,10 @@ from megatron.core import parallel_state
 import megatron.core.optimizer.muon_logging as md_logging_module
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.md_decoupling import MDDecoupling
+from megatron.core.optimizer.optimizer import _MAIN_PARAM_ROUTING_ATTRS
 from megatron.core.optimizer.muon_logging import _gain_log_family
 from megatron.core.optimizer.muon_logging import _include_gain_in_global_stats
+from megatron.core.optimizer.muon_logging import _norm_log_component
 from megatron.core.optimizer.muon_logging import collect_md_gain_stats
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
@@ -741,3 +743,142 @@ def test_collect_md_gain_stats_near_zero_reduces_abs_min_with_min(monkeypatch):
         shape for op, shape in launches if op == torch.distributed.ReduceOp.MIN
     ] == [(1, buckets), (1, buckets)]
     assert len(launches) == 6
+
+
+def test_norm_log_component_places_norms_in_the_block():
+    cases = [
+        # fused into the consuming linear (TE LayerNormLinear)
+        ("decoder.layers.0.self_attention.linear_qkv.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.self_attention.in_proj.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.mixer.in_proj.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight", "pre-attention"),
+        ("decoder.layers.0.mlp.linear_fc1.layer_norm_weight", "pre-mlp"),
+        ("decoder.layers.0.self_attention.linear_q_up_proj.layer_norm_weight", "qk"),
+        ("decoder.layers.0.self_attention.linear_kv_up_proj.layer_norm_weight", "qk"),
+        # standalone norm modules
+        ("decoder.layers.0.input_layernorm.weight", "pre-attention"),
+        ("decoder.layers.0.norm.weight", "pre-attention"),
+        ("decoder.layers.0.pre_mlp_layernorm.weight", "pre-mlp"),
+        ("decoder.layers.0.post_self_attn_layernorm.weight", "post-attention"),
+        ("decoder.layers.0.post_mlp_layernorm.weight", "post-mlp"),
+        ("decoder.layers.0.self_attention.q_layernorm.weight", "qk"),
+        ("decoder.layers.0.self_attention.k_layernorm.weight", "qk"),
+        ("decoder.layers.0.self_attention.kv_layernorm.weight", "qk"),
+        ("decoder.layers.0.self_attention.indexer.k_norm.weight", "qk"),
+        ("decoder.layers.0.self_attention.out_norm.weight", "mixer-output"),
+        ("decoder.layers.0.mixer.norm.weight", "mixer-output"),
+        ("decoder.final_layernorm.weight", "final"),
+        ("decoder.final_norm.weight", "final"),
+        ("mtp.layers.0.final_layernorm.weight", "final"),
+        ("mtp.layers.0.enorm.weight", "other"),
+        ("decoder.layers.0.pre_cross_attn_layernorm.weight", "other"),
+        ("decoder.layers.0.mlp.some_new_proj.layer_norm_weight", "other"),
+    ]
+    for name, expected in cases:
+        assert _gain_log_family(name, torch.nn.Parameter(torch.ones(4))) == "layernorm", name
+        assert _norm_log_component(name) == expected, name
+    assert "md_norm_log_component" in _MAIN_PARAM_ROUTING_ATTRS
+
+
+def _norm_component_optimizer():
+    """An MD matrix plus the norms of a KDA layer (0) and an attention layer (1) and the final
+    norm, each tagged the way the optimizer setup tags them."""
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    matrix.md_gain_log_family = "attention-in"
+    md_optimizer = MDDecoupling([matrix], hypersphere_gains_mode="row")
+    md_optimizer.state[matrix]["row_gain"] = torch.ones(2)
+    norms = []
+    for layer, name, values in [
+        (0, "self_attention.in_proj.layer_norm_weight", [1e-9, 1.0]),
+        (0, "self_attention.out_norm.weight", [0.5, 0.5]),
+        (0, "pre_mlp_layernorm.weight", [-2.0, 4.0]),
+        (0, "post_self_attn_layernorm.weight", [3.0, 3.0]),
+        (1, "self_attention.linear_qkv.layer_norm_weight", [1.0, 3.0]),
+        (1, "self_attention.q_layernorm.weight", [0.25, 0.75]),
+        (1, "self_attention.k_layernorm.weight", [1.25, 1.75]),
+        (1, "pre_mlp_layernorm.weight", [6.0, 8.0]),
+        (None, "decoder.final_layernorm.weight", [2.0, 2.0]),
+    ]:
+        if layer is not None:
+            name = f"decoder.layers.{layer}.{name}"
+        norm = torch.nn.Parameter(torch.tensor(values))
+        norm.md_gain_log_family = _gain_log_family(name, norm)
+        norm.md_layernorm_gain_offset = 0.0
+        norm.md_norm_log_component = _norm_log_component(name)
+        if layer is not None:
+            norm.md_gain_log_layer = layer
+        norms.append(norm)
+    untagged = torch.nn.Parameter(torch.tensor([7.0]))
+    untagged.md_gain_log_family = "layernorm"
+    norms.append(untagged)
+    return SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=torch.optim.Adam(norms)),
+        )
+    )
+
+
+def test_collect_md_gain_stats_norm_components_off_by_default():
+    stats = collect_md_gain_stats(_norm_component_optimizer(), per_layer=True)
+    assert not any("/layernorm-" in name for name in stats)
+
+
+def test_collect_md_gain_stats_logs_norm_components():
+    kwargs = dict(per_layer=True, log_sparsity=False, gain_near_zero_thresholds=[1e-6])
+    base = collect_md_gain_stats(_norm_component_optimizer(), **kwargs)
+    stats = collect_md_gain_stats(
+        _norm_component_optimizer(), log_norm_components=True, **kwargs
+    )
+    # the pooled bucket and every other metric are unchanged
+    assert {name: stats[name] for name in base} == base
+
+    def gains(prefix, component):
+        return f"{prefix}/gains/layernorm-{component}/flat"
+
+    for prefix in ("muon-md", "muon-md/layers/0"):
+        assert stats[f"{gains(prefix, 'pre-attention')}/count-abs-below-1e-06"] == 1
+        assert stats[f"{gains(prefix, 'mixer-output')}/mean"] == pytest.approx(0.5)
+        assert stats[f"{gains(prefix, 'post-attention')}/max"] == pytest.approx(3.0)
+    layer_0 = gains("muon-md/layers/0", "pre-mlp")
+    assert stats[f"{layer_0}/min"] == pytest.approx(-2.0)
+    assert stats[f"{layer_0}/effective-rms"] == pytest.approx(10**0.5)
+    layer_1 = "muon-md/layers/1"
+    assert stats[f"{gains(layer_1, 'pre-attention')}/mean"] == pytest.approx(2.0)
+    assert stats[f"{gains(layer_1, 'qk')}/mean"] == pytest.approx(1.0)
+    assert stats[f"{gains(layer_1, 'qk')}/min"] == pytest.approx(0.25)
+    assert f"{gains(layer_1, 'mixer-output')}/mean" not in stats
+    # global buckets pool the layers; the final norm has no layer
+    assert stats[f"{gains('muon-md', 'pre-mlp')}/mean"] == pytest.approx(4.0)
+    assert stats[f"{gains('muon-md', 'final')}/mean"] == pytest.approx(2.0)
+    assert not any("layernorm-final" in name for name in stats if "/layers/" in name)
+    # a norm without a component tag is logged as other
+    assert stats[f"{gains('muon-md', 'other')}/mean"] == pytest.approx(7.0)
+
+
+@pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers is not installed"
+)
+def test_collect_muon_stats_logs_norm_components():
+    from megatron.core.optimizer.muon import TensorParallelMuon
+    from megatron.core.optimizer.muon_logging import collect_muon_stats
+
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    matrix.md_gain_log_family = "attention-in"
+    muon = TensorParallelMuon([matrix])
+    muon.state[matrix]["momentum_buffer"] = torch.zeros_like(matrix)
+    norm = torch.nn.Parameter(torch.tensor([0.0, -0.5]))
+    norm.md_gain_log_family = "layernorm"
+    norm.md_layernorm_gain_offset = 1.0
+    norm.md_norm_log_component = "pre-mlp"
+    norm.md_gain_log_layer = 4
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=muon),
+            SimpleNamespace(optimizer=torch.optim.Adam([norm])),
+        )
+    )
+    stats = collect_muon_stats(optimizer, per_layer=True, log_norm_components=True)
+    for prefix in ("muon", "muon/layers/4"):
+        assert stats[f"{prefix}/gains/layernorm-pre-mlp/flat/mean"] == pytest.approx(0.75)
+        assert stats[f"{prefix}/gains/layernorm/flat/mean"] == pytest.approx(0.75)

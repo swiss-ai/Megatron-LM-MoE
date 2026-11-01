@@ -234,6 +234,11 @@ class LoggerConfig:
     log_muon_per_layer: bool = False
     """If set, additionally log all Muon statistics by global layer."""
 
+    log_muon_norm_components: bool = False
+    """With log_muon_gains: also log the norm gains split by their place in the block, as
+    gains/layernorm-<component>/flat for pre-attention, pre-mlp, post-attention, post-mlp, qk,
+    mixer-output, final and other. The pooled gains/layernorm/flat is kept."""
+
     muon_log_interval: int | None = None
     """Muon logging interval. Defaults to log_interval when unset."""
 
