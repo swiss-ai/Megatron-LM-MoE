@@ -689,9 +689,55 @@ def test_collect_md_gain_stats_near_zero_uses_zero_centered_offset():
     assert stats["muon-md/gains/layernorm/flat/abs-min"] == pytest.approx(0.0)
 
 
-@pytest.mark.parametrize("bad", [[0.0], [-1e-6], [float("inf")]])
+@pytest.mark.parametrize("bad", [[0.0], [-1e-6], [float("inf")], [float("nan")]])
 def test_collect_md_gain_stats_rejects_bad_near_zero_thresholds(bad):
     with pytest.raises(ValueError, match="near-zero"):
         collect_md_gain_stats(
             _near_zero_optimizer(), log_sparsity=False, gain_near_zero_thresholds=bad
         )
+
+
+def test_collect_md_gain_stats_near_zero_count_is_strict():
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    md_optimizer = MDDecoupling([matrix], hypersphere_gains_mode="row")
+    layernorm = torch.nn.Parameter(torch.tensor([-0.25, 0.5, -0.5, 1.0]))
+    layernorm.md_gain_log_family = "layernorm"
+    layernorm.md_layernorm_gain_offset = 0.0
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=torch.optim.Adam([layernorm])),
+        )
+    )
+    stats = collect_md_gain_stats(
+        optimizer, log_sparsity=False, gain_near_zero_thresholds=[0.5]
+    )
+    # |gain| == T is not below T
+    assert stats["muon-md/gains/layernorm/flat/count-abs-below-0.5"] == 1
+
+
+def test_collect_md_gain_stats_near_zero_reduces_abs_min_with_min(monkeypatch):
+    launches = []
+
+    def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+        launches.append((op, tuple(tensor.shape)))
+        return SimpleNamespace(wait=lambda: None)
+
+    monkeypatch.setattr(
+        md_logging_module.torch.distributed, "is_available", lambda: True
+    )
+    monkeypatch.setattr(
+        md_logging_module.torch.distributed, "is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        md_logging_module.torch.distributed, "all_reduce", fake_all_reduce
+    )
+    collect_md_gain_stats(
+        _near_zero_optimizer(), log_sparsity=False, gain_near_zero_thresholds=[1e-6]
+    )
+    buckets = len(md_logging_module._GAIN_FAMILIES) * len(md_logging_module._GAIN_AXES)
+    # signed minima and abs-minima, both over the full (scope, bucket) grid
+    assert [
+        shape for op, shape in launches if op == torch.distributed.ReduceOp.MIN
+    ] == [(1, buckets), (1, buckets)]
+    assert len(launches) == 6
