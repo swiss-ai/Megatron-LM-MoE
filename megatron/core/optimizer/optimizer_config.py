@@ -441,8 +441,8 @@ class OptimizerConfig:
     md_attention_in_gain_revive_threshold: Optional[float] = None
     """One-shot revive of collapsed input gains, applied right after loading the checkpoint named
     by md_attention_in_gain_revive_iteration. Applies to the two per-input-channel gains in front
-    of the input projections in scope (see md_attention_in_gain_scope and
-    md_dense_mlp_in_gain_revive): the pre-norm gamma (chained Adam) and the MDDecoupling column
+    of the input projections in scope (see md_attention_in_gain_scope, md_dense_mlp_in_gain_revive
+    and md_moe_mlp_in_gain_revive): the pre-norm gamma (chained Adam) and the MDDecoupling column
     gain phi(c). An entry whose effective gain is below this threshold in magnitude is reset to the
     mean of its gain vector and its Adam moments are zeroed. None disables."""
 
@@ -466,15 +466,22 @@ class OptimizerConfig:
     matrix's column gain: the dense layers of a hybrid dense/MoE stack. MoE experts and shared
     experts have no fused pre-norm and are never touched."""
 
+    md_moe_mlp_in_gain_revive: bool = False
+    """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
+    coefficient and target) to the standalone pre-MLP norm gamma (pre_mlp_layernorm) in front of the
+    MoE block. Only the gamma: the column gains of the router, shared expert and expert / latent
+    input projections that read it are not touched."""
+
     md_attention_in_gain_pull_coeff: float = 0.0
-    """Decoupled weight decay of the revive-scope gains toward a target value instead of 0:
-    x <- x - lr * coeff * (x - c) on the stored parameter, where lr is that parameter's scheduled
-    LR. For the pre-norm gamma x is the gamma itself (c is the target), applied right after the
-    chained Adam step; for a softplus column gain x is the raw gain and c = softplus_inv(target),
-    folded into the gains AdamW decay (on top of --gains-weight-decay). 0 disables."""
+    """Decoupled weight decay of the magnitude of the revive-scope gains toward a target value
+    instead of 0: x <- x - lr * coeff * (x - sign(x) * c), where lr is that parameter's scheduled LR
+    and sign(0) = +1, so |x| moves toward c and the sign is kept. For the pre-norm gamma x is the
+    effective gamma, applied right after the chained Adam step; for a softplus column gain x is the
+    raw gain and c = softplus_inv(target) (the multiplier is always positive), folded into the
+    gains AdamW decay (on top of --gains-weight-decay). 0 disables."""
 
     md_attention_in_gain_pull_target: float = 1.0
-    """Target value c of the attention-in gain pull (effective-gain units)."""
+    """Target magnitude c of the attention-in gain pull (effective-gain units)."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state

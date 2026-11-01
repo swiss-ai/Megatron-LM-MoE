@@ -157,7 +157,7 @@ def _global_rank() -> int:
 
 
 def _is_revived_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "softmax",
-                              dense_mlp_in: bool = False) -> bool:
+                              dense_mlp_in: bool = False, moe_mlp_in: bool = False) -> bool:
     """The pre-norm gains the --md-attention-in-gain-* revive and pull act on: the norm gain fused
     in front of an input projection, which multiplies the same per-input-channel axis as that
     projection's MDDecoupling column gain (the matrices of :meth:`MDDecoupling._is_revived_matrix`).
@@ -167,10 +167,15 @@ def _is_revived_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "soft
     ``dense_mlp_in`` adds the gamma fused in front of the dense MLP linear_fc1 (the dense layers of
     a hybrid dense/MoE stack; MoE experts and shared experts have no fused norm and are excluded by
     the ``.mlp.linear_fc1`` suffix), which collapses the same way as the attention-in gamma.
+    ``moe_mlp_in`` adds the standalone pre-MLP norm gamma (``pre_mlp_layernorm``) in front of the
+    MoE block. It is shared by the router, the shared expert and the expert / latent input
+    projections, so only the gamma is in scope, not their column gains.
     """
     if param.ndim != 1:
         return False
     if dense_mlp_in and name.endswith(".mlp.linear_fc1.layer_norm_weight"):
+        return True
+    if moe_mlp_in and name.endswith(".pre_mlp_layernorm.weight"):
         return True
     if ".self_attention." not in name:
         return False
@@ -1761,7 +1766,10 @@ class MDDecoupling(_MDDecouplingBase):
 
         # Pull of a revived matrix's column gain toward phi_inv(target), folded into the decoupled
         # weight decay: g <- g - lr * (wd * g + coeff * (g - t)) = g - lr * (wd + coeff) * (g - t'),
-        # t' = coeff * t / (wd + coeff). The default path keeps the plain decay toward 0.
+        # t' = coeff * t / (wd + coeff). The pull acts on the magnitude: under "direct" the stored
+        # gain is the multiplier and may be negative, so it is pulled toward sign(g) * t'; under
+        # "softplus" the multiplier is always positive and the raw gain is pulled toward t'.
+        # The default path keeps the plain decay toward 0.
         coeff = self.attention_in_gain_pull_coeff
         pull_col = bool(coeff) and "col_gain" in gain_grads and self._is_revived_matrix(p)
         for name, grad in gain_grads.items():
@@ -1776,6 +1784,7 @@ class MDDecoupling(_MDDecouplingBase):
                 gain, m, v, grad,
                 self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
                 beta1, beta2, eps, name_wd, name_target,
+                name_target != 0.0 and self.gain_parametrization == "direct",
             )
 
     def _gains_lr(self, group) -> float:
@@ -1822,14 +1831,16 @@ class MDDecoupling(_MDDecouplingBase):
 
 
 @torch.compile(dynamic=True)
-def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd, wd_target=0.0):
+def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd, wd_target=0.0,
+                     wd_target_signed=False):
     """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
 
     lr / bc1 / bc2 are 0-dim tensors (they change every step, so passing them as
     tensors instead of Python floats avoids per-step recompilation); beta1, beta2,
-    eps, wd and wd_target are run constants. `dynamic=True` shares one graph across the
-    differently shaped gain tensors. Equivalent to the eager update:
-        if wd: gain -= lr*wd * (gain - wd_target)   (gain *= 1 - lr*wd when wd_target == 0)
+    eps, wd, wd_target and wd_target_signed are run constants. `dynamic=True` shares one graph
+    across the differently shaped gain tensors. Equivalent to the eager update:
+        if wd: gain -= lr*wd * (gain - target)   (gain *= 1 - lr*wd when wd_target == 0)
+               target = sign(gain) * wd_target if wd_target_signed (sign(0) = +1) else wd_target
         m  = beta1*m + (1-beta1)*grad
         v  = beta2*v + (1-beta2)*grad^2
         gain -= (lr/bc1) * m / (v.sqrt()/bc2.sqrt() + eps)
@@ -1837,6 +1848,8 @@ def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd, wd_t
     if wd != 0.0:
         if wd_target == 0.0:
             gain.mul_(1.0 - lr * wd)
+        elif wd_target_signed:
+            gain.sub_((gain - torch.where(gain < 0, -wd_target, wd_target)) * (lr * wd))
         else:
             gain.sub_((gain - wd_target) * (lr * wd))
     m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
@@ -2193,10 +2206,12 @@ def get_megatron_mddecoupling_optimizer(
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
             if _is_revived_pre_norm_gain(name, param, config.md_attention_in_gain_scope,
-                                         config.md_dense_mlp_in_gain_revive):
+                                         config.md_dense_mlp_in_gain_revive,
+                                         config.md_moe_mlp_in_gain_revive):
                 # The gamma fused in front of the attention-in projection (and, with
                 # --md-dense-mlp-in-gain-revive, the dense MLP fc1): revived together with the
                 # projection's column gain (both are per-input-channel gains on the same input).
+                # With --md-moe-mlp-in-gain-revive also the MoE pre_mlp_layernorm gamma.
                 param.md_revived_pre_norm_gain = True
             if param.md_gain_log_family == "layernorm":
                 # This tagging is just to be able to log layernorm gain under muon_logging
@@ -2205,13 +2220,13 @@ def get_megatron_mddecoupling_optimizer(
                 )
                 param.md_norm_log_component = _norm_log_component(name)
             if getattr(param, "md_revived_pre_norm_gain", False) and config.md_attention_in_gain_pull_coeff:
-                # Pull of the gamma toward the target, applied by the chained Adam's wrapper right
-                # after its step (see _decay_to_target in optimizer.py), on the stored value:
-                # (p + offset) - target == p - (target - offset).
+                # Pull of the gamma's magnitude toward the target (the sign is kept), applied by the
+                # chained Adam's wrapper right after its step (see _decay_to_target in optimizer.py)
+                # on the effective gain p + offset.
                 param.md_decay_to_target = (
                     float(config.md_attention_in_gain_pull_coeff),
-                    float(config.md_attention_in_gain_pull_target)
-                    - float(getattr(param, "md_layernorm_gain_offset", 0.0)),
+                    float(config.md_attention_in_gain_pull_target),
+                    float(getattr(param, "md_layernorm_gain_offset", 0.0)),
                 )
             module_name = name.rpartition('.')[0]
             while module_name:
