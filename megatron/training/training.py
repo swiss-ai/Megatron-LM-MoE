@@ -3528,7 +3528,7 @@ def train(
                     )
                     args._activation_norm_unsupported_warned = True
                 log_activation_norms = False
-            activation_norm_logging.set_active(log_activation_norms)
+            activation_norm_logging.set_active(log_activation_norms, args.activation_spike_stats)
             log_output_logits = output_logit_logging.should_log(
                 iteration + 1, args.output_logit_log_interval
             )
