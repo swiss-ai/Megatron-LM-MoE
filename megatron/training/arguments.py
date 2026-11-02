@@ -3149,12 +3149,17 @@ def _add_training_args(parser):
                        'read it are not touched.')
     group.add_argument('--md-attention-in-gain-pull-coeff', type=float, default=0.0,
                        help='md_decoupling: decoupled weight decay of the magnitude toward a target, '
-                       'x <- x - lr * coeff * (x - sign(x) * c), on the pre-norm gamma and column gain '
-                       'of the input projections in scope: |x| moves toward c and the sign is kept '
+                       'x <- x - lr * coeff * (x - sign(x) * c), on the pre-norm gamma of the input '
+                       'projections in scope (and their column gains with '
+                       '--md-attention-in-gain-pull-col-gain): |x| moves toward c and the sign is kept '
                        '(raw softplus gain pulled to softplus_inv(c)). 0 disables.')
     group.add_argument('--md-attention-in-gain-pull-target', type=float, default=1.0,
                        help='Target magnitude c of --md-attention-in-gain-pull-coeff, in effective-gain '
                        'units.')
+    group.add_argument('--md-attention-in-gain-pull-col-gain', action='store_true', default=False,
+                       help='Also apply --md-attention-in-gain-pull-coeff to the MDDecoupling column '
+                       'gains of the input projections in scope. By default only the pre-norm gammas '
+                       'are pulled.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

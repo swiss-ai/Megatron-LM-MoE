@@ -2735,7 +2735,8 @@ def test_col_gain_pull_folded_into_gains_weight_decay(gains_wd):
     untagged = torch.nn.Parameter(torch.randn(8, 4))
     optimizer = _revive_matrix_optimizer(
         param, gains_weight_decay=gains_wd,
-        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0)
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0,
+        attention_in_gain_pull_col_gain=True)
     optimizer.add_param_group({"params": [untagged]})
     optimizer._maybe_init_gain_state(untagged)
     raw = torch.tensor([-3.0, 0.0, 2.0, 5.0])
@@ -2753,6 +2754,22 @@ def test_col_gain_pull_folded_into_gains_weight_decay(gains_wd):
     torch.testing.assert_close(optimizer.state[untagged]["col_gain"], raw * (1 - lr * gains_wd))
     torch.testing.assert_close(
         optimizer.state[param]["row_gain"], torch.full((8,), 1.5 * (1 - lr * gains_wd)))
+
+
+def test_col_gain_pull_off_by_default():
+    """Without attention_in_gain_pull_col_gain a revive-scope matrix's column gain keeps the plain
+    decay g*(1 - lr*wd), as with no pull: by default the pull acts only on the pre-norm gammas."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _revive_matrix_optimizer(
+        param, gains_weight_decay=0.1, attention_in_gain_pull_coeff=0.5,
+        attention_in_gain_pull_target=1.0)
+    raw = torch.tensor([-3.0, 0.0, 2.0, 5.0])
+    optimizer.state[param]["col_gain"].copy_(raw)
+    group = optimizer.param_groups[0]
+    group["step"] = 1
+    optimizer._gains_step(param, group, {"col_gain": torch.zeros(4), "row_gain": torch.zeros(8)})
+    torch.testing.assert_close(optimizer.state[param]["col_gain"], raw * (1 - 0.01 * 0.1))
 
 
 @pytest.mark.parametrize("offset", [0.0, 1.0])
@@ -2805,7 +2822,8 @@ def test_col_gain_pull_keeps_sign_under_direct_parametrization():
     optimizer = _gqa_qkv_optimizer(
         param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
         gain_parametrization="direct", use_orthogonal_updates=False,
-        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0)
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0,
+        attention_in_gain_pull_col_gain=True)
     optimizer._maybe_init_gain_state(param)
     raw = torch.tensor([-3.0, -0.5, 0.5, 2.0])
     optimizer.state[param]["col_gain"].copy_(raw)
