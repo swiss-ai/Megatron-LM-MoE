@@ -1339,7 +1339,8 @@ class MDDecoupling(_MDDecouplingBase):
         # Which attention-in projections the revive / pull touch: "softmax" = linear_qkv of the global
         # softmax layers only (default); "all" adds the KDA/GDN in_proj (see _is_revived_matrix).
         attention_in_gain_scope: Literal["softmax", "all"] = "softmax",
-        # Also revive / pull the column gain of the dense MLP linear_fc1 (see _is_revived_matrix).
+        # Also revive the column gain of the dense MLP linear_fc1, and pull it with
+        # attention_in_gain_pull_col_gain (see _is_revived_matrix).
         dense_mlp_in_gain: bool = False,
         # Decoupled pull of the revived matrices' column gains toward a target, folded into the
         # gains weight decay (see _gains_step); only with attention_in_gain_pull_col_gain.
@@ -1644,7 +1645,8 @@ class MDDecoupling(_MDDecouplingBase):
         return total
 
     def _is_revived_matrix(self, p) -> bool:
-        """Matrices whose column gain the revive / pull touch: the fused attention input projection
+        """Matrices whose column gain the revive touches (and the pull, with
+        attention_in_gain_pull_col_gain): the fused attention input projection
         in the configured scope (softmax linear_qkv always, KDA/GDN in_proj only under
         attention_in_gain_scope == "all") and, with dense_mlp_in_gain, the dense MLP linear_fc1.
         Its column gain is over the input channels like linear_qkv's and sits behind the same kind
@@ -1773,7 +1775,7 @@ class MDDecoupling(_MDDecouplingBase):
         # t' = coeff * t / (wd + coeff). The pull acts on the magnitude: under "direct" the stored
         # gain is the multiplier and may be negative, so it is pulled toward sign(g) * t'; under
         # "softplus" the multiplier is always positive and the raw gain is pulled toward t'.
-        # The default path keeps the plain decay toward 0.
+        # Only with attention_in_gain_pull_col_gain; otherwise the plain decay toward 0.
         coeff = self.attention_in_gain_pull_coeff
         pull_col = (bool(coeff) and self.attention_in_gain_pull_col_gain and "col_gain" in gain_grads
                     and self._is_revived_matrix(p))

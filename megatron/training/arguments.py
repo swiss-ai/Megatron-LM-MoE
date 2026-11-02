@@ -1652,6 +1652,11 @@ def validate_args(args, defaults={}):
             assert args.md_attention_in_gain_pull_target > 0, (
                 "--md-attention-in-gain-pull-target is the magnitude the pull moves |gain| toward "
                 f"and must be > 0; got {args.md_attention_in_gain_pull_target}.")
+        elif args.md_attention_in_gain_pull_col_gain:
+            warn_rank_0(
+                "--md-attention-in-gain-pull-col-gain has no effect without "
+                "--md-attention-in-gain-pull-coeff > 0."
+            )
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
                 "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
@@ -3136,12 +3141,14 @@ def _add_training_args(parser):
                        choices=['softmax', 'all'],
                        help='Which attention-in projections the revive and the pull touch: the fused '
                        'linear_qkv of the global softmax attention layers only (softmax, default) or '
-                       'also the KDA/GDN in_proj (all).')
+                       'also the KDA/GDN in_proj (all). The pull reaches their column gains only with '
+                       '--md-attention-in-gain-pull-col-gain.')
     group.add_argument('--md-dense-mlp-in-gain-revive', action='store_true', default=False,
                        help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
                        'iteration, mean, coefficient and target) to the pre-norm gamma fused in front '
                        'of the dense MLP linear_fc1 and to its column gain (the dense layers of a '
-                       'hybrid dense/MoE stack). MoE and shared experts are not touched.')
+                       'hybrid dense/MoE stack). The pull reaches the column gain only with '
+                       '--md-attention-in-gain-pull-col-gain. MoE and shared experts are not touched.')
     group.add_argument('--md-moe-mlp-in-gain-revive', action='store_true', default=False,
                        help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
                        'iteration, mean, coefficient and target) to the MoE pre-MLP norm gamma '

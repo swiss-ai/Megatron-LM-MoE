@@ -458,13 +458,15 @@ class OptimizerConfig:
     md_attention_in_gain_scope: str = 'softmax'
     """Which attention-in projections the revive and the pull touch: 'softmax' = the fused
     linear_qkv (pre-norm gamma + column gain) of the global softmax attention layers only;
-    'all' adds the KDA/GDN in_proj."""
+    'all' adds the KDA/GDN in_proj. The pull reaches the column gains only with
+    md_attention_in_gain_pull_col_gain."""
 
     md_dense_mlp_in_gain_revive: bool = False
     """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
     coefficient and target) to the gamma fused in front of the dense MLP linear_fc1 and to that
-    matrix's column gain: the dense layers of a hybrid dense/MoE stack. MoE experts and shared
-    experts have no fused pre-norm and are never touched."""
+    matrix's column gain: the dense layers of a hybrid dense/MoE stack. The pull reaches the column
+    gain only with md_attention_in_gain_pull_col_gain. MoE experts and shared experts have no fused
+    pre-norm and are never touched."""
 
     md_moe_mlp_in_gain_revive: bool = False
     """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
