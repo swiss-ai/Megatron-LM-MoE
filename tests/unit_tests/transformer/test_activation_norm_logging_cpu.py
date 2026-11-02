@@ -7,6 +7,7 @@ Run: python tests/unit_tests/transformer/test_activation_norm_logging_cpu.py
 
 import importlib.util
 import gc
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -219,16 +220,81 @@ class TestActivationNormLogging(unittest.TestCase):
         bias = torch.tensor([0.1, -0.2, 0.0, 0.3, 0.0])
         valid = (x.double() + bias.double())[~padding.T]
         logging.set_active(True, spike_stats=True)
-        with patch.object(logging, "_CHUNK_ELEMENTS", 10), logging.forward_scope():
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", 10), logging.forward_scope():
             logging.record(0, "mlp_output", x, padding, bias)
         stats = self.collect()
         for name, value in spike_reference(valid.flatten()).items():
             self.assertAlmostEqual(stats[f"activation_spike/mlp_output_{name}_layer_0"], value, places=5)
         median = valid.abs().median().item()
-        bin_ratio = 10 ** (1 / logging._HIST_BINS_PER_DECADE)
+        half_bin = 10 ** (0.5 / logging._HIST_BINS_PER_DECADE)
         logged = stats["activation_spike/mlp_output_abs_median_layer_0"]
-        self.assertTrue(median / bin_ratio < logged < median * bin_ratio, (logged, median))
+        self.assertTrue(median / half_bin <= logged <= median * half_bin, (logged, median))
         self.assertAlmostEqual(stats["activation_spike/mlp_output_abs_max_layer_0"], 50.3, places=5)
+
+    def spike_stats(self, x, padding=None, layer=0, metric="residual_input"):
+        logging.set_active(True, spike_stats=True)
+        with logging.forward_scope():
+            logging.record(layer, metric, x, padding)
+        stats = self.collect()
+        return {k.split(f"{metric}_")[1].replace(f"_layer_{layer}", ""): v for k, v in stats.items()
+                if k.startswith(f"activation_spike/{metric}_")}
+
+    def test_spike_kurtosis_exact_with_large_mean_offset(self):
+        torch.manual_seed(0)
+        noise = torch.randn(256, 1, 1024)
+        for offset, dtype in ((1e3, torch.float32), (1e3, torch.bfloat16), (1e5, torch.float32)):
+            x = (noise + offset).to(dtype)
+            expected = spike_reference(x.double().flatten())["kurtosis"]
+            logged = self.spike_stats(x)["kurtosis"]
+            self.assertAlmostEqual(logged, expected, delta=1e-3 * expected, msg=(offset, dtype))
+
+    def test_spike_median_bin_position_and_range_ends(self):
+        # Even split: lower median (as torch.median), read at the centre of its bin. Padded
+        # tokens (here most of them) must stay out of the histogram.
+        half_bin = 10 ** (0.5 / logging._HIST_BINS_PER_DECADE)
+        padding = torch.ones(1, 32, dtype=torch.bool)
+        padding[0, :8] = False
+        for value in (10 ** 0.34, 10 ** -3.2, 10 ** 2.7):
+            x = torch.full((32, 1, 1), 1e4)
+            x[:8, 0, 0] = torch.tensor([value] * 4 + [10 * value] * 4)
+            logged = self.spike_stats(x, padding)["abs_median"]
+            self.assertTrue(value / half_bin <= logged <= value * half_bin, (value, logged))
+        # Constant inputs read exactly, also outside the histogram range.
+        for value in (1e-13, 1e-12, 1.0, 1e6, 1e8):
+            stats = self.spike_stats(torch.full((2, 1, 4), value))
+            for name in ("abs_min", "abs_median", "abs_max"):
+                self.assertAlmostEqual(stats[name] / value, 1.0, places=6, msg=(name, value))
+
+    def test_spike_all_zero_and_nan_inf(self):
+        zeros = self.spike_stats(torch.zeros(4, 1, 8))
+        self.assertEqual((zeros["abs_min"], zeros["abs_mean"], zeros["abs_median"], zeros["abs_max"]),
+                         (0.0, 0.0, 0.0, 0.0))
+        self.assertTrue(math.isnan(zeros["kurtosis"]))
+        x = torch.full((4, 1, 8), 2.0)
+        x[1, 0, 2] = float("nan")
+        nan = self.spike_stats(x)
+        half_bin = 10 ** (0.5 / logging._HIST_BINS_PER_DECADE)
+        self.assertTrue(2.0 / half_bin <= nan["abs_median"] <= 2.0 * half_bin)  # NaN is left out
+        self.assertTrue(all(math.isnan(nan[k]) for k in ("abs_min", "abs_mean", "abs_max", "kurtosis")))
+        x[1, 0, 2] = float("inf")
+        inf = self.spike_stats(x)
+        self.assertEqual((inf["abs_min"], inf["abs_mean"], inf["abs_max"]), (2.0, float("inf"), float("inf")))
+        self.assertTrue(math.isnan(inf["kurtosis"]))
+        # NaN inside padding never leaks, even when the first chunk is all padding.
+        x = torch.randn(4, 1, 8)
+        x[0, 0, 3] = float("nan")
+        padding = torch.zeros(1, 4, dtype=torch.bool)
+        padding[0, 0] = True
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", 8):
+            stats = self.spike_stats(x, padding)
+        for name, value in spike_reference(x[1:].double().flatten()).items():
+            self.assertAlmostEqual(stats[name], value, places=5)
+
+    def test_set_active_clears_spike_accumulators(self):
+        logging.set_active(True, spike_stats=True)
+        with logging.forward_scope():
+            logging.record(0, "residual_input", torch.full((2, 1, 4), 100.0))
+        self.assertEqual(self.spike_stats(torch.full((2, 1, 4), 3.0))["abs_max"], 3.0)
 
     def test_spike_kurtosis_gaussian_vs_one_hot(self):
         torch.manual_seed(0)

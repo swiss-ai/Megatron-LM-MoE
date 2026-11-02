@@ -9,24 +9,40 @@ checkpoint forwards. Each rerun starts with fresh accumulators.
 
 from contextlib import contextmanager
 from functools import wraps
-from typing import Callable, Dict, Iterator, Optional
+from typing import Callable, Dict, Iterator, Optional, Union
 
 import torch
 
 METRICS = ("residual_input", "attention_output", "mlp_output")
 # Bound FP32 workspace to about 1 MiB (or one sequence position if larger).
 _CHUNK_ELEMENTS = 262144
-# Spike stats: the median of |x| comes from a log10 histogram, 16 bins per decade over
-# [1e-12, 1e6) (bin width ~15%); smaller values, including 0, fall in the first bin.
+# Spike stats run about 20 small kernels per chunk, so they use 16 MiB chunks (three FP32
+# buffers live) to stay off the kernel-launch floor.
+_SPIKE_CHUNK_ELEMENTS = 4 * 1024 * 1024
+# Spike stats: the median of |x| is read from a log10 histogram with 16 bins per decade
+# over [1e-12, 1e6], so it is within half a bin (about 7.5%) of the true median. |x| below
+# 1e-12, including 0, counts as 1e-12 and |x| above 1e6 as 1e6; NaN is left out.
 _HIST_LOG10_MIN, _HIST_LOG10_MAX, _HIST_BINS_PER_DECADE = -12, 6, 16
 _HIST_BINS = (_HIST_LOG10_MAX - _HIST_LOG10_MIN) * _HIST_BINS_PER_DECADE
+# Per (layer, metric): [count, sum d, sum d^2, sum d^3, sum d^4, sum |x|, histogram...] with
+# d = x - shift, where shift is the mean of the first chunk seen. Moments about a nearby
+# shift keep the kurtosis exact even when the mean is large against the spread.
+_SPIKE_SUMS = 6
 _active = False
 _spike_stats = False
 _in_forward = False
 _acc: Dict[tuple[int, str], torch.Tensor] = {}
-# Per (layer, metric): [sum x, sum |x|, sum x^3, sum x^4, histogram of |x|...], min |x|, max |x|.
-_SPIKE_SUMS = 4
-_spike: Dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_spike: Dict[tuple[int, str], "_SpikeState"] = {}
+
+
+class _SpikeState:
+    __slots__ = ("sums", "shift", "extrema")
+
+    def __init__(self, device: torch.device):
+        self.sums = torch.zeros(_SPIKE_SUMS + _HIST_BINS, device=device, dtype=torch.float64)
+        self.shift: Optional[torch.Tensor] = None
+        # [-min |x|, max |x|], so one MAX all-reduce pools both.
+        self.extrema = torch.tensor([-float("inf"), 0.0], device=device, dtype=torch.float64)
 
 
 def should_log(step: int, interval: int = 0) -> bool:
@@ -122,7 +138,8 @@ def _accumulate(
         _acc[key] = acc
     if x.numel() == 0:
         return
-    positions = max(1, _CHUNK_ELEMENTS // (x.shape[1] * x.shape[2]))
+    chunk_elements = _SPIKE_CHUNK_ELEMENTS if _spike_stats else _CHUNK_ELEMENTS
+    positions = max(1, chunk_elements // (x.shape[1] * x.shape[2]))
     for start in range(0, x.shape[0], positions):
         end = min(start + positions, x.shape[0])
         # copy=True is essential for FP32 inputs: in-place squaring must never
@@ -138,39 +155,52 @@ def _accumulate(
             values.masked_fill_(padding.unsqueeze(-1), 0.0)
             count = (~padding).sum(dtype=torch.int64) * x.shape[-1]
         else:
+            padding = None
             count = values.numel()
         if _spike_stats:
-            _accumulate_spike(key, values, padding if padding_mask is not None else None)
+            _accumulate_spike(key, values, padding, count)
         values.square_()
         acc[0].add_(values.sum(dtype=torch.float64))
         acc[1].add_(count)
 
 
-def _accumulate_spike(key: tuple, values: torch.Tensor, padding: Optional[torch.Tensor]) -> None:
-    """Add one chunk to the moment sums, |x| histogram and |x| min/max of ``key``."""
-    spike = _spike.get(key)
-    if spike is None:
-        spike = (
-            torch.zeros(_SPIKE_SUMS + _HIST_BINS, device=values.device, dtype=torch.float64),
-            torch.full((), float("inf"), device=values.device, dtype=torch.float64),
-            torch.zeros((), device=values.device, dtype=torch.float64),
-        )
-        _spike[key] = spike
-    sums, min_abs, max_abs = spike
-    if padding is not None:
-        values = values[~padding]
-    if values.numel() == 0:
-        return
+def _accumulate_spike(
+    key: tuple, values: torch.Tensor, padding: Optional[torch.Tensor], count: Union[int, torch.Tensor]
+) -> None:
+    """Add one chunk (padding already zeroed, ``count`` valid elements) to the spike
+    accumulators of ``key``. No host synchronisation: padding is handled by masking."""
+    state = _spike.get(key)
+    if state is None:
+        state = _spike[key] = _SpikeState(values.device)
+    if state.shift is None:
+        valid = count.clamp(min=1) if torch.is_tensor(count) else count
+        state.shift = values.sum(dtype=torch.float64) / valid
+    pad = None if padding is None else padding.unsqueeze(-1).expand_as(values)
     magnitude = values.abs()
-    sums[0].add_(values.sum(dtype=torch.float64))
-    sums[1].add_(magnitude.sum(dtype=torch.float64))
-    sums[2].add_(values.pow(3).sum(dtype=torch.float64))
-    sums[3].add_(values.pow(4).sum(dtype=torch.float64))
-    min_abs.copy_(torch.minimum(min_abs, magnitude.min().double()))
-    max_abs.copy_(torch.maximum(max_abs, magnitude.max().double()))
-    bins = ((magnitude.log10() - _HIST_LOG10_MIN) * _HIST_BINS_PER_DECADE).floor()
-    bins = bins.nan_to_num_(0.0).clamp_(0, _HIST_BINS - 1).long()
-    sums[_SPIKE_SUMS:].add_(torch.bincount(bins.flatten(), minlength=_HIST_BINS).double())
+    abs_sum = magnitude.sum(dtype=torch.float64)
+    max_abs = magnitude.max()
+    if pad is not None:
+        magnitude.masked_fill_(pad, float("inf"))
+    min_abs = magnitude.min()
+    torch.maximum(state.extrema, torch.stack((-min_abs, max_abs)).double(), out=state.extrema)
+    # Histogram of log10 |x|: 0 maps to -inf and NaN stays NaN; the clamp keeps 0 and
+    # out-of-range values in the end bins, and histc ignores NaN and the -inf padding.
+    log_magnitude = magnitude.log10_().clamp_(_HIST_LOG10_MIN, _HIST_LOG10_MAX)
+    if pad is not None:
+        log_magnitude.masked_fill_(pad, -float("inf"))
+    state.sums[_SPIKE_SUMS:].add_(
+        torch.histc(log_magnitude, _HIST_BINS, _HIST_LOG10_MIN, _HIST_LOG10_MAX)
+    )
+    # Moments of d = x - shift; the buffer of |x| is free now and takes d, d^3.
+    d = torch.sub(values, state.shift, out=magnitude)
+    if pad is not None:
+        d.masked_fill_(pad, 0.0)
+    d2 = d.square()
+    s1, s2 = d.sum(dtype=torch.float64), d2.sum(dtype=torch.float64)
+    s3 = d.mul_(d2).sum(dtype=torch.float64)
+    s4 = d2.square_().sum(dtype=torch.float64)
+    state.sums[0].add_(count)
+    state.sums[1:_SPIKE_SUMS].add_(torch.stack((s1, s2, s3, s4, abs_sum)))
 
 
 @torch.no_grad()
@@ -191,6 +221,7 @@ def collect(num_layers: int, device: torch.device) -> Dict[str, float]:
     distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if distributed:
         torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM)
+    spike_stats = _collect_spike(num_layers, device, totals, distributed) if _spike_stats else {}
     totals = totals.cpu()
     stats = {}
     for layer in range(num_layers):
@@ -198,48 +229,64 @@ def collect(num_layers: int, device: torch.device) -> Dict[str, float]:
             square_sum, count = totals[layer, index].tolist()
             if count > 0:
                 stats[f"activation_norm/{metric}_rms_layer_{layer}"] = (square_sum / count) ** 0.5
-    if _spike_stats:
-        stats.update(_collect_spike(num_layers, device, totals, distributed))
+    stats.update(spike_stats)
     return stats
 
 
 def _collect_spike(num_layers: int, device: torch.device, totals: torch.Tensor,
                    distributed: bool) -> Dict[str, float]:
-    """Pool the spike accumulators like the RMS sums (SUM for moments and histogram, MIN/MAX
-    for |x|) and turn them into per-layer stats. Kurtosis is the plain (Pearson) kurtosis
-    E[(x - mean)^4] / Var^2 of every logged element: 3 for a Gaussian, larger when a few
-    entries are much bigger than the rest. TP replication scales all sums equally."""
+    """Pool the spike accumulators like the RMS sums and turn them into per-layer stats.
+
+    Each rank holds moments about its own shift. The global mean is pooled first (SUM),
+    every rank moves its moments to that mean, and the central moments, |x| sum and
+    histogram are pooled with SUM; [-min, max] of |x| with MAX. Kurtosis is the plain
+    (Pearson) kurtosis E[(x - mean)^4] / Var^2 of every logged element: 3 for a Gaussian,
+    larger when a few entries are much bigger than the rest. TP replication scales all
+    sums equally. ``totals`` holds the pooled [square sum, count] of the RMS path."""
     shape = (num_layers, len(METRICS))
     sums = torch.zeros(shape + (_SPIKE_SUMS + _HIST_BINS,), device=device, dtype=torch.float64)
-    min_abs = torch.full(shape, float("inf"), device=device, dtype=torch.float64)
-    max_abs = torch.zeros(shape, device=device, dtype=torch.float64)
-    for (layer, metric), (s, lo, hi) in _spike.items():
+    shift = torch.zeros(shape, device=device, dtype=torch.float64)
+    extrema = torch.tensor([-float("inf"), 0.0], device=device, dtype=torch.float64).repeat(
+        shape + (1,))
+    for (layer, metric), state in _spike.items():
         if 0 <= layer < num_layers:
             index = (layer, METRICS.index(metric))
-            sums[index], min_abs[index], max_abs[index] = s, lo, hi
+            sums[index], shift[index], extrema[index] = state.sums, state.shift, state.extrema
     _spike.clear()
+    n, s1, s2, s3, s4 = (sums[..., i] for i in range(5))
+    # Global mean from sum x = sum d + count * shift, then the central moments about it.
+    mean = s1 + n * shift
     if distributed:
-        torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(min_abs, op=torch.distributed.ReduceOp.MIN)
-        torch.distributed.all_reduce(max_abs, op=torch.distributed.ReduceOp.MAX)
-    sums, min_abs, max_abs = sums.cpu(), min_abs.cpu(), max_abs.cpu()
+        torch.distributed.all_reduce(mean, op=torch.distributed.ReduceOp.SUM)
+    d = shift - mean / totals[..., 1].clamp(min=1)
+    m2 = s2 + 2 * s1 * d + n * d * d
+    m4 = s4 + 4 * s3 * d + 6 * s2 * d * d + 4 * s1 * d * d * d + n * d * d * d * d
+    pooled = torch.cat((torch.stack((m2, m4), -1), sums[..., 5:]), -1)
+    if distributed:
+        torch.distributed.all_reduce(pooled, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(extrema, op=torch.distributed.ReduceOp.MAX)
+    pooled, extrema, counts = pooled.cpu(), extrema.cpu(), totals[..., 1].cpu()
     stats = {}
     for layer in range(num_layers):
         for index, metric in enumerate(METRICS):
-            square_sum, count = totals[layer, index].tolist()
+            count = counts[layer, index].item()
             if count <= 0:
                 continue
-            s1, abs_mean, s3, s4 = (v / count for v in sums[layer, index, :_SPIKE_SUMS].tolist())
-            s2 = square_sum / count
-            hist = sums[layer, index, _SPIKE_SUMS:]
-            median_bin = int(torch.searchsorted(hist.cumsum(0), hist.sum() / 2).item())
-            var = s2 - s1 * s1
-            m4 = s4 - 4 * s1 * s3 + 6 * s1 * s1 * s2 - 3 * s1 ** 4
+            m2, m4, abs_mean = (v / count for v in pooled[layer, index, :3].tolist())
+            abs_min, abs_max = (-extrema[layer, index, 0]).item(), extrema[layer, index, 1].item()
+            hist = pooled[layer, index, 3:]
+            if hist.sum() > 0:
+                # Lower median for an even count, as torch.median; the bin centre, kept
+                # inside [min, max] so constant or all-zero inputs read exactly.
+                median_bin = int(torch.searchsorted(hist.cumsum(0), hist.sum() / 2).item())
+                median = 10 ** (_HIST_LOG10_MIN + (median_bin + 0.5) / _HIST_BINS_PER_DECADE)
+                median = min(max(median, abs_min), abs_max)
+            else:
+                median = float("nan")
             prefix = f"activation_spike/{metric}"
-            stats[f"{prefix}_abs_min_layer_{layer}"] = min_abs[layer, index].item()
+            stats[f"{prefix}_abs_min_layer_{layer}"] = abs_min
             stats[f"{prefix}_abs_mean_layer_{layer}"] = abs_mean
-            stats[f"{prefix}_abs_median_layer_{layer}"] = 10 ** (
-                _HIST_LOG10_MIN + (median_bin + 0.5) / _HIST_BINS_PER_DECADE)
-            stats[f"{prefix}_abs_max_layer_{layer}"] = max_abs[layer, index].item()
-            stats[f"{prefix}_kurtosis_layer_{layer}"] = m4 / (var * var) if var > 0 else float("nan")
+            stats[f"{prefix}_abs_median_layer_{layer}"] = median
+            stats[f"{prefix}_abs_max_layer_{layer}"] = abs_max
+            stats[f"{prefix}_kurtosis_layer_{layer}"] = m4 / (m2 * m2) if m2 > 0 else float("nan")
     return stats
