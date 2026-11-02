@@ -1652,6 +1652,11 @@ def validate_args(args, defaults={}):
             assert args.md_attention_in_gain_pull_target > 0, (
                 "--md-attention-in-gain-pull-target is the magnitude the pull moves |gain| toward "
                 f"and must be > 0; got {args.md_attention_in_gain_pull_target}.")
+        elif args.md_attention_in_gain_pull_col_gain:
+            warn_rank_0(
+                "--md-attention-in-gain-pull-col-gain has no effect without "
+                "--md-attention-in-gain-pull-coeff > 0."
+            )
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
                 "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
@@ -3136,12 +3141,14 @@ def _add_training_args(parser):
                        choices=['softmax', 'all'],
                        help='Which attention-in projections the revive and the pull touch: the fused '
                        'linear_qkv of the global softmax attention layers only (softmax, default) or '
-                       'also the KDA/GDN in_proj (all).')
+                       'also the KDA/GDN in_proj (all). The pull reaches their column gains only with '
+                       '--md-attention-in-gain-pull-col-gain.')
     group.add_argument('--md-dense-mlp-in-gain-revive', action='store_true', default=False,
                        help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
                        'iteration, mean, coefficient and target) to the pre-norm gamma fused in front '
                        'of the dense MLP linear_fc1 and to its column gain (the dense layers of a '
-                       'hybrid dense/MoE stack). MoE and shared experts are not touched.')
+                       'hybrid dense/MoE stack). The pull reaches the column gain only with '
+                       '--md-attention-in-gain-pull-col-gain. MoE and shared experts are not touched.')
     group.add_argument('--md-moe-mlp-in-gain-revive', action='store_true', default=False,
                        help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
                        'iteration, mean, coefficient and target) to the MoE pre-MLP norm gamma '
@@ -3149,12 +3156,17 @@ def _add_training_args(parser):
                        'read it are not touched.')
     group.add_argument('--md-attention-in-gain-pull-coeff', type=float, default=0.0,
                        help='md_decoupling: decoupled weight decay of the magnitude toward a target, '
-                       'x <- x - lr * coeff * (x - sign(x) * c), on the pre-norm gamma and column gain '
-                       'of the input projections in scope: |x| moves toward c and the sign is kept '
+                       'x <- x - lr * coeff * (x - sign(x) * c), on the pre-norm gamma of the input '
+                       'projections in scope (and their column gains with '
+                       '--md-attention-in-gain-pull-col-gain): |x| moves toward c and the sign is kept '
                        '(raw softplus gain pulled to softplus_inv(c)). 0 disables.')
     group.add_argument('--md-attention-in-gain-pull-target', type=float, default=1.0,
                        help='Target magnitude c of --md-attention-in-gain-pull-coeff, in effective-gain '
                        'units.')
+    group.add_argument('--md-attention-in-gain-pull-col-gain', action='store_true', default=False,
+                       help='Also apply --md-attention-in-gain-pull-coeff to the MDDecoupling column '
+                       'gains of the input projections in scope. By default only the pre-norm gammas '
+                       'are pulled.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

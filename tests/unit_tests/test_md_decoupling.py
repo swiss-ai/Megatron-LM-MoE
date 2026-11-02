@@ -528,6 +528,18 @@ def test_md_decoupling_recipe_defaults():
     assert config.gain_parametrization == "softplus"
     assert config.muon_router_scale_mode == "none"
     assert config.muon_split_fc1 is True
+    assert config.md_attention_in_gain_pull_col_gain is False
+
+
+def test_md_attention_in_gain_pull_col_gain_argument():
+    import argparse
+
+    from megatron.training.arguments import _add_training_args
+
+    parser = _add_training_args(argparse.ArgumentParser(allow_abbrev=False))
+    assert parser.parse_args([]).md_attention_in_gain_pull_col_gain is False
+    opts = parser.parse_args(["--md-attention-in-gain-pull-col-gain"])
+    assert opts.md_attention_in_gain_pull_col_gain is True
 
 
 def test_md_decoupling_router_scale_mode_resolution():
@@ -2735,7 +2747,8 @@ def test_col_gain_pull_folded_into_gains_weight_decay(gains_wd):
     untagged = torch.nn.Parameter(torch.randn(8, 4))
     optimizer = _revive_matrix_optimizer(
         param, gains_weight_decay=gains_wd,
-        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0)
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0,
+        attention_in_gain_pull_col_gain=True)
     optimizer.add_param_group({"params": [untagged]})
     optimizer._maybe_init_gain_state(untagged)
     raw = torch.tensor([-3.0, 0.0, 2.0, 5.0])
@@ -2753,6 +2766,22 @@ def test_col_gain_pull_folded_into_gains_weight_decay(gains_wd):
     torch.testing.assert_close(optimizer.state[untagged]["col_gain"], raw * (1 - lr * gains_wd))
     torch.testing.assert_close(
         optimizer.state[param]["row_gain"], torch.full((8,), 1.5 * (1 - lr * gains_wd)))
+
+
+def test_col_gain_pull_off_by_default():
+    """Without attention_in_gain_pull_col_gain a revive-scope matrix's column gain keeps the plain
+    decay g*(1 - lr*wd), as with no pull: by default the pull acts only on the pre-norm gammas."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _revive_matrix_optimizer(
+        param, gains_weight_decay=0.1, attention_in_gain_pull_coeff=0.5,
+        attention_in_gain_pull_target=1.0)
+    raw = torch.tensor([-3.0, 0.0, 2.0, 5.0])
+    optimizer.state[param]["col_gain"].copy_(raw)
+    group = optimizer.param_groups[0]
+    group["step"] = 1
+    optimizer._gains_step(param, group, {"col_gain": torch.zeros(4), "row_gain": torch.zeros(8)})
+    torch.testing.assert_close(optimizer.state[param]["col_gain"], raw * (1 - 0.01 * 0.1))
 
 
 @pytest.mark.parametrize("offset", [0.0, 1.0])
@@ -2805,7 +2834,8 @@ def test_col_gain_pull_keeps_sign_under_direct_parametrization():
     optimizer = _gqa_qkv_optimizer(
         param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
         gain_parametrization="direct", use_orthogonal_updates=False,
-        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0)
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0,
+        attention_in_gain_pull_col_gain=True)
     optimizer._maybe_init_gain_state(param)
     raw = torch.tensor([-3.0, -0.5, 0.5, 2.0])
     optimizer.state[param]["col_gain"].copy_(raw)
@@ -2822,11 +2852,15 @@ def test_col_gain_pull_keeps_sign_under_direct_parametrization():
     {},
     {"md_attention_in_gain_scope": "all", "md_dense_mlp_in_gain_revive": True,
      "md_moe_mlp_in_gain_revive": True, "md_attention_in_gain_pull_coeff": 5e-3},
+    {"md_attention_in_gain_scope": "all", "md_dense_mlp_in_gain_revive": True,
+     "md_moe_mlp_in_gain_revive": True, "md_attention_in_gain_pull_coeff": 5e-3,
+     "md_attention_in_gain_pull_col_gain": True},
 ])
 def test_builder_tags_revived_pre_norm_gains(monkeypatch, flags):
     """The builder tags exactly the in-scope pre-norm gammas (softmax linear_qkv always; KDA
     in_proj, dense fc1 and MoE pre_mlp_layernorm only with their flags) and, with a pull
-    coefficient, gives them md_decay_to_target = (coeff, target, offset)."""
+    coefficient, gives them md_decay_to_target = (coeff, target, offset). The gamma tags do not
+    depend on md_attention_in_gain_pull_col_gain, which is passed through to MDDecoupling."""
     names = {
         "decoder.layers.0.self_attention.in_proj.layer_norm_weight": "kda",
         "decoder.layers.0.mlp.linear_fc1.layer_norm_weight": "dense",
@@ -2857,10 +2891,16 @@ def test_builder_tags_revived_pre_norm_gains(monkeypatch, flags):
                         lambda *a, **k: SimpleNamespace(chained_optimizers=[]))
     config = OptimizerConfig(optimizer="md_decoupling", lr=0.01, min_lr=0.0)
     config.use_distributed_optimizer = False
+    # Tagging does not depend on the orthogonal updates, which need emerging-optimizers.
+    config.use_orthogonal_updates = False
     for k, v in flags.items():
         setattr(config, k, v)
-    md_module.get_megatron_mddecoupling_optimizer(
+    optimizer = md_module.get_megatron_mddecoupling_optimizer(
         config, [_FakeModelChunk()], config_overrides={}, pg_collection=_NoProcessGroups())
+    md_optimizer = optimizer.chained_optimizers[0].optimizer
+    assert isinstance(md_optimizer, MDDecoupling)
+    assert md_optimizer.attention_in_gain_pull_col_gain is flags.get(
+        "md_attention_in_gain_pull_col_gain", False)
 
     in_scope = {"softmax"} | ({"kda", "dense", "moe"} if flags else set())
     for name, kind in names.items():

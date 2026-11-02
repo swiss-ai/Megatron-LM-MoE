@@ -458,13 +458,15 @@ class OptimizerConfig:
     md_attention_in_gain_scope: str = 'softmax'
     """Which attention-in projections the revive and the pull touch: 'softmax' = the fused
     linear_qkv (pre-norm gamma + column gain) of the global softmax attention layers only;
-    'all' adds the KDA/GDN in_proj."""
+    'all' adds the KDA/GDN in_proj. The pull reaches the column gains only with
+    md_attention_in_gain_pull_col_gain."""
 
     md_dense_mlp_in_gain_revive: bool = False
     """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
     coefficient and target) to the gamma fused in front of the dense MLP linear_fc1 and to that
-    matrix's column gain: the dense layers of a hybrid dense/MoE stack. MoE experts and shared
-    experts have no fused pre-norm and are never touched."""
+    matrix's column gain: the dense layers of a hybrid dense/MoE stack. The pull reaches the column
+    gain only with md_attention_in_gain_pull_col_gain. MoE experts and shared experts have no fused
+    pre-norm and are never touched."""
 
     md_moe_mlp_in_gain_revive: bool = False
     """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
@@ -476,12 +478,19 @@ class OptimizerConfig:
     """Decoupled weight decay of the magnitude of the revive-scope gains toward a target value
     instead of 0: x <- x - lr * coeff * (x - sign(x) * c), where lr is that parameter's scheduled LR
     and sign(0) = +1, so |x| moves toward c and the sign is kept. For the pre-norm gamma x is the
-    effective gamma, applied right after the chained Adam step; for a softplus column gain x is the
-    raw gain and c = softplus_inv(target) (the multiplier is always positive), folded into the
-    gains AdamW decay (on top of --gains-weight-decay). 0 disables."""
+    effective gamma, applied right after the chained Adam step. With
+    md_attention_in_gain_pull_col_gain it also pulls the column gains of the revive-scope matrices;
+    for a softplus column gain x is the raw gain and c = softplus_inv(target) (the multiplier is
+    always positive), folded into the gains AdamW decay (on top of --gains-weight-decay).
+    0 disables."""
 
     md_attention_in_gain_pull_target: float = 1.0
     """Target magnitude c of the attention-in gain pull (effective-gain units)."""
+
+    md_attention_in_gain_pull_col_gain: bool = False
+    """Also apply the attention-in gain pull to the MDDecoupling column gains of the revive-scope
+    matrices. By default only the pre-norm gammas are pulled and the column gains keep the plain
+    gains decay toward 0."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
