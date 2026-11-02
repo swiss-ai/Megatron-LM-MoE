@@ -2677,7 +2677,8 @@ def test_revive_collapsed_gains_publishes_to_model_params():
 
     assert md_module.revive_collapsed_gains(chained, 1e-8) == 2
     assert calls == ["copy", "copy", "allgather"]
-    assert md._phi(md.state[param]["col_gain"])[0] > 1e-3 and float(gamma[0]) > 1.0
+    # mean("all") of [1e-14, 1, 2] is 1.0 in fp32
+    assert md._phi(md.state[param]["col_gain"])[0] > 1e-3 and abs(float(gamma[0]) - 1.0) < 1e-6
 
 
 def test_attention_in_pre_norm_gain_tag_predicate():
@@ -2708,6 +2709,16 @@ def test_attention_in_pre_norm_gain_tag_predicate():
         "decoder.layers.3.self_attention.q_layernorm.weight", one_d)
     assert not md_module._is_revived_pre_norm_gain(
         "decoder.layers.3.self_attention.linear_qkv.weight", two_d)
+    # MoE pre-MLP norm gamma only with moe_mlp_in; post norms never
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.pre_mlp_layernorm.weight", one_d, scope="all", dense_mlp_in=True)
+    assert md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.pre_mlp_layernorm.weight", one_d, moe_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.post_mlp_layernorm.weight", one_d, scope="all", dense_mlp_in=True,
+        moe_mlp_in=True)
+    assert not md_module._is_revived_pre_norm_gain(
+        "decoder.layers.3.post_self_attn_layernorm.weight", one_d, scope="all", moe_mlp_in=True)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2746,17 +2757,18 @@ def test_col_gain_pull_folded_into_gains_weight_decay(gains_wd):
 
 @pytest.mark.parametrize("offset", [0.0, 1.0])
 def test_decay_to_target_after_inner_step(offset):
-    """gamma <- gamma - lr * coeff * (gamma_eff - target) after the Adam step; the tag stores the
-    target in stored units (target - offset); untagged params get the plain Adam step."""
+    """gamma_eff <- gamma_eff - lr * coeff * (gamma_eff - sign(gamma_eff) * target) after the Adam
+    step: negative effective gains are pulled toward -target, positive ones toward +target;
+    untagged params get the plain Adam step."""
     from megatron.core.optimizer.optimizer import _decay_to_target
 
-    values = torch.tensor([1.5, -0.5, 2.0, 1.0])
+    values = torch.tensor([1.5, -0.5, 2.0, 1.0, -3.0, 0.2])
     gamma = torch.nn.Parameter(values - offset)
-    gamma.md_decay_to_target = (0.5, 1.0 - offset)
+    gamma.md_decay_to_target = (0.5, 1.0, offset)
     other = torch.nn.Parameter(values.clone())
     lr = 0.01
     adam = torch.optim.AdamW([gamma, other], lr=lr, weight_decay=0.0)
-    gamma.grad = torch.tensor([0.1, -0.2, 0.3, 0.05])
+    gamma.grad = torch.tensor([0.1, -0.2, 0.3, 0.05, 0.1, -0.1])
     other.grad = gamma.grad.clone()
     adam.step()
     plain = other.detach().clone()
@@ -2764,4 +2776,97 @@ def test_decay_to_target_after_inner_step(offset):
     _decay_to_target(adam)
 
     assert torch.equal(other.detach(), plain)
-    torch.testing.assert_close(gamma.detach() + offset, plain - lr * 0.5 * (plain - 1.0))
+    target = torch.where(plain < 0, -1.0, 1.0)
+    torch.testing.assert_close(gamma.detach() + offset, plain - lr * 0.5 * (plain - target))
+    assert torch.equal(torch.sign(gamma.detach() + offset), torch.sign(plain)), "signs are kept"
+
+
+def test_decay_to_target_keeps_sign_over_many_steps():
+    """Repeated decay with zero gradient converges |gamma| to the target and never flips a sign;
+    an exact zero goes to +target."""
+    from megatron.core.optimizer.optimizer import _decay_to_target
+
+    gamma = torch.nn.Parameter(torch.tensor([-0.9, -1e-9, 0.0, 1e-9, 0.9, -4.0, 4.0]))
+    gamma.md_decay_to_target = (1.0, 1.0, 0.0)
+    sgd = torch.optim.SGD([gamma], lr=0.05)
+    for _ in range(400):
+        gamma.grad = torch.zeros_like(gamma)
+        sgd.step()
+        _decay_to_target(sgd)
+    torch.testing.assert_close(
+        gamma.detach(), torch.tensor([-1.0, -1.0, 1.0, 1.0, 1.0, -1.0, 1.0]), rtol=0, atol=1e-5)
+
+
+def test_col_gain_pull_keeps_sign_under_direct_parametrization():
+    """Under gain_parametrization='direct' the stored column gain is the multiplier and may be
+    negative: the pull moves it toward sign(g) * target; the row gain keeps the plain decay."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _gqa_qkv_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization="direct", use_orthogonal_updates=False,
+        attention_in_gain_pull_coeff=0.5, attention_in_gain_pull_target=1.0)
+    optimizer._maybe_init_gain_state(param)
+    raw = torch.tensor([-3.0, -0.5, 0.5, 2.0])
+    optimizer.state[param]["col_gain"].copy_(raw)
+    group = optimizer.param_groups[0]
+    group["step"] = 1
+    optimizer._gains_step(param, group, {"col_gain": torch.zeros(4), "row_gain": torch.zeros(8)})
+    lr = optimizer._gains_lr(group)
+    target = torch.where(raw < 0, -1.0, 1.0)
+    torch.testing.assert_close(optimizer.state[param]["col_gain"], raw - lr * 0.5 * (raw - target))
+    torch.testing.assert_close(optimizer.state[param]["row_gain"], torch.ones(8))
+
+
+@pytest.mark.parametrize("flags", [
+    {},
+    {"md_attention_in_gain_scope": "all", "md_dense_mlp_in_gain_revive": True,
+     "md_moe_mlp_in_gain_revive": True, "md_attention_in_gain_pull_coeff": 5e-3},
+])
+def test_builder_tags_revived_pre_norm_gains(monkeypatch, flags):
+    """The builder tags exactly the in-scope pre-norm gammas (softmax linear_qkv always; KDA
+    in_proj, dense fc1 and MoE pre_mlp_layernorm only with their flags) and, with a pull
+    coefficient, gives them md_decay_to_target = (coeff, target, offset)."""
+    names = {
+        "decoder.layers.0.self_attention.in_proj.layer_norm_weight": "kda",
+        "decoder.layers.0.mlp.linear_fc1.layer_norm_weight": "dense",
+        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": "softmax",
+        "decoder.layers.3.pre_mlp_layernorm.weight": "moe",
+        "decoder.layers.3.post_mlp_layernorm.weight": None,
+        "decoder.layers.3.post_self_attn_layernorm.weight": None,
+        "decoder.layers.3.self_attention.q_layernorm.weight": None,
+        "decoder.final_layernorm.weight": None,
+    }
+    params = {n: torch.nn.Parameter(torch.ones(6)) for n in names}
+
+    class _FakeModelChunk:
+        config = SimpleNamespace(layernorm_zero_centered_gamma=False, num_attention_heads=2,
+                                 num_query_groups=2, kv_channels=3, hidden_size=6, num_layers=4)
+
+        def named_parameters(self):
+            return iter(params.items())
+
+        def named_modules(self):
+            return iter([])
+
+    def fake_get_param_groups(model_chunks, config, config_overrides):
+        return [{"params": list(params.values()), "is_expert_parallel": False}]
+
+    monkeypatch.setattr(md_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(md_module, "get_megatron_optimizer",
+                        lambda *a, **k: SimpleNamespace(chained_optimizers=[]))
+    config = OptimizerConfig(optimizer="md_decoupling", lr=0.01, min_lr=0.0)
+    config.use_distributed_optimizer = False
+    for k, v in flags.items():
+        setattr(config, k, v)
+    md_module.get_megatron_mddecoupling_optimizer(
+        config, [_FakeModelChunk()], config_overrides={}, pg_collection=_NoProcessGroups())
+
+    in_scope = {"softmax"} | ({"kda", "dense", "moe"} if flags else set())
+    for name, kind in names.items():
+        p = params[name]
+        assert getattr(p, "md_revived_pre_norm_gain", False) == (kind in in_scope), name
+        if flags and kind in in_scope:
+            assert p.md_decay_to_target == (5e-3, 1.0, 0.0), name
+        else:
+            assert not hasattr(p, "md_decay_to_target"), name

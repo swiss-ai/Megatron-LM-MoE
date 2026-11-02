@@ -123,16 +123,18 @@ _MAIN_PARAM_ROUTING_ATTRS = (
 
 @torch.no_grad()
 def _decay_to_target(torch_optimizer: torch.optim.Optimizer) -> None:
-    """Decoupled weight decay toward a target for params tagged ``md_decay_to_target =
-    (coeff, target)``: p <- p - lr * coeff * (p - target), lr = the param group's scheduled LR.
-    Runs right after the inner optimizer step, before the main -> model copy. No-op for untagged
-    params (the default)."""
+    """Decoupled weight decay of the magnitude toward a target for params tagged
+    ``md_decay_to_target = (coeff, target, offset)``: with the effective value x = p + offset,
+    p <- p - lr * coeff * (x - sign(x) * target), lr = the param group's scheduled LR and
+    sign(0) = +1, so |x| moves toward target and the sign is kept. Runs right after the inner
+    optimizer step, before the main -> model copy. No-op for untagged params (the default)."""
     for group in torch_optimizer.param_groups:
         for p in group["params"]:
             spec = getattr(p, "md_decay_to_target", None)
             if spec is not None:
-                coeff, target = spec
-                p.sub_((p - target) * (group["lr"] * coeff))
+                coeff, target, offset = spec
+                x = p + offset if offset else p
+                p.sub_((x - torch.where(x < 0, -target, target)) * (group["lr"] * coeff))
 
 
 def _propagate_routing_attrs(main_param, model_param):
