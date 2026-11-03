@@ -306,6 +306,11 @@ class LoggerConfig:
     gain|, and for each threshold T count-abs-below-T and fraction-abs-below-T, the number and
     fraction of gain entries with |effective gain| < T."""
 
+    log_muon_gain_abs_min: bool = False
+    """With log_muon_gains: log abs-min, the smallest |effective gain|, for every gain
+    family/axis (globally and per layer with log_muon_per_layer) even when
+    muon_gain_near_zero_thresholds is empty. abs-min is always logged when thresholds are given."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 
