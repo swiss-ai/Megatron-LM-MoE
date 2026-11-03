@@ -16,17 +16,22 @@ import torch
 METRICS = ("residual_input", "attention_output", "mlp_output")
 # Bound FP32 workspace to about 1 MiB (or one sequence position if larger).
 _CHUNK_ELEMENTS = 262144
-# Spike stats run about 20 small kernels per chunk, so they use 16 MiB chunks (three FP32
-# buffers live) to stay off the kernel-launch floor.
+# Spike stats run 40-60 small kernels per chunk, so they use 16 MiB chunks to stay off the
+# kernel-launch floor. Transient workspace is about 80 MiB: three FP32 chunk buffers plus the
+# float64 temporary of each float64 sum.
 _SPIKE_CHUNK_ELEMENTS = 4 * 1024 * 1024
+# torch.histc counts in float32, which is exact only below 2**24 per call.
+assert _SPIKE_CHUNK_ELEMENTS < 2**24
 # Spike stats: the median of |x| is read from a log10 histogram with 16 bins per decade
-# over [1e-12, 1e6], so it is within half a bin (about 7.5%) of the true median. |x| below
-# 1e-12, including 0, counts as 1e-12 and |x| above 1e6 as 1e6; NaN is left out.
+# over [1e-12, 1e6], so inside that range it is within half a bin (about 7.5%) of the true
+# median. |x| below 1e-12, including 0, counts as 1e-12 and |x| above 1e6 as 1e6, and the
+# result is clamped to [min, max]; NaN is left out.
 _HIST_LOG10_MIN, _HIST_LOG10_MAX, _HIST_BINS_PER_DECADE = -12, 6, 16
 _HIST_BINS = (_HIST_LOG10_MAX - _HIST_LOG10_MIN) * _HIST_BINS_PER_DECADE
 # Per (layer, metric): [count, sum d, sum d^2, sum d^3, sum d^4, sum |x|, histogram...] with
-# d = x - shift, where shift is the mean of the first chunk seen. Moments about a nearby
-# shift keep the kurtosis exact even when the mean is large against the spread.
+# d = x - shift, where shift is the mean of the first chunk with a valid element, rounded to
+# float32 (the precision d is computed in). Moments about a nearby shift keep the kurtosis
+# exact even when the mean is large against the spread.
 _SPIKE_SUMS = 6
 _active = False
 _spike_stats = False
@@ -36,11 +41,15 @@ _spike: Dict[tuple[int, str], "_SpikeState"] = {}
 
 
 class _SpikeState:
-    __slots__ = ("sums", "shift", "extrema")
+    __slots__ = ("sums", "shift", "has_shift", "shift_known", "extrema")
 
     def __init__(self, device: torch.device):
         self.sums = torch.zeros(_SPIKE_SUMS + _HIST_BINS, device=device, dtype=torch.float64)
-        self.shift: Optional[torch.Tensor] = None
+        self.shift = torch.zeros((), device=device, dtype=torch.float64)
+        # Whether a chunk with a valid element has set the shift: as a tensor (padded chunks
+        # are only known on the device), and on the host once an unpadded chunk set it.
+        self.has_shift = torch.zeros((), device=device, dtype=torch.bool)
+        self.shift_known = False
         # [-min |x|, max |x|], so one MAX all-reduce pools both.
         self.extrema = torch.tensor([-float("inf"), 0.0], device=device, dtype=torch.float64)
 
@@ -104,7 +113,8 @@ def record(
     *,
     training: bool = True,
 ) -> None:
-    """Accumulate squared sum and element count for [sequence, batch, hidden].
+    """Accumulate squared sum and element count for [sequence, batch, hidden], and the
+    spike accumulators when spike stats are on.
 
     ``padding_mask`` is already CP/SP-local, shaped [batch, sequence], with True
     for padding. Outputs are measured BEFORE sandwich norm/residual scaling/add,
@@ -172,9 +182,16 @@ def _accumulate_spike(
     state = _spike.get(key)
     if state is None:
         state = _spike[key] = _SpikeState(values.device)
-    if state.shift is None:
+    if not state.shift_known:
+        # Until a chunk with a valid element is seen, every accumulated sum is 0, so the shift
+        # can still change. A chunk that is all padding must not set it to 0.
         valid = count.clamp(min=1) if torch.is_tensor(count) else count
-        state.shift = values.sum(dtype=torch.float64) / valid
+        chunk_mean = (values.sum(dtype=torch.float64) / valid).float().double()
+        state.shift = torch.where(state.has_shift, state.shift, chunk_mean)
+        if torch.is_tensor(count):
+            state.has_shift |= count > 0
+        else:  # an unpadded chunk is never empty here
+            state.shift_known = True
     pad = None if padding is None else padding.unsqueeze(-1).expand_as(values)
     magnitude = values.abs()
     abs_sum = magnitude.sum(dtype=torch.float64)
@@ -255,10 +272,10 @@ def _collect_spike(num_layers: int, device: torch.device, totals: torch.Tensor,
     _spike.clear()
     n, s1, s2, s3, s4 = (sums[..., i] for i in range(5))
     # Global mean from sum x = sum d + count * shift, then the central moments about it.
-    mean = s1 + n * shift
+    sum_x = s1 + n * shift
     if distributed:
-        torch.distributed.all_reduce(mean, op=torch.distributed.ReduceOp.SUM)
-    d = shift - mean / totals[..., 1].clamp(min=1)
+        torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+    d = shift - sum_x / totals[..., 1].clamp(min=1)
     m2 = s2 + 2 * s1 * d + n * d * d
     m4 = s4 + 4 * s3 * d + 6 * s2 * d * d + 4 * s1 * d * d * d + n * d * d * d * d
     pooled = torch.cat((torch.stack((m2, m4), -1), sums[..., 5:]), -1)

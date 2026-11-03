@@ -260,7 +260,7 @@ class LoggerConfig:
     activation_spike_stats: bool = False
     """On the --activation-norm-log-interval steps, also log per-layer min, mean, median and max
     of |x| and the kurtosis of x for the same three activations (activation_spike/*). The median
-    comes from a log-spaced histogram over [1e-12, 1e6] (within 7.5%). On those steps the
+    comes from a log-spaced histogram (within 7.5% for |x| in [1e-12, 1e6]). On those steps the
     logger works in 16 MiB chunks (about 80 MiB of transient workspace) and adds three small
     all-reduces."""
 
