@@ -7,6 +7,7 @@ Run: python tests/unit_tests/transformer/test_activation_norm_logging_cpu.py
 
 import importlib.util
 import gc
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -42,6 +43,50 @@ def distributed_worker(rank, rendezvous):
         assert stats["activation_norm/mlp_output_rms_layer_1"] == 7.0
     finally:
         dist.destroy_process_group()
+
+
+def spike_worker(rank, rendezvous):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        logging.set_active(True, spike_stats=True)
+        with logging.forward_scope():
+            # Rank 1 holds the spike; layer 1 exists only on rank 0 (another PP stage).
+            x = torch.tensor([[[1.0, -2.0]], [[0.5, 3.0]]]) if rank == 0 else torch.tensor([[[40.0, -1.0]]])
+            logging.record(0, "residual_input", x)
+            if rank == 0:
+                logging.record(1, "mlp_output", torch.full((1, 1, 2), 2.0))
+        stats = logging.collect(2, torch.device("cpu"))
+        pooled = torch.tensor([1.0, -2.0, 0.5, 3.0, 40.0, -1.0], dtype=torch.float64)
+        expected = spike_reference(pooled)
+        for name, value in expected.items():
+            assert abs(stats[f"activation_spike/residual_input_{name}_layer_0"] - value) < 1e-9, name
+        assert stats["activation_spike/mlp_output_abs_max_layer_1"] == 2.0
+        assert "activation_spike/attention_output_abs_max_layer_0" not in stats
+        # Large common offset, rank means one spread apart, two chunks per rank: each rank's
+        # shift must be the number it subtracted, or the pooled kurtosis drifts (~4e-4 here).
+        generator = torch.Generator().manual_seed(rank)
+        x = (torch.randn(32, 1, 512, generator=generator) + 1e5 + rank).float()
+        logging.set_active(True, spike_stats=True)
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", 16 * 512), logging.forward_scope():
+            logging.record(0, "attention_output", x)
+        logged = logging.collect(1, torch.device("cpu"))["activation_spike/attention_output_kurtosis_layer_0"]
+        gathered = [torch.empty_like(x) for _ in range(2)]
+        dist.all_gather(gathered, x)
+        expected = spike_reference(torch.cat(gathered).double().flatten())["kurtosis"]
+        assert abs(logged - expected) < 1e-6 * expected, (logged, expected)
+    finally:
+        dist.destroy_process_group()
+
+
+def spike_reference(values):
+    """Exact min/mean/max of |x| and kurtosis of a flat float64 tensor (median not included)."""
+    centred = values - values.mean()
+    return {
+        "abs_min": values.abs().min().item(),
+        "abs_mean": values.abs().mean().item(),
+        "abs_max": values.abs().max().item(),
+        "kurtosis": (centred.pow(4).mean() / centred.square().mean().square()).item(),
+    }
 
 
 class TestActivationNormLogging(unittest.TestCase):
@@ -144,6 +189,15 @@ class TestActivationNormLogging(unittest.TestCase):
             logging.record(0, "residual_input", torch.full((2, 1, 4), 3.0))
         self.assertEqual(self.collect()["activation_norm/residual_input_rms_layer_0"], 3.0)
 
+    def test_rerun_discards_rejected_attempt_spike_stats(self):
+        logging.set_active(True, spike_stats=True)
+        with logging.forward_scope():
+            logging.record(0, "residual_input", torch.full((2, 1, 4), 100.0))
+        logging.reset_attempt()
+        with logging.forward_scope():
+            logging.record(0, "residual_input", torch.full((2, 1, 4), 3.0))
+        self.assertEqual(self.collect()["activation_spike/residual_input_abs_max_layer_0"], 3.0)
+
     def test_scope_restored_on_exception_and_eval_is_ignored(self):
         logging.set_active(True)
         with self.assertRaises(RuntimeError), logging.forward_scope():
@@ -160,6 +214,133 @@ class TestActivationNormLogging(unittest.TestCase):
             logging.record(0, "residual_input", x)
         expected = x.double().square().mean().sqrt().item()
         self.assertAlmostEqual(self.collect()["activation_norm/residual_input_rms_layer_0"], expected)
+
+    def test_spike_stats_off_by_default(self):
+        logging.set_active(True)
+        # The flag-off path must keep main's chunk size: reading the spike one would fail here.
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", None), logging.forward_scope():
+            logging.record(0, "residual_input", torch.randn(4, 1, 8))
+        self.assertFalse(logging._spike)
+        self.assertFalse([k for k in self.collect() if k.startswith("activation_spike/")])
+
+    def test_spike_stats_match_reference_with_padding_bias_and_chunks(self):
+        torch.manual_seed(0)
+        x = torch.randn(6, 2, 5)
+        x[2, 1, 3] = -50.0  # one spike, negative so that max(x) != max(|x|)
+        x[0, 0, 0] = 1e3  # padded spike, must be ignored
+        padding = torch.zeros(2, 6, dtype=torch.bool)
+        padding[0, 0] = True
+        bias = torch.tensor([0.1, -0.2, 0.0, 0.3, 0.0])
+        valid = (x.double() + bias.double())[~padding.T]
+        logging.set_active(True, spike_stats=True)
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", 10), logging.forward_scope():
+            logging.record(0, "mlp_output", x, padding, bias)
+        stats = self.collect()
+        for name, value in spike_reference(valid.flatten()).items():
+            self.assertAlmostEqual(stats[f"activation_spike/mlp_output_{name}_layer_0"], value, places=5)
+        median = valid.abs().median().item()
+        half_bin = 10 ** (0.5 / logging._HIST_BINS_PER_DECADE)
+        logged = stats["activation_spike/mlp_output_abs_median_layer_0"]
+        self.assertTrue(median / half_bin <= logged <= median * half_bin, (logged, median))
+        self.assertAlmostEqual(stats["activation_spike/mlp_output_abs_max_layer_0"], 49.7, places=5)
+
+    def spike_stats(self, x, padding=None, layer=0, metric="residual_input"):
+        logging.set_active(True, spike_stats=True)
+        with logging.forward_scope():
+            logging.record(layer, metric, x, padding)
+        stats = self.collect()
+        return {k.split(f"{metric}_")[1].replace(f"_layer_{layer}", ""): v for k, v in stats.items()
+                if k.startswith(f"activation_spike/{metric}_")}
+
+    def test_spike_kurtosis_exact_with_large_mean_offset(self):
+        torch.manual_seed(0)
+        noise = torch.randn(256, 1, 1024)
+        for offset, dtype in ((1e3, torch.float32), (1e3, torch.bfloat16), (1e5, torch.float32)):
+            x = (noise + offset).to(dtype)
+            expected = spike_reference(x.double().flatten())["kurtosis"]
+            logged = self.spike_stats(x)["kurtosis"]
+            self.assertAlmostEqual(logged, expected, delta=1e-3 * expected, msg=(offset, dtype))
+
+    def test_spike_median_bin_position_and_range_ends(self):
+        # Even split: lower median (as torch.median), read at the centre of its bin. Padded
+        # tokens (here most of them) must stay out of the histogram.
+        half_bin = 10 ** (0.5 / logging._HIST_BINS_PER_DECADE)
+        padding = torch.ones(1, 32, dtype=torch.bool)
+        padding[0, :8] = False
+        for value in (10 ** 0.34, 10 ** -3.2, 10 ** 2.7):
+            x = torch.full((32, 1, 1), 1e4)
+            x[:8, 0, 0] = torch.tensor([value] * 4 + [10 * value] * 4)
+            logged = self.spike_stats(x, padding)["abs_median"]
+            self.assertTrue(value / half_bin <= logged <= value * half_bin, (value, logged))
+        # Constant inputs read exactly, also outside the histogram range.
+        for value in (1e-13, 1e-12, 1.0, 1e6, 1e8):
+            stats = self.spike_stats(torch.full((2, 1, 4), value))
+            for name in ("abs_min", "abs_median", "abs_max"):
+                self.assertAlmostEqual(stats[name] / value, 1.0, places=6, msg=(name, value))
+
+    def test_spike_all_zero_and_nan_inf(self):
+        zeros = self.spike_stats(torch.zeros(4, 1, 8))
+        self.assertEqual((zeros["abs_min"], zeros["abs_mean"], zeros["abs_median"], zeros["abs_max"]),
+                         (0.0, 0.0, 0.0, 0.0))
+        self.assertTrue(math.isnan(zeros["kurtosis"]))
+        x = torch.full((4, 1, 8), 2.0)
+        x[1, 0, 2] = float("nan")
+        nan = self.spike_stats(x)
+        half_bin = 10 ** (0.5 / logging._HIST_BINS_PER_DECADE)
+        self.assertTrue(2.0 / half_bin <= nan["abs_median"] <= 2.0 * half_bin)  # NaN is left out
+        self.assertTrue(all(math.isnan(nan[k]) for k in ("abs_min", "abs_mean", "abs_max", "kurtosis")))
+        x[1, 0, 2] = float("inf")
+        inf = self.spike_stats(x)
+        self.assertEqual((inf["abs_min"], inf["abs_mean"], inf["abs_max"]), (2.0, float("inf"), float("inf")))
+        self.assertTrue(math.isnan(inf["kurtosis"]))
+        # NaN inside padding never leaks, even when the first chunk is all padding.
+        x = torch.randn(4, 1, 8)
+        x[0, 0, 3] = float("nan")
+        padding = torch.zeros(1, 4, dtype=torch.bool)
+        padding[0, 0] = True
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", 8):
+            stats = self.spike_stats(x, padding)
+        for name, value in spike_reference(x[1:].double().flatten()).items():
+            self.assertAlmostEqual(stats[name], value, places=5)
+
+    def test_spike_kurtosis_exact_when_first_chunk_is_all_padding(self):
+        # An all-padding first chunk must not set the shift to 0: with an offset of 1e4 times
+        # the spread, moments about 0 would cancel completely.
+        torch.manual_seed(0)
+        x = torch.randn(16, 2, 64) + 1e4
+        padding = torch.zeros(2, 16, dtype=torch.bool)
+        padding[:, :4] = True
+        padding[1, 12:] = True
+        with patch.object(logging, "_SPIKE_CHUNK_ELEMENTS", 4 * 2 * 64):
+            stats = self.spike_stats(x, padding)
+        expected = spike_reference(x.double()[~padding.T].flatten())["kurtosis"]
+        self.assertAlmostEqual(stats["kurtosis"], expected, delta=1e-6 * expected)
+
+    def test_set_active_clears_spike_accumulators(self):
+        logging.set_active(True, spike_stats=True)
+        with logging.forward_scope():
+            logging.record(0, "residual_input", torch.full((2, 1, 4), 100.0))
+        self.assertEqual(self.spike_stats(torch.full((2, 1, 4), 3.0))["abs_max"], 3.0)
+
+    def test_spike_kurtosis_gaussian_vs_one_hot(self):
+        torch.manual_seed(0)
+        logging.set_active(True, spike_stats=True)
+        one_hot = torch.zeros(64, 1, 128)
+        one_hot[:, :, 7] = 1.0
+        with logging.forward_scope():
+            logging.record(0, "residual_input", torch.randn(256, 1, 128))
+            logging.record(1, "residual_input", one_hot)
+        stats = self.collect()
+        self.assertAlmostEqual(stats["activation_spike/residual_input_kurtosis_layer_0"], 3.0, delta=0.1)
+        # One channel in 128: kurtosis ~ 128 (a spiky distribution).
+        self.assertGreater(stats["activation_spike/residual_input_kurtosis_layer_1"], 100)
+        self.assertEqual(stats["activation_spike/residual_input_abs_min_layer_1"], 0.0)
+
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo unavailable")
+    def test_distributed_spike_stats_pool_across_ranks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendezvous = Path(tmp, "rendezvous").resolve().as_uri()
+            mp.spawn(spike_worker, args=(rendezvous,), nprocs=2, join=True)
 
     @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo unavailable")
     def test_distributed_unequal_shards_and_pp_ownership(self):
