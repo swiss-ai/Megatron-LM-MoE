@@ -645,6 +645,47 @@ def test_collect_md_gain_stats_near_zero_off_by_default():
     assert not any("abs-min" in name or "abs-below" in name for name in base)
 
 
+def test_collect_md_gain_stats_logs_abs_min_without_thresholds():
+    optimizer = _near_zero_optimizer()
+    stats = collect_md_gain_stats(
+        optimizer, per_layer=True, log_sparsity=False, log_gain_abs_min=True
+    )
+    for prefix in ("muon-md", "muon-md/layers/3"):
+        col = f"{prefix}/gains/attention-in/col"
+        assert stats[f"{col}/abs-min"] == pytest.approx(1e-9, rel=1e-3)
+    assert not any("abs-below" in name for name in stats)
+
+    # the same abs-min values are logged alongside the thresholds
+    with_thresholds = collect_md_gain_stats(
+        optimizer, per_layer=True, log_sparsity=False, gain_near_zero_thresholds=[1e-6]
+    )
+    for name, value in stats.items():
+        if name.endswith("/abs-min"):
+            assert with_thresholds[name] == value
+
+
+def test_collect_md_gain_stats_abs_min_on_layernorm_gains():
+    stats = collect_md_gain_stats(
+        _near_zero_optimizer(), per_layer=True, log_sparsity=False, log_gain_abs_min=True
+    )
+    for prefix in ("muon-md", "muon-md/layers/3"):
+        norm = f"{prefix}/gains/layernorm/flat"
+        # the smallest-magnitude norm gain is -1e-12, so abs-min differs from the signed min
+        assert stats[f"{norm}/abs-min"] == pytest.approx(1e-12, rel=1e-3)
+        assert stats[f"{norm}/min"] == pytest.approx(-0.4)
+
+
+def test_collect_md_gain_stats_abs_min_flag_requires_log_gains():
+    stats = collect_md_gain_stats(
+        _near_zero_optimizer(),
+        per_layer=True,
+        log_gains=False,
+        log_sparsity=False,
+        log_gain_abs_min=True,
+    )
+    assert not any("abs-min" in name for name in stats)
+
+
 def test_collect_md_gain_stats_logs_near_zero_counts_on_abs_effective_gain():
     stats = collect_md_gain_stats(
         _near_zero_optimizer(),

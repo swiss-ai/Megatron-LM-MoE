@@ -539,7 +539,8 @@ def _append_md_gain_stats(
     """Turn reduced sufficient statistics into the final scalar metric values.
 
     ``mean``, ``rms``, saturation, ``min``, and ``max`` describe all gain elements in a bucket.
-    With ``near_zero_thresholds``, ``abs-min`` and ``count``/``fraction-abs-below-T`` do too.
+    ``abs-min`` (when ``abs_minima`` is given) and, with ``near_zero_thresholds``,
+    ``count``/``fraction-abs-below-T`` do too.
     ``effective-rms``, combined scale, gauge, and sparsity metrics instead average
     already-computed matrix values, so differently sized matrices receive equal weight.
     """
@@ -562,8 +563,9 @@ def _append_md_gain_stats(
                 stats[f"{gain_prefix}/saturated-fraction"] = (
                     saturated_count / softplus_count
                 )
-            if near_zero_thresholds:
+            if abs_minima is not None:
                 stats[f"{gain_prefix}/abs-min"] = abs_minima[bucket]
+            if near_zero_thresholds:
                 for threshold_index, threshold in enumerate(near_zero_thresholds):
                     below = totals[bucket][_GAIN_STAT_COUNT + threshold_index]
                     stats[f"{gain_prefix}/count-abs-below-{threshold}"] = below
@@ -605,6 +607,7 @@ def collect_md_gain_stats(
     log_param_rms: bool = True,
     gain_near_zero_thresholds=(),
     log_norm_components: bool = False,
+    log_gain_abs_min: bool = False,
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-MD statistics."""
     from .md_decoupling import MDDecoupling
@@ -620,6 +623,7 @@ def collect_md_gain_stats(
         log_param_rms,
         gain_near_zero_thresholds,
         log_norm_components,
+        log_gain_abs_min,
     )
 
 
@@ -632,6 +636,7 @@ def collect_muon_stats(
     log_param_rms: bool = True,
     gain_near_zero_thresholds=(),
     log_norm_components: bool = False,
+    log_gain_abs_min: bool = False,
 ) -> Dict[str, float]:
     """Collect standard Muon LayerNorm gain, weight sparsity, and RMS statistics."""
     from .muon import TensorParallelMuon
@@ -647,6 +652,7 @@ def collect_muon_stats(
         log_param_rms,
         gain_near_zero_thresholds,
         log_norm_components,
+        log_gain_abs_min,
     )
 
 
@@ -662,6 +668,7 @@ def _collect_muon_stats(
     log_param_rms: bool,
     gain_near_zero_thresholds=(),
     log_norm_components: bool = False,
+    log_gain_abs_min: bool = False,
 ) -> Dict[str, float]:
     """Collect selected global and optionally per-layer Muon-family statistics.
 
@@ -691,6 +698,8 @@ def _collect_muon_stats(
     )
     if any(not math.isfinite(value) or value <= 0 for value in near_zero_thresholds):
         raise ValueError(f"{namespace} gain near-zero thresholds must be finite positive values")
+    # abs-min is logged on its own with log_gain_abs_min, and always alongside the thresholds.
+    log_abs_min = log_gains and (log_gain_abs_min or bool(near_zero_thresholds))
 
     wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
     inner_optimizers = [
@@ -760,7 +769,7 @@ def _collect_muon_stats(
         (scope_count, bucket_count), float("inf"), dtype=torch.float64, device=device
     )
     maxima = torch.full_like(minima, float("-inf"))
-    abs_minima = torch.full_like(minima, float("inf")) if near_zero_thresholds else None
+    abs_minima = torch.full_like(minima, float("inf")) if log_abs_min else None
     matrix_axis_totals = torch.zeros(
         (scope_count, bucket_count, _MATRIX_AXIS_STAT_COUNT),
         dtype=torch.float64,
@@ -897,7 +906,7 @@ def _collect_muon_stats(
         gain_maxima = torch.segment_reduce(effective_gain, "max", lengths=entry_counts)
         gain_abs_minima = (
             torch.segment_reduce(effective_gain.abs(), "min", lengths=entry_counts)
-            if near_zero_thresholds
+            if log_abs_min
             else None
         )
         entry_buckets = torch.tensor(
@@ -909,7 +918,7 @@ def _collect_muon_stats(
         flat_totals.index_add_(0, entry_buckets, gain_values)
         flat_minima.scatter_reduce_(0, entry_buckets, gain_minima, reduce="amin")
         flat_maxima.scatter_reduce_(0, entry_buckets, gain_maxima, reduce="amax")
-        if near_zero_thresholds:
+        if log_abs_min:
             abs_minima.view(-1).scatter_reduce_(
                 0, entry_buckets, gain_abs_minima, reduce="amin"
             )
@@ -931,7 +940,7 @@ def _collect_muon_stats(
             flat_maxima.scatter_reduce_(
                 0, layer_indices, gain_maxima[layer_entries], reduce="amax"
             )
-            if near_zero_thresholds:
+            if log_abs_min:
                 abs_minima.view(-1).scatter_reduce_(
                     0, layer_indices, gain_abs_minima[layer_entries], reduce="amin"
                 )
@@ -953,7 +962,7 @@ def _collect_muon_stats(
                     torch.distributed.all_reduce(matrix_axis_totals, async_op=True),
                 )
             )
-            if near_zero_thresholds:
+            if log_abs_min:
                 works.append(
                     torch.distributed.all_reduce(
                         abs_minima, op=torch.distributed.ReduceOp.MIN, async_op=True
@@ -969,7 +978,7 @@ def _collect_muon_stats(
         tensor.cpu().tolist()
         for tensor in (totals, minima, maxima, matrix_axis_totals, matrix_totals)
     )
-    abs_minima = abs_minima.cpu().tolist() if near_zero_thresholds else None
+    abs_minima = abs_minima.cpu().tolist() if log_abs_min else None
     nvtx_range_pop(f"{namespace}/logging/cpu-transfer")
     stats = {}
     nvtx_range_push(f"{namespace}/logging/format-statistics")
@@ -984,7 +993,7 @@ def _collect_muon_stats(
             matrix_totals[scope],
             sparsity_thresholds,
             prefix=prefix,
-            abs_minima=abs_minima[scope] if near_zero_thresholds else None,
+            abs_minima=abs_minima[scope] if log_abs_min else None,
             near_zero_thresholds=near_zero_thresholds,
             families=families,
         )
