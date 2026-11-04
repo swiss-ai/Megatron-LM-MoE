@@ -30,6 +30,10 @@ products:
     ranks: 4
     test_case: [tests/unit_tests/data/**/*.py]
 
+  - name: cpu-offloading-ats
+    ranks: 4
+    test_case: [tests/unit_tests/test_optimizer_cpu_offloading_ats.py]
+
   - name: checkpoint-optimizer
     ranks: 8
     test_case: [tests/unit_tests/dist_checkpointing/test_optimizer.py]

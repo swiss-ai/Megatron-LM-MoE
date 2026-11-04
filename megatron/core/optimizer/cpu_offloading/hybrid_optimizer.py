@@ -40,6 +40,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         This optimizer is particularly useful in scenarios where memory
         constraints are present or when leveraging both CPU and GPU resources
         can lead to performance improvements.
+
+        Enable ``pin_cpu_optimizer_state`` to copy pageable CPU optimizer state
+        into CUDA host storage after each CPU update and when restoring state.
+        This prevents access-driven migration to GPU HBM on ATS systems such as
+        GH200. Already-pinned tensors are reused. Each new or replaced pageable
+        tensor needs a copy and temporarily occupies both allocations. Working
+        parameters and gradients remain controlled by their own pinning options.
     """
 
     def __init__(
@@ -52,6 +59,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        pin_cpu_optimizer_state: bool = False,
         **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -63,6 +71,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "param_update_in_fp32": param_update_in_fp32,
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
+                "pin_cpu_optimizer_state": pin_cpu_optimizer_state,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
                 **kwargs,
             },
@@ -73,6 +82,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.gpu_optimizer_cls = gpu_optimizer_cls
         self.pin_cpu_grads = pin_cpu_grads
         self.pin_cpu_params = pin_cpu_params
+        self.pin_cpu_optimizer_state = pin_cpu_optimizer_state
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
@@ -117,6 +127,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
+                self._pin_cpu_optimizer_state(optimizer)
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
@@ -146,6 +157,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 optimizer.register_step_post_hook(param_copy_back_gpu_hook_closure())
             elif self.param_update_in_fp32:
                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
+
+    def _pin_cpu_optimizer_state(self, optimizer):
+        if self.pin_cpu_optimizer_state:
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    # master_param aliases a working parameter, not optimizer-owned state.
+                    if key != "master_param" and isinstance(value, torch.Tensor):
+                        if value.device.type == "cpu" and value.numel() and not value.is_pinned():
+                            # This will make a copy of the tensor in pinned memory.
+                            state[key] = value.pin_memory()
 
     def step(self, closure=None):
         """
@@ -365,6 +386,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                         self.state[orig_param][k] = state[k] = v.to("cpu")
                     else:
                         self.state[orig_param][k] = state[k] = v.to("cuda")
+            if optimizer in self.cpu_optimizers:
+                self._pin_cpu_optimizer_state(optimizer)
 
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:

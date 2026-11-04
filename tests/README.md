@@ -145,6 +145,26 @@ passing coverage. Phase logs use `prod.node-*.{out,err}` and
 without waiting for pytest's final summary. Compiler-cache isolation does not
 isolate UCCL proxy state between cases in the same pytest process.
 
+### GH200/GB200 ATS optimizer-state residency probe
+
+```bash
+NODES=1 bash tests/run_tests.sh unit cpu-offloading-ats
+```
+
+This dedicated experimental group runs a real `HybridDeviceOptimizer` update, then
+compares its pageable and pinned `exp_avg` state. A GPU kernel deliberately
+reads/writes the original CPU moment for 100 passes; no prefetch is requested.
+Query-only `numa_move_pages` calls sample 512 page locations before and after.
+JUnit properties record how many sampled pages reside on HBM NUMA nodes.
+
+The pageable control must show migration to HBM; pinned state must stay on CPU.
+This is a mechanism test, **not** a claim that normal CPU AdamW execution accesses
+moments from the GPU. It requires GH200 or GB200 ATS, libnuma, page-residency query permission,
+and enabled access-counter migration. Unsupported systems skip. On supported
+hardware, failure to reproduce pageable migration is a test failure, not evidence
+that pinning prevented it. The `general` group excludes this dedicated group.
+Selecting `cpu-offloading-ats` (or `all`) runs it without an extra environment flag.
+
 ### Unit fixtures
 
 NVIDIA's public v2.5 unit datasets and tokenizers are already installed at
