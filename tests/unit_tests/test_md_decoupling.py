@@ -2910,3 +2910,55 @@ def test_builder_tags_revived_pre_norm_gains(monkeypatch, flags):
             assert p.md_decay_to_target == (5e-3, 1.0, 0.0), name
         else:
             assert not hasattr(p, "md_decay_to_target"), name
+
+
+@pytest.mark.parametrize("post_norm_flag", [False, True])
+def test_builder_tags_post_norm_gains(monkeypatch, post_norm_flag):
+    """With md_post_norm_gain_pull and a pull coefficient the builder gives the sandwich-norm
+    output gammas (post_self_attn_layernorm, post_mlp_layernorm) md_decay_to_target = (coeff,
+    target, offset) without tagging them as revived pre-norm gains; without the flag they are
+    untouched. The QK-norm, KDA output-norm and final-norm gammas are never tagged."""
+    names = {
+        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": "pre",
+        "decoder.layers.3.post_self_attn_layernorm.weight": "post",
+        "decoder.layers.3.post_mlp_layernorm.weight": "post",
+        "decoder.layers.0.post_self_attn_layernorm.weight": "post",
+        "decoder.layers.0.post_mlp_layernorm.weight": "post",
+        "decoder.layers.3.self_attention.q_layernorm.weight": None,
+        "decoder.layers.0.self_attention.out_norm.weight": None,
+        "decoder.final_layernorm.weight": None,
+    }
+    params = {n: torch.nn.Parameter(torch.ones(6)) for n in names}
+
+    class _FakeModelChunk:
+        config = SimpleNamespace(layernorm_zero_centered_gamma=False, num_attention_heads=2,
+                                 num_query_groups=2, kv_channels=3, hidden_size=6, num_layers=4)
+
+        def named_parameters(self):
+            return iter(params.items())
+
+        def named_modules(self):
+            return iter([])
+
+    def fake_get_param_groups(model_chunks, config, config_overrides):
+        return [{"params": list(params.values()), "is_expert_parallel": False}]
+
+    monkeypatch.setattr(md_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(md_module, "get_megatron_optimizer",
+                        lambda *a, **k: SimpleNamespace(chained_optimizers=[]))
+    config = OptimizerConfig(optimizer="md_decoupling", lr=0.01, min_lr=0.0)
+    config.use_distributed_optimizer = False
+    config.use_orthogonal_updates = False
+    config.md_attention_in_gain_pull_coeff = 5e-3
+    config.md_attention_in_gain_pull_target = 0.5
+    config.md_post_norm_gain_pull = post_norm_flag
+    md_module.get_megatron_mddecoupling_optimizer(
+        config, [_FakeModelChunk()], config_overrides={}, pg_collection=_NoProcessGroups())
+
+    for name, kind in names.items():
+        p = params[name]
+        assert getattr(p, "md_revived_pre_norm_gain", False) == (kind == "pre"), name
+        expect_pull = kind == "pre" or (kind == "post" and post_norm_flag)
+        assert hasattr(p, "md_decay_to_target") == expect_pull, name
+        if expect_pull:
+            assert p.md_decay_to_target == (5e-3, 0.5, 0.0), name

@@ -1657,6 +1657,17 @@ def validate_args(args, defaults={}):
                 "--md-attention-in-gain-pull-col-gain has no effect without "
                 "--md-attention-in-gain-pull-coeff > 0."
             )
+        if args.md_post_norm_gain_pull:
+            if not args.md_attention_in_gain_pull_coeff:
+                warn_rank_0(
+                    "--md-post-norm-gain-pull has no effect without "
+                    "--md-attention-in-gain-pull-coeff > 0."
+                )
+            if not args.sandwich_norm:
+                warn_rank_0(
+                    "--md-post-norm-gain-pull has no effect without --sandwich-norm "
+                    "(no post_self_attn_layernorm / post_mlp_layernorm gammas)."
+                )
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
                 "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
@@ -3167,6 +3178,11 @@ def _add_training_args(parser):
                        help='Also apply --md-attention-in-gain-pull-coeff to the MDDecoupling column '
                        'gains of the input projections in scope. By default only the pre-norm gammas '
                        'are pulled.')
+    group.add_argument('--md-post-norm-gain-pull', action='store_true', default=False,
+                       help='Also apply --md-attention-in-gain-pull-coeff (same coefficient and target) '
+                       'to the sandwich-norm output gammas of every layer: post_self_attn_layernorm '
+                       'and post_mlp_layernorm (--sandwich-norm). Pull only, no revive. The QK-norm, '
+                       'KDA output-norm and final-norm gammas are not touched.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

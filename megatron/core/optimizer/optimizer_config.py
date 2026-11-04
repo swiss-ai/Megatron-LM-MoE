@@ -492,6 +492,13 @@ class OptimizerConfig:
     matrices. By default only the pre-norm gammas are pulled and the column gains keep the plain
     gains decay toward 0."""
 
+    md_post_norm_gain_pull: bool = False
+    """Also apply the attention-in gain pull (same md_attention_in_gain_pull_coeff and target) to
+    the sandwich-norm output gammas of every layer, post_self_attn_layernorm and
+    post_mlp_layernorm: x <- x - lr * coeff * (x - sign(x) * c) on the effective gamma, right
+    after the chained Adam step. Pull only, no revive. The QK-norm, KDA output-norm and
+    final-norm gammas are not touched."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed
