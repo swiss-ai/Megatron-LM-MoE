@@ -485,19 +485,21 @@ class OptimizerConfig:
     0 disables."""
 
     md_attention_in_gain_pull_target: float = 1.0
-    """Target magnitude c of the attention-in gain pull (effective-gain units)."""
+    """Target magnitude c of the attention-in gain pull and of the post-norm gain pull
+    (md_post_norm_gain_pull_coeff), in effective-gain units."""
 
     md_attention_in_gain_pull_col_gain: bool = False
     """Also apply the attention-in gain pull to the MDDecoupling column gains of the revive-scope
     matrices. By default only the pre-norm gammas are pulled and the column gains keep the plain
     gains decay toward 0."""
 
-    md_post_norm_gain_pull: bool = False
-    """Also apply the attention-in gain pull (same md_attention_in_gain_pull_coeff and target) to
-    the sandwich-norm output gammas of every layer, post_self_attn_layernorm and
-    post_mlp_layernorm: x <- x - lr * coeff * (x - sign(x) * c) on the effective gamma, right
-    after the chained Adam step. Pull only, no revive. The QK-norm, KDA output-norm and
-    final-norm gammas are not touched."""
+    md_post_norm_gain_pull_coeff: float = 0.0
+    """Pull of the sandwich-norm output gammas (post_self_attn_layernorm, post_mlp_layernorm of
+    every layer) toward the same target as the pre-norm pull (md_attention_in_gain_pull_target),
+    with its own coefficient: x <- x - lr * coeff * (x - sign(x) * c) on the effective gamma, right
+    after the chained Adam step. Independent of md_attention_in_gain_pull_coeff, so the pre-norm
+    and post-norm pulls can have different strengths (or either can be off). Pull only, no
+    revive. The QK-norm, KDA output-norm and final-norm gammas are not touched. 0 disables."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state

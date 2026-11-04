@@ -2912,23 +2912,28 @@ def test_builder_tags_revived_pre_norm_gains(monkeypatch, flags):
             assert not hasattr(p, "md_decay_to_target"), name
 
 
-@pytest.mark.parametrize("post_norm_flag", [False, True])
-def test_builder_tags_post_norm_gains(monkeypatch, post_norm_flag):
-    """With md_post_norm_gain_pull and a pull coefficient the builder gives the sandwich-norm
-    output gammas (post_self_attn_layernorm, post_mlp_layernorm) md_decay_to_target = (coeff,
-    target, offset) without tagging them as revived pre-norm gains; without the flag they are
-    untouched. The QK-norm, KDA output-norm and final-norm gammas are never tagged."""
-    names = {
-        "decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": "pre",
-        "decoder.layers.3.post_self_attn_layernorm.weight": "post",
-        "decoder.layers.3.post_mlp_layernorm.weight": "post",
-        "decoder.layers.0.post_self_attn_layernorm.weight": "post",
-        "decoder.layers.0.post_mlp_layernorm.weight": "post",
-        "decoder.layers.3.self_attention.q_layernorm.weight": None,
-        "decoder.layers.0.self_attention.out_norm.weight": None,
-        "decoder.final_layernorm.weight": None,
-    }
-    params = {n: torch.nn.Parameter(torch.ones(6)) for n in names}
+# Gammas of one KDA layer (0, dense MLP) and one global-attention layer (3, MoE) with
+# --sandwich-norm, as in a hybrid KDA / MoE stack. Values: which pull scope the gamma belongs to.
+_POST_NORM_PULL_NAMES = {
+    "module.decoder.layers.0.self_attention.in_proj.layer_norm_weight": "pre_all",
+    "module.decoder.layers.0.self_attention.out_norm.weight": None,
+    "module.decoder.layers.0.post_self_attn_layernorm.weight": "post",
+    "module.decoder.layers.0.mlp.linear_fc1.layer_norm_weight": "pre_all",
+    "module.decoder.layers.0.post_mlp_layernorm.weight": "post",
+    "module.decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": "pre",
+    "module.decoder.layers.3.self_attention.q_layernorm.weight": None,
+    "module.decoder.layers.3.self_attention.k_layernorm.weight": None,
+    "module.decoder.layers.3.post_self_attn_layernorm.weight": "post",
+    "module.decoder.layers.3.pre_mlp_layernorm.weight": "pre_all",
+    "module.decoder.layers.3.post_mlp_layernorm.weight": "post",
+    "module.decoder.final_layernorm.weight": None,
+}
+
+
+def _tag_post_norm_pull_params(monkeypatch, values, **flags):
+    """Run the md_decoupling builder (optimizer construction faked) on the names above and return
+    the tagged params."""
+    params = {n: torch.nn.Parameter(values.clone()) for n in _POST_NORM_PULL_NAMES}
 
     class _FakeModelChunk:
         config = SimpleNamespace(layernorm_zero_centered_gamma=False, num_attention_heads=2,
@@ -2949,16 +2954,63 @@ def test_builder_tags_post_norm_gains(monkeypatch, post_norm_flag):
     config = OptimizerConfig(optimizer="md_decoupling", lr=0.01, min_lr=0.0)
     config.use_distributed_optimizer = False
     config.use_orthogonal_updates = False
-    config.md_attention_in_gain_pull_coeff = 5e-3
-    config.md_attention_in_gain_pull_target = 0.5
-    config.md_post_norm_gain_pull = post_norm_flag
+    for k, v in flags.items():
+        setattr(config, k, v)
     md_module.get_megatron_mddecoupling_optimizer(
         config, [_FakeModelChunk()], config_overrides={}, pg_collection=_NoProcessGroups())
+    return params
 
-    for name, kind in names.items():
+
+@pytest.mark.parametrize("pre_coeff,post_coeff", [(0.0, 0.0), (5e-3, 0.0), (0.0, 2e-3),
+                                                  (5e-3, 2e-3)])
+@pytest.mark.parametrize("pre_scope_all", [False, True])
+def test_builder_tags_post_norm_gains(monkeypatch, pre_coeff, post_coeff, pre_scope_all):
+    """The sandwich-norm output gammas (post_self_attn_layernorm, post_mlp_layernorm) get
+    md_decay_to_target = (md_post_norm_gain_pull_coeff, target, offset), the in-scope pre-norm
+    gammas (md_attention_in_gain_pull_coeff, target, offset): two independent coefficients, either
+    may be 0 (= no tag). The post norms are never tagged as revived pre-norm gains, and the
+    QK-norm, KDA out_norm and final-norm gammas are never tagged."""
+    scope_flags = dict(md_attention_in_gain_scope="all", md_dense_mlp_in_gain_revive=True,
+                       md_moe_mlp_in_gain_revive=True) if pre_scope_all else {}
+    params = _tag_post_norm_pull_params(
+        monkeypatch, torch.ones(6), md_attention_in_gain_pull_coeff=pre_coeff,
+        md_attention_in_gain_pull_target=1.0, md_post_norm_gain_pull_coeff=post_coeff,
+        **scope_flags)
+
+    pre_kinds = {"pre", "pre_all"} if pre_scope_all else {"pre"}
+    for name, kind in _POST_NORM_PULL_NAMES.items():
         p = params[name]
-        assert getattr(p, "md_revived_pre_norm_gain", False) == (kind == "pre"), name
-        expect_pull = kind == "pre" or (kind == "post" and post_norm_flag)
-        assert hasattr(p, "md_decay_to_target") == expect_pull, name
-        if expect_pull:
-            assert p.md_decay_to_target == (5e-3, 0.5, 0.0), name
+        assert getattr(p, "md_revived_pre_norm_gain", False) == (kind in pre_kinds), name
+        coeff = pre_coeff if kind in pre_kinds else post_coeff if kind == "post" else 0.0
+        if coeff:
+            assert p.md_decay_to_target == (coeff, 1.0, 0.0), name
+        else:
+            assert not hasattr(p, "md_decay_to_target"), name
+
+
+def test_post_norm_pull_reaches_main_params_with_its_own_coeff(monkeypatch):
+    """End to end on CPU: the builder's tags survive the copy onto the fp32 main params
+    (_propagate_routing_attrs, as in the Float16 / distributed optimizer wrappers), and
+    _decay_to_target after the chained Adam step pulls the pre-norm gamma with the pre-norm
+    coefficient and the post-norm gammas with the post-norm coefficient, keeping the sign."""
+    from megatron.core.optimizer.optimizer import _decay_to_target, _propagate_routing_attrs
+
+    values = torch.tensor([-25.0, -3.0, -0.5, 0.0, 0.5, 2.5])
+    pre_coeff, post_coeff, lr = 0.5, 0.05, 0.01
+    params = _tag_post_norm_pull_params(
+        monkeypatch, values, md_attention_in_gain_pull_coeff=pre_coeff,
+        md_attention_in_gain_pull_target=1.0, md_post_norm_gain_pull_coeff=post_coeff)
+    main = {}
+    for name, p in params.items():
+        main[name] = p.detach().clone().float()
+        _propagate_routing_attrs(main[name], p)
+        main[name].grad = torch.zeros_like(main[name])
+    adam = torch.optim.Adam(list(main.values()), lr=lr)
+    adam.step()  # zero grads: Adam leaves the values unchanged, only the pull moves them
+    _decay_to_target(adam)
+
+    sign = torch.where(values < 0, -1.0, 1.0)
+    for name, kind in _POST_NORM_PULL_NAMES.items():
+        coeff = {"pre": pre_coeff, "post": post_coeff}.get(kind, 0.0)
+        expected = values - lr * coeff * (values - sign) if coeff else values
+        torch.testing.assert_close(main[name], expected, rtol=0, atol=0, msg=name)

@@ -186,8 +186,8 @@ def _is_revived_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "soft
 
 def _is_sandwich_post_norm_gain(name: str, param: torch.Tensor) -> bool:
     """The sandwich-norm output gammas (--sandwich-norm): the standalone post_self_attn_layernorm
-    and post_mlp_layernorm of a layer. With md_post_norm_gain_pull they get the same
-    decay-to-target pull as the pre-norm gammas (no revive)."""
+    and post_mlp_layernorm of a layer. With md_post_norm_gain_pull_coeff > 0 they get the
+    decay-to-target pull with that coefficient (no revive)."""
     return param.ndim == 1 and (name.endswith(".post_self_attn_layernorm.weight")
                                 or name.endswith(".post_mlp_layernorm.weight"))
 
@@ -2234,16 +2234,21 @@ def get_megatron_mddecoupling_optimizer(
                     getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
                 )
                 param.md_norm_log_component = _norm_log_component(name)
-            pull_post_norm = (config.md_post_norm_gain_pull
-                              and _is_sandwich_post_norm_gain(name, param))
-            if (getattr(param, "md_revived_pre_norm_gain", False) or pull_post_norm) \
-                    and config.md_attention_in_gain_pull_coeff:
-                # Pull of the gamma's magnitude toward the target (the sign is kept), applied by the
-                # chained Adam's wrapper right after its step (see _decay_to_target in optimizer.py)
-                # on the effective gain p + offset. With md_post_norm_gain_pull also the
-                # sandwich-norm output gammas (post_self_attn_layernorm, post_mlp_layernorm).
+            # Pull of the gamma's magnitude toward the target (the sign is kept), applied by the
+            # chained Adam's wrapper right after its step (see _decay_to_target in optimizer.py)
+            # on the effective gain p + offset. The pre-norm gammas use
+            # md_attention_in_gain_pull_coeff, the sandwich-norm output gammas
+            # (post_self_attn_layernorm, post_mlp_layernorm) md_post_norm_gain_pull_coeff;
+            # both share md_attention_in_gain_pull_target.
+            if getattr(param, "md_revived_pre_norm_gain", False):
+                pull_coeff = config.md_attention_in_gain_pull_coeff
+            elif _is_sandwich_post_norm_gain(name, param):
+                pull_coeff = config.md_post_norm_gain_pull_coeff
+            else:
+                pull_coeff = 0.0
+            if pull_coeff:
                 param.md_decay_to_target = (
-                    float(config.md_attention_in_gain_pull_coeff),
+                    float(pull_coeff),
                     float(config.md_attention_in_gain_pull_target),
                     float(getattr(param, "md_layernorm_gain_offset", 0.0)),
                 )

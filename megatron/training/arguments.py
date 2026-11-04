@@ -1648,26 +1648,22 @@ def validate_args(args, defaults={}):
             assert args.md_attention_in_gain_revive_iteration is not None, (
                 "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
                 "(the checkpoint iteration after which the one-shot revive runs).")
-        if args.md_attention_in_gain_pull_coeff:
+        assert args.md_post_norm_gain_pull_coeff >= 0, (
+            f"--md-post-norm-gain-pull-coeff must be >= 0; got {args.md_post_norm_gain_pull_coeff}.")
+        if args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff:
             assert args.md_attention_in_gain_pull_target > 0, (
                 "--md-attention-in-gain-pull-target is the magnitude the pull moves |gain| toward "
                 f"and must be > 0; got {args.md_attention_in_gain_pull_target}.")
-        elif args.md_attention_in_gain_pull_col_gain:
+        if args.md_attention_in_gain_pull_col_gain and not args.md_attention_in_gain_pull_coeff:
             warn_rank_0(
                 "--md-attention-in-gain-pull-col-gain has no effect without "
                 "--md-attention-in-gain-pull-coeff > 0."
             )
-        if args.md_post_norm_gain_pull:
-            if not args.md_attention_in_gain_pull_coeff:
-                warn_rank_0(
-                    "--md-post-norm-gain-pull has no effect without "
-                    "--md-attention-in-gain-pull-coeff > 0."
-                )
-            if not args.sandwich_norm:
-                warn_rank_0(
-                    "--md-post-norm-gain-pull has no effect without --sandwich-norm "
-                    "(no post_self_attn_layernorm / post_mlp_layernorm gammas)."
-                )
+        if args.md_post_norm_gain_pull_coeff and not args.sandwich_norm:
+            warn_rank_0(
+                "--md-post-norm-gain-pull-coeff has no effect without --sandwich-norm "
+                "(no post_self_attn_layernorm / post_mlp_layernorm gammas)."
+            )
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
                 "--hypersphere-radius-mode init only applies to --hypersphere-mode flat; "
@@ -3172,17 +3168,20 @@ def _add_training_args(parser):
                        '--md-attention-in-gain-pull-col-gain): |x| moves toward c and the sign is kept '
                        '(raw softplus gain pulled to softplus_inv(c)). 0 disables.')
     group.add_argument('--md-attention-in-gain-pull-target', type=float, default=1.0,
-                       help='Target magnitude c of --md-attention-in-gain-pull-coeff, in effective-gain '
-                       'units.')
+                       help='Target magnitude c of --md-attention-in-gain-pull-coeff and '
+                       '--md-post-norm-gain-pull-coeff, in effective-gain units.')
     group.add_argument('--md-attention-in-gain-pull-col-gain', action='store_true', default=False,
                        help='Also apply --md-attention-in-gain-pull-coeff to the MDDecoupling column '
                        'gains of the input projections in scope. By default only the pre-norm gammas '
                        'are pulled.')
-    group.add_argument('--md-post-norm-gain-pull', action='store_true', default=False,
-                       help='Also apply --md-attention-in-gain-pull-coeff (same coefficient and target) '
-                       'to the sandwich-norm output gammas of every layer: post_self_attn_layernorm '
-                       'and post_mlp_layernorm (--sandwich-norm). Pull only, no revive. The QK-norm, '
-                       'KDA output-norm and final-norm gammas are not touched.')
+    group.add_argument('--md-post-norm-gain-pull-coeff', type=float, default=0.0,
+                       help='Coefficient of the pull of the sandwich-norm output gammas '
+                       '(post_self_attn_layernorm and post_mlp_layernorm of every layer, '
+                       '--sandwich-norm) toward --md-attention-in-gain-pull-target: '
+                       'x <- x - lr * coeff * (x - sign(x) * c), sign kept. Independent of '
+                       '--md-attention-in-gain-pull-coeff (the pre-norm pull), so the two can '
+                       'differ. Pull only, no revive. The QK-norm, KDA output-norm and final-norm '
+                       'gammas are not touched. 0 disables.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '
