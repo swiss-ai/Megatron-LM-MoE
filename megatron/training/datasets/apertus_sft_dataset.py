@@ -1,5 +1,6 @@
 """Length-delimited Apertus-2 SFT with stored or token-scanned loss weights."""
 
+import functools
 import hashlib
 import json
 import logging
@@ -17,6 +18,12 @@ from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
+
+
+# Builders recreate each dataset per split, provider call and VP stage; log once per process.
+@functools.cache
+def _log_loss_weights(message):
+    log_single_rank(logger, logging.INFO, message)
 
 
 class ApertusSFTLowLevelDataset:
@@ -37,20 +44,25 @@ class ApertusSFTLowLevelDataset:
             raise ValueError(f"expected one sequence per conversation/document: {path}")
         self.weights = None
         source_paths = [path]
-        if config.sft_load_loss_mask:
+        weight_path = None
+        if config.sft_loss_mask != "off":
             candidates = [path + ".loss_weights", path + ".loss_mask"]
             if os.path.basename(path) == "tokens":
                 candidates += [
                     os.path.join(os.path.dirname(path), name)
                     for name in ("loss_weights", "loss_mask")
                 ]
-            matches = [p for p in candidates if os.path.exists(p + ".idx")]
-            if len(matches) != 1:
+            matches = [
+                p for p in candidates
+                if os.path.exists(p + ".idx") or os.path.exists(p + ".bin")
+            ]
+            if len(matches) > 1 or (config.sft_loss_mask == "on" and not matches):
                 raise ValueError(
                     f"expected exactly one paired loss_weights/loss_mask index for {path}; "
                     f"found {matches}"
                 )
-            weight_path = matches[0]
+            weight_path = matches[0] if matches else None
+        if weight_path is not None:
             self.weights = IndexedDataset(weight_path, mmap=config.mmap_bin_files)
             if self.weights.index.dtype not in (np.float32, np.float64):
                 raise ValueError(f"loss weights must be float32 or float64: {weight_path}")
@@ -61,6 +73,14 @@ class ApertusSFTLowLevelDataset:
             ):
                 raise ValueError(f"unaligned token/weight indices: {path} / {weight_path}")
             source_paths.append(weight_path)
+        if config.sft_loss_mask == "auto":
+            source = f"stored {weight_path}" if weight_path else "derived from output controls"
+            _log_loss_weights(f"Apertus SFT loss weights (auto) for {path}: {source}")
+        else:
+            source = "stored" if weight_path else "derived from output controls"
+            _log_loss_weights(
+                f"Apertus SFT loss weights ({config.sft_loss_mask}): {source} for every dataset"
+            )
         self.source_identity = {
             os.path.realpath(prefix + suffix): {
                 "size": os.stat(prefix + suffix).st_size,
@@ -125,7 +145,7 @@ class ApertusSFTDataset(MegatronDataset):
     def _key_config_attributes():
         return [
             "random_seed", "sequence_length", "split", "split_matrix", "tokenizer",
-            "sft_load_loss_mask", "sft_packing_strategy", "sft_pack_samples",
+            "sft_loss_mask", "sft_packing_strategy", "sft_pack_samples",
             "max_docs_per_bin_sft",
             "context_parallel_size", "sequence_parallel_size",
         ]
@@ -143,7 +163,7 @@ class ApertusSFTDataset(MegatronDataset):
         ).hexdigest()
         self._control_ids = (
             self._read_controls(config.tokenizer)
-            if not config.sft_load_loss_mask or config.sft_report_assistant_loss else None
+            if dataset.weights is None or config.sft_report_assistant_loss else None
         )
         self._vocab_size = config.tokenizer.vocab_size
         cp = max(1, int(config.context_parallel_size or 1))
