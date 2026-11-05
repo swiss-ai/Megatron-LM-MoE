@@ -395,7 +395,7 @@ def core_gpt_dataset_config_from_args(args):
         "sft_pack_samples": args.ap_sft_pack_samples,
         "sft_packing_strategy": args.ap_sft_packing_strategy,
         "max_docs_per_bin_sft": args.max_docs_per_bin_sft,
-        "sft_load_loss_mask": args.ap_sft_load_loss_mask,
+        "sft_loss_mask": args.ap_sft_loss_mask,
         "sft_report_assistant_loss": args.ap_sft_report_assistant_loss,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "goldfish_loss": args.goldfish_loss,

@@ -5,6 +5,7 @@ The dataset is loaded directly to avoid training-package GPU initialization.
 """
 
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -68,7 +69,7 @@ def make_dataset(tmp_path, rows, weights=None, *, requested=None, **kwargs):
         reset_attention_mask=False,
         eod_mask_loss=False,
         path_to_cache=str(tmp_path / "cache"),
-        sft_load_loss_mask=weights is not None,
+        sft_loss_mask=kwargs.pop("sft_loss_mask", "on" if weights is not None else "off"),
         **kwargs,
     )
     low = ApertusSFTLowLevelDataset(str(prefix), config)
@@ -89,10 +90,11 @@ def test_authoritative_weights_shift_and_real_pad_token(tmp_path):
     assert row["loss_mask"][6:].sum() == 0
 
 
-def test_stored_weights_need_no_apertus_controls(tmp_path):
+@pytest.mark.parametrize("mode", ["on", "auto"])
+def test_stored_weights_need_no_apertus_controls(tmp_path, mode):
     tokenizer = Tokenizer()
     tokenizer.tokenizer = None
-    data = make_dataset(tmp_path, [[1, 2]], [[0, 1]], tokenizer=tokenizer)
+    data = make_dataset(tmp_path, [[1, 2]], [[0, 1]], tokenizer=tokenizer, sft_loss_mask=mode)
     assert data[0]["loss_mask"][0] == 1
 
 
@@ -242,8 +244,9 @@ def test_invalid_weights_fail_with_document_context(tmp_path, bad):
         data[0]
 
 
+@pytest.mark.parametrize("mode", ["on", "auto"])
 @pytest.mark.parametrize("problem", ["dtype", "length", "boundaries", "empty", "ambiguous"])
-def test_invalid_indices_rejected(tmp_path, problem):
+def test_invalid_indices_rejected(tmp_path, problem, mode):
     rows = [[]] if problem == "empty" else [[1, 2], [3]]
     prefix = tmp_path / "tokens"
     write_index(prefix, rows, np.int32)
@@ -257,8 +260,64 @@ def test_invalid_indices_rejected(tmp_path, problem):
         write_index(tmp_path / "tokens.loss_weights", rows, np.float64)
     with pytest.raises(ValueError):
         ApertusSFTLowLevelDataset(
-            str(prefix), SimpleNamespace(mmap_bin_files=True, sft_load_loss_mask=True)
+            str(prefix), SimpleNamespace(mmap_bin_files=True, sft_loss_mask=mode)
         )
+
+
+def test_loss_mask_modes_and_auto_cache_invalidation(tmp_path):
+    derived = make_dataset(tmp_path, [[1, 90, 2, 91, 92]], sft_loss_mask="auto")
+    config = derived.config
+
+    def build(mode):
+        config.sft_loss_mask = mode
+        return ApertusSFTDataset(
+            ApertusSFTLowLevelDataset(derived.dataset_path, config),
+            derived.dataset_path,
+            derived.indices,
+            None,
+            Split.train,
+            config,
+        )
+
+    with pytest.raises(ValueError, match="expected exactly one paired"):
+        build("on")
+    write_index(tmp_path / "loss_weights", [[0, 0.25, 0, 2, 0.5]], np.float32)
+    stored = build("auto")
+    assert stored.unique_description_hash != derived.unique_description_hash
+    assert stored[0]["loss_mask"][:5].tolist() == [0.25, 0, 2, 0.5, 0]
+    assert torch.equal(build("off")[0]["loss_mask"], derived[0]["loss_mask"])
+    for suffix in (".idx", ".bin"):
+        (tmp_path / ("loss_weights" + suffix)).unlink()
+    removed = build("auto")
+    assert removed.unique_description_hash == derived.unique_description_hash
+    assert torch.equal(removed[0]["loss_mask"], derived[0]["loss_mask"])
+
+
+@pytest.mark.parametrize("missing", [".idx", ".bin"])
+def test_auto_rejects_incomplete_weights(tmp_path, missing):
+    data = make_dataset(tmp_path, [[1, 2]], [[0, 1]], sft_loss_mask="auto")
+    (tmp_path / ("loss_weights" + missing)).unlink()
+    with pytest.raises(AssertionError, match="cannot be found"):
+        ApertusSFTLowLevelDataset(data.dataset_path, data.config)
+
+
+def test_auto_logs_weight_source_once_per_dataset(tmp_path, caplog):
+    for name in ("stored", "derived"):
+        (tmp_path / name).mkdir()
+        write_index(tmp_path / name / "tokens", [[1, 2]], np.int32)
+    write_index(tmp_path / "stored" / "loss_weights", [[0, 1]], np.float32)
+    caplog.set_level(logging.INFO)
+    for name in ("stored", "derived", "stored"):
+        ApertusSFTLowLevelDataset(
+            str(tmp_path / name / "tokens"),
+            SimpleNamespace(mmap_bin_files=True, sft_loss_mask="auto"),
+        )
+    assert [r.getMessage() for r in caplog.records if r.name == module.logger.name] == [
+        f"Apertus SFT loss weights (auto) for {tmp_path}/stored/tokens: "
+        f"stored {tmp_path}/stored/loss_weights",
+        f"Apertus SFT loss weights (auto) for {tmp_path}/derived/tokens: "
+        "derived from output controls",
+    ]
 
 
 def test_cache_reload_epoch_shuffle_and_source_invalidation(tmp_path, monkeypatch):
@@ -282,7 +341,11 @@ def test_cache_reload_epoch_shuffle_and_source_invalidation(tmp_path, monkeypatc
         os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
     changed = ApertusSFTDataset(
         ApertusSFTLowLevelDataset(data.dataset_path, data.config),
-        data.dataset_path, data.indices, 24, Split.train, data.config,
+        data.dataset_path,
+        data.indices,
+        24,
+        Split.train,
+        data.config,
     )
     assert changed.unique_description_hash != first_hash
     np.testing.assert_array_equal(changed.shuffle_index, data.shuffle_index)
