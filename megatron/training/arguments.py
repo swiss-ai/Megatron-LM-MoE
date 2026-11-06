@@ -4118,8 +4118,9 @@ def _add_sft_args(parser):
                             'order or best-fit decreasing')
     group.add_argument('--max-docs-per-bin-sft', type=int, default=0,
                        help='Maximum conversations per --ap-sft bfd pack; 0 means no limit')
-    group.add_argument('--ap-sft-load-loss-mask', action="store_true",
-                       help='Load sibling indexed loss_weights data')
+    group.add_argument('--ap-sft-loss-mask', choices=['auto', 'on', 'off'], default='off',
+                       help='Stored loss weights: auto loads per dataset when present, '
+                            'on requires them for every dataset, off derives Apertus masking')
     group.add_argument('--ap-sft-report-assistant-loss', action='store_true',
                        help='Report unweighted loss over Apertus output targets; '
                             'requires Apertus control metadata in both loading modes')

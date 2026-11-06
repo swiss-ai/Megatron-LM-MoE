@@ -75,7 +75,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch.
 
     Returns tokens, labels, loss weights, attention mask, position IDs, physical
-    padding mask, packed sequence parameters, and optional assistant-target mask.
+    padding mask, packed sequence parameters, optional assistant-target mask, and
+    with ``--ap-sft`` the padding percentage of each sample.
 
     Packed sequence support (``--sft``, ``--ap-sft``, or ``--dataloader-inter-document-masking``):
         When any is set, the dataset emits THD-format batches where multiple
@@ -115,13 +116,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     is_packed_sequence = has_cu_seqlens
     has_bfd_padding = args.pretraining_packing_strategy == "bfd"
     if not is_first_last and not is_packed_sequence and not is_mtp and not has_bfd_padding:
-        return None, None, None, None, None, None, None, None
+        return _batch_outputs({}, None, None)
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
         mtp_on_this_rank=is_mtp
         )
+    # Measured per sample before flattening merges the micro-batch; float64 keeps the
+    # variance exact when all samples have nearly the same padding.
+    padding_percent = 100 * batch['padding_mask'].double().mean(dim=1) if args.ap_sft else None
     batch = flatten_batch_for_packed_sequences(batch)
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -153,7 +157,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 max_local_len=args.cp_doc_aware_max_local_len,
                 max_padding=args.cp_doc_aware_max_padding,
             )
-            return _batch_outputs(batch, packed_seq_params)
+            return _batch_outputs(batch, packed_seq_params, padding_percent)
         if args.dataloader_inter_document_masking and cp_size > 1:
             batch, cu_seqlens, max_seqlen = pad_thd_batch_for_cp(
                 batch,
@@ -178,7 +182,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_q=int(max_seqlen[0].item()),
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
-        ))
+        ), padding_percent)
 
     if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism
@@ -189,15 +193,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
 
-    return _batch_outputs(batch, packed_seq_params)
+    return _batch_outputs(batch, packed_seq_params, padding_percent)
 
 
-def _batch_outputs(batch, packed_seq_params):
+def _batch_outputs(batch, packed_seq_params, padding_percent):
     """Order a processed batch as get_batch returns it."""
     return (
         batch.get('tokens'), batch.get('labels'), batch.get('loss_mask'),
         batch.get('attention_mask'), batch.get('position_ids'), batch.get('padding_mask'),
-        packed_seq_params, batch.get('assistant_mask'),
+        packed_seq_params, batch.get('assistant_mask'), padding_percent,
     )
 
 
@@ -208,6 +212,7 @@ SPIKY_LOSS_FACTOR = 10
 def loss_func(
     loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None,
     assistant_mask: Optional[torch.Tensor] = None,
+    padding_percent: Optional[torch.Tensor] = None,
 ):
     """Loss function.
 
@@ -216,6 +221,7 @@ def loss_func(
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
         assistant_mask: Output-target membership, independent of training weights.
+        padding_percent: Padding percentage of each sample, reported as summary statistics.
 
     Returns:
         the loss scalar for this micro-batch
@@ -249,6 +255,11 @@ def loss_func(
                 assistant_sum = torch.where(assistant_mask, losses.detach(), 0).sum()
                 assistant_count = assistant_mask.sum()
                 report['assistant_loss'] = torch.stack([assistant_sum, assistant_count])
+    if padding_percent is not None:
+        report['padding percent'] = torch.stack([
+            padding_percent.new_full((), padding_percent.numel()), padding_percent.sum(),
+            padding_percent.square().sum(), padding_percent.min(), padding_percent.max(),
+        ])
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -302,9 +313,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         (
             tokens, labels, loss_mask, attention_mask, position_ids, padding_mask,
-            packed_seq_params, assistant_mask,
+            packed_seq_params, assistant_mask, padding_percent,
         ) = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
+    loss_fn = partial(
+        loss_func, loss_mask, model=model, assistant_mask=assistant_mask,
+        # Evaluation reduces only one- and two-element reports.
+        padding_percent=padding_percent if model.training else None,
+    )
 
     with stimer:
         if args.use_legacy_models:
@@ -318,9 +334,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     padding_mask=padding_mask,
                     packed_seq_params=packed_seq_params,
                 )
-                return schedule_plan, partial(
-                    loss_func, loss_mask, model=model, assistant_mask=assistant_mask
-                )
+                return schedule_plan, loss_fn
             else:
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
@@ -328,9 +342,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(
-        loss_func, loss_mask, model=model, assistant_mask=assistant_mask
-    )
+    return output_tensor, loss_fn
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
@@ -395,7 +407,7 @@ def core_gpt_dataset_config_from_args(args):
         "sft_pack_samples": args.ap_sft_pack_samples,
         "sft_packing_strategy": args.ap_sft_packing_strategy,
         "max_docs_per_bin_sft": args.max_docs_per_bin_sft,
-        "sft_load_loss_mask": args.ap_sft_load_loss_mask,
+        "sft_loss_mask": args.ap_sft_loss_mask,
         "sft_report_assistant_loss": args.ap_sft_report_assistant_loss,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "goldfish_loss": args.goldfish_loss,

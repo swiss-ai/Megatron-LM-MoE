@@ -128,6 +128,8 @@ def test_real_provider_builds_exhaustive_training_and_preserves_validation(
     for i in range(prefix_count):
         prefix = tmp_path / f'tokens{i}'
         write_index(prefix, [[1 + i * 10 + j, 90, 2, 91, 92] for j in range(8)], np.int32)
+        if i == 0:
+            write_index(str(prefix) + '.loss_weights', [[0, 0.25, 0, 2, 0.5]] * 8, np.float32)
         prefixes.append(str(prefix))
     config = GPTDatasetConfig(
         random_seed=123,
@@ -140,6 +142,8 @@ def test_real_provider_builds_exhaustive_training_and_preserves_validation(
         split=None if per_split else '75,25,0',
         blend_per_split=[(prefixes, None), (prefixes[:1], None), None] if per_split else None,
         path_to_cache=str(tmp_path / 'cache'),
+        sft_loss_mask='auto',
+        sft_report_assistant_loss=True,
     )
     args = SimpleNamespace(
         ap_sft=True,
@@ -181,6 +185,10 @@ def test_real_provider_builds_exhaustive_training_and_preserves_validation(
         items = [train[epoch * train.samples_per_epoch + i] for i in range(expected)]
         ids = [item['tokens'][0].item() for item in items]
         assert len(set(ids)) == expected
+        for item in items:
+            weights = [0.25, 0, 2, 0.5, 0] if item['tokens'][0] < 10 else [1, 1, 1, 1, 0]
+            assert item['loss_mask'][:5].tolist() == weights
+            assert item['assistant_mask'][:5].tolist() == [True, True, True, True, False]
     for i in range(expected, train.samples_per_epoch):
         dummy = train[i]
         assert not dummy['loss_mask'].any()

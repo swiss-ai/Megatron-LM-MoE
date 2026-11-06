@@ -8,7 +8,11 @@ All modes use `pretrain_gpt.py` and the usual data-path flags.
 | --- | --- | --- |
 | `--sft` | Local JSON/JSONL `messages: [{role, content}, …]` | HF Datasets loads rows; the conversation tokenizer creates targets during loading. |
 | `--ap-sft` | Indexed tokens | Scans Apertus-2 controls for output-only weights. |
-| `--ap-sft --ap-sft-load-loss-mask` | Indexed tokens and float weights | Uses stored weights. |
+| `--ap-sft --ap-sft-loss-mask auto` | Indexed tokens, optional float weights per dataset | Loads stored weights where present; otherwise derives output masking. |
+| `--ap-sft --ap-sft-loss-mask on` | Indexed tokens and float weights | Requires stored weights for every dataset. |
+
+`--ap-sft-loss-mask off` is the default and ignores stored weights. Use `on` in
+place of the removed `--ap-sft-load-loss-mask`. The mode applies to all splits.
 
 The [JSON loader](../megatron/training/datasets/sft_dataset.py) supports ordinary
 chat messages, not native Apertus-2 dicts or direct HF Hub loading. Prepare
@@ -18,6 +22,12 @@ The [AP loader](../megatron/training/datasets/apertus_sft_dataset.py) expects on
 nonempty conversation per sequence/document: `tokens.{bin,idx}` plus optional
 `loss_weights.{bin,idx}`. Weights are float32/float64 and match token lengths and
 document boundaries. Pass the `tokens` prefix as the data path.
+
+Weight prefixes can be `<data-path>.loss_weights` or `<data-path>.loss_mask`;
+for a data path named `tokens`, sibling `loss_weights` or `loss_mask` also works.
+`auto` falls back only when no weight file exists; incomplete, ambiguous or
+invalid weight files fail. The log reports the choice per dataset. Dataset
+caches include the mode and resolved source files.
 
 ## Weighting and normalization
 
@@ -57,6 +67,12 @@ weights shift per conversation, conversation boundaries reset attention and
 positions, and long conversations keep their prefix. Indices are cached; every
 epoch is shuffled independently. AP needs THD-capable attention and rejects
 `--pretraining-packing-strategy bfd`.
+
+Training computes `padding percent mean`, `variance`, `min` and `max` over the
+samples of each global batch. With TensorBoard enabled, these are logged at
+`--tensorboard-log-interval` to TensorBoard and, when configured, W&B. The console
+prints their averages over the log interval. A sample's padding includes CP/SP
+alignment and the zero-loss samples that complete an `--ap-sft-epochs` epoch.
 
 With CP or sequence parallelism, each conversation is padded to a multiple of
 `lcm(2 × CP, CP × SP)` with CP > 1, else SP (SP = TP size with
