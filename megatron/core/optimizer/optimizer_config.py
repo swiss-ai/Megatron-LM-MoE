@@ -501,6 +501,16 @@ class OptimizerConfig:
     and post-norm pulls can have different strengths (or either can be off). Pull only, no
     revive. The QK-norm, KDA output-norm and final-norm gammas are not touched. 0 disables."""
 
+    md_rowcol_gain_pull_coeff: float = 0.0
+    """Pull of the MDDecoupling row and column gains toward md_attention_in_gain_pull_target, with
+    its own coefficient, on the matrices next to a pulled norm gamma: the input projection behind a
+    pre-norm gamma pulled by md_attention_in_gain_pull_coeff (linear_qkv, KDA/GDN in_proj, dense
+    linear_fc1, following its scope flags) and the output projection in front of a post-norm gamma
+    pulled by md_post_norm_gain_pull_coeff (linear_proj, KDA/GDN out_proj, dense linear_fc2), layer
+    by layer. Matrices next to an unpulled or absent gamma are not touched. Folded into the gains
+    AdamW decay like md_attention_in_gain_pull_col_gain, which it overrides on the column gain.
+    MoE matrices are not touched. Pull only, no revive. 0 disables."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed
