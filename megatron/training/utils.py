@@ -627,7 +627,9 @@ def get_blend_and_blend_per_split(args):
 def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
-    has_cu_seqlens = args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    has_cu_seqlens = (
+        args.sft or args.ap_sft or getattr(args, 'dataloader_inter_document_masking', False)
+    )
     has_bfd_padding = getattr(args, 'pretraining_packing_strategy', None) == 'bfd'
     broadcast_bfd_padding = has_bfd_padding and mpu.get_tensor_model_parallel_world_size() > 1
 
@@ -672,6 +674,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["local_cp_size"].cuda(non_blocking=True)
             ),
         }
+
+        if args.ap_sft:
+            batch['padding_mask'] = data['padding_mask'].cuda(non_blocking=True)
+            if args.ap_sft_report_assistant_loss:
+                batch['assistant_mask'] = data['assistant_mask'].cuda(non_blocking=True)
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
@@ -750,6 +757,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         if broadcast_bfd_padding:
             # One int32 per sample replaces a sequence-length boolean mask.
             _broadcast(num_valid_tokens)
+
+        if args.ap_sft:
+            _broadcast(batch['padding_mask'])
+            if args.ap_sft_report_assistant_loss:
+                _broadcast(batch['assistant_mask'])
 
     else:
         if args.hybrid_context_parallel:
@@ -902,6 +914,14 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
         }
+        if args.ap_sft:
+            batch['padding_mask'] = torch.empty(
+                shape, dtype=torch.bool, device=torch.cuda.current_device()
+            )
+            _broadcast(batch['padding_mask'])
+            if args.ap_sft_report_assistant_loss:
+                batch['assistant_mask'] = torch.empty_like(batch['padding_mask'])
+                _broadcast(batch['assistant_mask'])
 
     if has_bfd_padding:
         positions = torch.arange(args.seq_length, device=num_valid_tokens.device).unsqueeze(0)

@@ -300,7 +300,22 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Packing strategy for SFT: 'greedy' (sequential) or 'bfd' (Best-Fit Decreasing)."""
 
     max_docs_per_bin: int = 0
-    """Maximum number of documents allowed per sample in bfd, 0 means no limit""" 
+    """Maximum number of documents allowed per sample in bfd, 0 means no limit"""
+
+    sft_pack_samples: bool = False
+    """Pack complete SFT conversations into one THD sample."""
+
+    sft_packing_strategy: str = "greedy"
+    """SFT packing strategy: greedy or bfd."""
+
+    max_docs_per_bin_sft: int = 0
+    """Maximum conversations per SFT BFD bin, or zero for unlimited."""
+
+    sft_load_loss_mask: bool = False
+    """Load a sibling indexed loss-weight dataset."""
+
+    sft_report_assistant_loss: bool = False
+    """Emit a separate output-target mask for unweighted assistant loss reporting."""
 
     token_dtype_code: Optional[int] = field(init=False, default=None)
     """The dtype code for the token ids. 4 for int32, 8 for uint16."""
@@ -918,7 +933,7 @@ class GPTDataset(MegatronDataset):
                 sample_index=sample_index,
                 from_cache=True,
             )
-            
+
             return document_index, sample_index, shuffle_index
 
         # Cache hit
