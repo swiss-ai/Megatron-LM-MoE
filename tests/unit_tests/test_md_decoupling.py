@@ -3014,3 +3014,213 @@ def test_post_norm_pull_reaches_main_params_with_its_own_coeff(monkeypatch):
         coeff = {"pre": pre_coeff, "post": post_coeff}.get(kind, 0.0)
         expected = values - lr * coeff * (values - sign) if coeff else values
         torch.testing.assert_close(main[name], expected, rtol=0, atol=0, msg=name)
+
+
+# ---------------------------------------------------------------------------------------------
+# Row/col gain pull of the matrices next to the pulled norms (--md-rowcol-gain-pull-coeff)
+
+# Params of a hybrid stack: KDA layer 0 (dense MLP), softmax layer 3 (MoE), MLA layer 5, a layer 6
+# without a fused pre-norm (local spec), an MTP layer and a Mamba layer. Matrix values: which pulled
+# gamma the matrix sits next to (None: never pulled). Gammas: the pull scope that tags them.
+_ROWCOL_PULL_MATRICES = {
+    "module.decoder.layers.0.self_attention.in_proj.weight": "pre_kda",
+    "module.decoder.layers.0.self_attention.out_proj.weight": "post",
+    "module.decoder.layers.0.self_attention.decay_out_proj.weight": None,
+    "module.decoder.layers.0.self_attention.gate_out_proj.weight": None,
+    "module.decoder.layers.0.mlp.linear_fc1.weight": "pre_dense",
+    "module.decoder.layers.0.mlp.linear_fc2.weight": "post",
+    "module.decoder.layers.3.self_attention.linear_qkv.weight": "pre",
+    "module.decoder.layers.3.self_attention.linear_proj.weight": "post",
+    "module.decoder.layers.3.mlp.router.weight": None,
+    "module.decoder.layers.3.mlp.shared_experts.linear_fc1.weight": None,
+    "module.decoder.layers.3.mlp.shared_experts.linear_fc2.weight": None,
+    "module.decoder.layers.3.mlp.experts.linear_fc1.weight0": None,
+    "module.decoder.layers.3.mlp.experts.linear_fc2.weight0": None,
+    "module.decoder.layers.3.mlp.experts.local_experts.0.linear_fc1.weight": None,
+    "module.decoder.layers.3.mlp.experts.local_experts.0.linear_fc2.weight": None,
+    "module.decoder.layers.3.mlp.fc1_latent_proj.weight": None,
+    "module.decoder.layers.3.mlp.fc2_latent_proj.weight": None,
+    "module.decoder.layers.5.self_attention.linear_q_down_proj.weight": None,
+    "module.decoder.layers.5.self_attention.linear_kv_down_proj.weight": None,
+    "module.decoder.layers.5.self_attention.linear_q_up_proj.weight": None,
+    "module.decoder.layers.5.self_attention.linear_kv_up_proj.weight": None,
+    "module.decoder.layers.5.self_attention.linear_proj.weight": "post",
+    "module.decoder.layers.6.self_attention.linear_qkv.weight": None,
+    "module.mtp.layers.0.eh_proj.weight": None,
+    "module.mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.weight": "pre",
+    "module.mtp.layers.0.mtp_model_layer.self_attention.linear_proj.weight": "post",
+    "module.decoder.layers.7.mixer.in_proj.weight": None,
+    "module.decoder.layers.7.mixer.out_proj.weight": None,
+    "module.embedding.word_embeddings.weight": None,
+    "module.output_layer.weight": None,
+}
+_ROWCOL_PULL_GAMMAS = {
+    "module.decoder.layers.0.self_attention.in_proj.layer_norm_weight": "pre_kda",
+    "module.decoder.layers.0.self_attention.out_norm.weight": None,
+    "module.decoder.layers.0.post_self_attn_layernorm.weight": "post",
+    "module.decoder.layers.0.mlp.linear_fc1.layer_norm_weight": "pre_dense",
+    "module.decoder.layers.0.post_mlp_layernorm.weight": "post",
+    "module.decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": "pre",
+    "module.decoder.layers.3.post_self_attn_layernorm.weight": "post",
+    "module.decoder.layers.3.pre_mlp_layernorm.weight": None,
+    "module.decoder.layers.3.post_mlp_layernorm.weight": "post",
+    "module.decoder.layers.5.input_layernorm.weight": None,
+    "module.decoder.layers.5.post_self_attn_layernorm.weight": "post",
+    "module.decoder.layers.6.input_layernorm.weight": None,
+    "module.mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.layer_norm_weight": "pre",
+    "module.mtp.layers.0.mtp_model_layer.post_self_attn_layernorm.weight": "post",
+    "module.decoder.layers.7.mixer.in_proj.layer_norm_weight": None,
+}
+
+
+def _tag_rowcol_pull_params(monkeypatch, sandwich_norm, omit=(), **flags):
+    """Run the md_decoupling builder's tagging on the names above (without --sandwich-norm the
+    post-norm gammas do not exist; ``omit`` drops more params) and return the params;
+    MDDecoupling construction is skipped."""
+    params = {n: torch.nn.Parameter(torch.ones(4, 6)) for n in _ROWCOL_PULL_MATRICES}
+    params.update({n: torch.nn.Parameter(torch.ones(6)) for n, kind in _ROWCOL_PULL_GAMMAS.items()
+                   if sandwich_norm or kind != "post"})
+    for n in omit:
+        del params[n]
+
+    class _FakeModelChunk:
+        config = SimpleNamespace(layernorm_zero_centered_gamma=False, num_attention_heads=2,
+                                 num_query_groups=2, kv_channels=3, hidden_size=6, num_layers=8)
+
+        def named_parameters(self):
+            return iter(params.items())
+
+        def named_modules(self):
+            return iter([])
+
+    class _Built(Exception):
+        pass
+
+    def _stop(*args, **kwargs):
+        raise _Built()
+
+    monkeypatch.setattr(md_module, "_get_param_groups", lambda *a, **k: [])
+    monkeypatch.setattr(md_module, "MDDecoupling", _stop)
+    config = OptimizerConfig(optimizer="md_decoupling", lr=0.01, min_lr=0.0)
+    config.use_distributed_optimizer = False
+    config.use_orthogonal_updates = False
+    for k, v in flags.items():
+        setattr(config, k, v)
+    with pytest.raises(_Built):
+        md_module.get_megatron_mddecoupling_optimizer(
+            config, [_FakeModelChunk()], config_overrides={}, pg_collection=_NoProcessGroups())
+    return params
+
+
+@pytest.mark.parametrize("rowcol_coeff", [0.0, 0.3])
+@pytest.mark.parametrize("pre_coeff", [0.0, 5e-3])
+@pytest.mark.parametrize("post_coeff", [0.0, 2e-3])
+@pytest.mark.parametrize("scope", ["softmax", "all"])
+@pytest.mark.parametrize("dense_mlp_in", [False, True])
+@pytest.mark.parametrize("sandwich_norm", [False, True])
+def test_builder_tags_rowcol_gain_pull_matrices(monkeypatch, rowcol_coeff, pre_coeff, post_coeff,
+                                                scope, dense_mlp_in, sandwich_norm):
+    """md_rowcol_gain_pull_coeff tags exactly the matrices next to a pulled gamma of the same layer:
+    the input projection behind a pulled pre-norm gamma (following the scope flags) and the output
+    projection in front of a pulled sandwich post-norm gamma. Matrices next to an unpulled or absent
+    gamma (no --sandwich-norm, MLA / local-spec standalone input_layernorm), MoE matrices
+    (TEGroupedMLP, SequentialMLP, shared experts, router, latent projections), the KDA decay/gate
+    projections, MTP eh_proj, Mamba, the embedding and the output layer are never tagged."""
+    params = _tag_rowcol_pull_params(
+        monkeypatch, sandwich_norm, md_rowcol_gain_pull_coeff=rowcol_coeff,
+        md_attention_in_gain_pull_coeff=pre_coeff, md_post_norm_gain_pull_coeff=post_coeff,
+        md_attention_in_gain_pull_target=1.0, md_attention_in_gain_scope=scope,
+        md_dense_mlp_in_gain_revive=dense_mlp_in, md_moe_mlp_in_gain_revive=True)
+    pulled = set()
+    if pre_coeff:
+        pulled.add("pre")
+        if scope == "all":
+            pulled.add("pre_kda")
+        if dense_mlp_in:
+            pulled.add("pre_dense")
+    if post_coeff and sandwich_norm:
+        pulled.add("post")
+    for name, p in params.items():
+        kind = _ROWCOL_PULL_MATRICES.get(name)
+        if rowcol_coeff and kind in pulled:
+            assert p.md_rowcol_gain_pull_coeff == rowcol_coeff, name
+        else:
+            assert not hasattr(p, "md_rowcol_gain_pull_coeff"), name
+
+
+@pytest.mark.parametrize("missing", ["post_self_attn_layernorm", "post_mlp_layernorm"])
+def test_builder_rowcol_gain_pull_pairs_each_matrix_with_its_own_norm(monkeypatch, missing):
+    """Each output projection is paired with its own layer's post-norm: linear_proj / out_proj with
+    post_self_attn_layernorm, dense linear_fc2 with post_mlp_layernorm."""
+    params = _tag_rowcol_pull_params(
+        monkeypatch, True, omit=[f"module.decoder.layers.0.{missing}.weight"],
+        md_rowcol_gain_pull_coeff=0.3, md_post_norm_gain_pull_coeff=2e-3,
+        md_attention_in_gain_pull_target=1.0)
+    out_proj = params["module.decoder.layers.0.self_attention.out_proj.weight"]
+    fc2 = params["module.decoder.layers.0.mlp.linear_fc2.weight"]
+    assert hasattr(out_proj, "md_rowcol_gain_pull_coeff") == (missing == "post_mlp_layernorm")
+    assert hasattr(fc2, "md_rowcol_gain_pull_coeff") == (missing == "post_self_attn_layernorm")
+    # Layer 3 keeps both norms, so both of its output projections stay pulled.
+    assert params["module.decoder.layers.3.self_attention.linear_proj.weight"].md_rowcol_gain_pull_coeff == 0.3
+
+
+@pytest.mark.parametrize("gain_parametrization", ["softplus", "direct"])
+@pytest.mark.parametrize("target", [1.0, 2.0])
+@pytest.mark.parametrize("col_gain_flag", [False, True])
+def test_rowcol_gain_pull_folded_into_gains_weight_decay(gain_parametrization, target,
+                                                         col_gain_flag):
+    """A tagged matrix pulls both its row and column gains with md_rowcol_gain_pull_coeff (which
+    overrides the attention-in coefficient on the column gain), folded into the gains AdamW decay:
+    g <- g - lr * (wd * g + c * (g - t)). Under "softplus" t = softplus_inv(target); under "direct"
+    t = sign(g) * target (sign(0) = +1), so the sign is kept. Untagged matrices keep the plain decay
+    g*(1 - lr*wd). The tag survives the copy onto the fp32 main param."""
+    from megatron.core.optimizer.optimizer import _propagate_routing_attrs
+
+    model_param = torch.nn.Parameter(torch.randn(8, 4))
+    model_param.md_rowcol_gain_pull_coeff = 0.3
+    param = torch.nn.Parameter(model_param.detach().clone())
+    _propagate_routing_attrs(param, model_param)
+    param.is_qkv = True
+    untagged = torch.nn.Parameter(torch.randn(8, 4))
+    wd, lr = 0.1, 0.01
+    optimizer = _gqa_qkv_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization=gain_parametrization, use_orthogonal_updates=False,
+        gains_weight_decay=wd, attention_in_gain_pull_coeff=0.5,
+        attention_in_gain_pull_target=target, attention_in_gain_pull_col_gain=col_gain_flag)
+    optimizer.add_param_group({"params": [untagged]})
+    for p in (param, untagged):
+        optimizer._maybe_init_gain_state(p)
+    raw_col = torch.tensor([-3.0, 0.0, 2.0, 5.0])
+    raw_row = torch.linspace(-2.0, 4.0, 8)
+    for p in (param, untagged):
+        optimizer.state[p]["col_gain"].copy_(raw_col)
+        optimizer.state[p]["row_gain"].copy_(raw_row)
+    for p, group in ((param, optimizer.param_groups[0]), (untagged, optimizer.param_groups[1])):
+        group["step"] = 1
+        optimizer._gains_step(p, group, {"col_gain": torch.zeros(4), "row_gain": torch.zeros(8)})
+
+    for name, raw in (("col_gain", raw_col), ("row_gain", raw_row)):
+        if gain_parametrization == "softplus":
+            t = float(optimizer._phi_inv(torch.tensor(target, dtype=torch.float64)))
+        else:
+            t = torch.where(raw < 0, -target, target)
+        torch.testing.assert_close(
+            optimizer.state[param][name], raw - lr * (wd * raw + 0.3 * (raw - t)))
+        torch.testing.assert_close(optimizer.state[untagged][name], raw * (1 - lr * wd))
+
+
+def test_rowcol_gain_pull_does_not_revive():
+    """The revive touches only the matrices of _is_revived_matrix: a collapsed column gain of a
+    rowcol-pulled output projection is left as is."""
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.md_rowcol_gain_pull_coeff = 0.3
+    param.is_out_proj = True
+    optimizer = _revive_matrix_optimizer(param, attention_in_gain_scope="all",
+                                         dense_mlp_in_gain=True)
+    _collapse_col(optimizer, param, [0, 2])
+    col = optimizer.state[param]["col_gain"].clone()
+    weight = param.detach().clone()
+    assert optimizer.revive_collapsed_col_gains(1e-3) is None
+    torch.testing.assert_close(optimizer.state[param]["col_gain"], col, rtol=0, atol=0)
+    torch.testing.assert_close(param.detach(), weight, rtol=0, atol=0)

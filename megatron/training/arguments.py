@@ -1650,7 +1650,10 @@ def validate_args(args, defaults={}):
                 "(the checkpoint iteration after which the one-shot revive runs).")
         assert args.md_post_norm_gain_pull_coeff >= 0, (
             f"--md-post-norm-gain-pull-coeff must be >= 0; got {args.md_post_norm_gain_pull_coeff}.")
-        if args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff:
+        assert args.md_rowcol_gain_pull_coeff >= 0, (
+            f"--md-rowcol-gain-pull-coeff must be >= 0; got {args.md_rowcol_gain_pull_coeff}.")
+        if (args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff
+                or args.md_rowcol_gain_pull_coeff):
             assert args.md_attention_in_gain_pull_target > 0, (
                 "--md-attention-in-gain-pull-target is the magnitude the pull moves |gain| toward "
                 f"and must be > 0; got {args.md_attention_in_gain_pull_target}.")
@@ -1658,6 +1661,18 @@ def validate_args(args, defaults={}):
             warn_rank_0(
                 "--md-attention-in-gain-pull-col-gain has no effect without "
                 "--md-attention-in-gain-pull-coeff > 0."
+            )
+        if args.md_rowcol_gain_pull_coeff and not (
+                args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff):
+            warn_rank_0(
+                "--md-rowcol-gain-pull-coeff has no effect without --md-attention-in-gain-pull-coeff "
+                "or --md-post-norm-gain-pull-coeff > 0 (it only pulls the matrices next to a pulled "
+                "norm gamma)."
+            )
+        if args.md_rowcol_gain_pull_coeff and args.hypersphere_gains_mode in ("flat", "none"):
+            warn_rank_0(
+                "--md-rowcol-gain-pull-coeff has no effect without row or column gains "
+                f"(--hypersphere-gains-mode {args.hypersphere_gains_mode})."
             )
         if args.md_post_norm_gain_pull_coeff and not args.sandwich_norm:
             warn_rank_0(
@@ -3182,6 +3197,16 @@ def _add_training_args(parser):
                        '--md-attention-in-gain-pull-coeff (the pre-norm pull), so the two can '
                        'differ. Pull only, no revive. The QK-norm, KDA output-norm and final-norm '
                        'gammas are not touched. 0 disables.')
+    group.add_argument('--md-rowcol-gain-pull-coeff', type=float, default=0.0,
+                       help='Coefficient of the pull of the MDDecoupling row and column gains toward '
+                       '--md-attention-in-gain-pull-target, only on the matrices next to a pulled '
+                       'norm gamma, layer by layer: the input projection (linear_qkv, KDA/GDN '
+                       'in_proj, dense linear_fc1) behind a pre-norm gamma pulled by '
+                       '--md-attention-in-gain-pull-coeff and the output projection (linear_proj, '
+                       'KDA/GDN out_proj, dense linear_fc2) in front of a post-norm gamma pulled by '
+                       '--md-post-norm-gain-pull-coeff. Overrides '
+                       '--md-attention-in-gain-pull-col-gain on the column gain. MoE matrices are '
+                       'not touched. Pull only, no revive. 0 disables.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

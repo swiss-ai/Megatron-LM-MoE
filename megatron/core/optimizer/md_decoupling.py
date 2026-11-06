@@ -192,6 +192,26 @@ def _is_sandwich_post_norm_gain(name: str, param: torch.Tensor) -> bool:
                                 or name.endswith(".post_mlp_layernorm.weight"))
 
 
+def _rowcol_gain_pull_norm_name(name: str, param: torch.Tensor) -> Optional[str]:
+    """Name of the norm gamma next to an MDDecoupling matrix whose row and column gains
+    md_rowcol_gain_pull_coeff pulls when that gamma is pulled, None for every other param: the gamma
+    fused into the input projection (linear_qkv, KDA/GDN in_proj, dense linear_fc1) and the
+    same layer's sandwich post-norm in front of the output projection (linear_proj, KDA/GDN
+    out_proj -> post_self_attn_layernorm; dense linear_fc2 -> post_mlp_layernorm). MoE matrices
+    have none."""
+    if param.ndim != 2:
+        return None
+    if name.endswith((".self_attention.linear_qkv.weight", ".self_attention.in_proj.weight",
+                      ".mlp.linear_fc1.weight")):
+        return name[:-len("weight")] + "layer_norm_weight"
+    for suffix, norm in ((".self_attention.linear_proj.weight", ".post_self_attn_layernorm.weight"),
+                         (".self_attention.out_proj.weight", ".post_self_attn_layernorm.weight"),
+                         (".mlp.linear_fc2.weight", ".post_mlp_layernorm.weight")):
+        if name.endswith(suffix):
+            return name[:-len(suffix)] + norm
+    return None
+
+
 @torch.no_grad()
 def _revive_pre_norm_gains(torch_optimizer: torch.optim.Optimizer, threshold: float,
                            mean_mode: str = "all") -> Optional[torch.Tensor]:
@@ -1784,16 +1804,24 @@ class MDDecoupling(_MDDecouplingBase):
         # gain is the multiplier and may be negative, so it is pulled toward sign(g) * t'; under
         # "softplus" the multiplier is always positive and the raw gain is pulled toward t'.
         # Only with attention_in_gain_pull_col_gain; otherwise the plain decay toward 0.
-        coeff = self.attention_in_gain_pull_coeff
-        pull_col = (bool(coeff) and self.attention_in_gain_pull_col_gain and "col_gain" in gain_grads
-                    and self._is_revived_matrix(p))
+        # Matrices tagged md_rowcol_gain_pull_coeff pull their row and column gains the same way
+        # with that coefficient (it takes precedence for the column gain).
+        pull = {}
+        if (self.attention_in_gain_pull_coeff and self.attention_in_gain_pull_col_gain
+                and self._is_revived_matrix(p)):
+            pull["col_gain"] = self.attention_in_gain_pull_coeff
+        rowcol_coeff = getattr(p, "md_rowcol_gain_pull_coeff", 0.0)
+        if rowcol_coeff:
+            pull.update(row_gain=rowcol_coeff, col_gain=rowcol_coeff)
+        if pull:
+            t = float(self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=torch.float64)))
         for name, grad in gain_grads.items():
             gain = state[name]
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
             name_wd, name_target = wd, 0.0
-            if pull_col and name == "col_gain":
-                t = float(self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=torch.float64)))
+            coeff = pull.get(name)
+            if coeff:
                 name_wd, name_target = wd + coeff, coeff * t / (wd + coeff)
             _fused_gain_adam(
                 gain, m, v, grad,
@@ -2260,6 +2288,13 @@ def get_megatron_mddecoupling_optimizer(
                     param.md_gain_log_layer = int(layer_number) - 1
                     break
                 module_name = module_name.rpartition('.')[0]
+        # Row/col gain pull: only the matrices whose neighbouring gamma is pulled (tagged above).
+        if config.md_rowcol_gain_pull_coeff:
+            chunk_params = dict(model_chunk.named_parameters())
+            for name, param in chunk_params.items():
+                norm = chunk_params.get(_rowcol_gain_pull_norm_name(name, param))
+                if param.requires_grad and hasattr(norm, "md_decay_to_target"):
+                    param.md_rowcol_gain_pull_coeff = float(config.md_rowcol_gain_pull_coeff)
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
     hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
