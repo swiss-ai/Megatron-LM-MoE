@@ -1450,6 +1450,11 @@ class OffloadingExpertsMLP(MegatronModule):
 
         # lightweight config for the FP8 offloading autograd function
         self.fp8_config = OffloadingFP8Config.from_transformer_config(self.config)
+        if (
+            self.config.moe_use_inplace_fp8_param
+            and not self.config.moe_offloading_experts_debug_mode
+        ):
+            FP8ExpertsParameterManager.create_instance(config=self.fp8_config)
 
         # cuda stream manager for h2d transfer and computation
         self.stream_manager = StreamManager.get_instance(num_compute_streams=1 if self.config.moe_use_inplace_fp8_param else 4)
