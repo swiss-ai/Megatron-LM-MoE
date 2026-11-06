@@ -240,7 +240,15 @@ class TopKRouter(Router):
         # Quantile balancing uses a per-expert threshold `qb_beta`; it may be combined with
         # sequence-level aux loss through the load-balancing type list. The average method
         # accumulates per-microbatch quantiles, while the histogram method accumulates local
-        # counts and recovers the pooled quantile at the global-batch boundary.
+        # counts and recovers the pooled quantile at the global-batch boundary. marin_exact keeps
+        # every microbatch's raw-logit margins and runs Marin's estimator once per step.
+        self.qb_exact = (
+            "quantile_balancing" in self.routing_type
+            and self.config.moe_router_quantile_balancing_method == 'marin_exact'
+        )
+        self._qb_exact_margins = None  # [capacity, experts] fp32, host-pinned or device
+        self._qb_exact_valid = None  # [capacity] bool, same placement
+        self._qb_exact_rows = 0  # write cursor; reset once per optimizer step
         if "quantile_balancing" in self.routing_type:
             self.register_buffer(
                 'qb_beta',
@@ -263,6 +271,10 @@ class TopKRouter(Router):
                     ),
                     persistent=False,
                 )
+                self.qb_beta_accum = None
+                self.qb_beta_count = None
+            elif self.qb_exact:
+                self.qb_histogram = None
                 self.qb_beta_accum = None
                 self.qb_beta_count = None
             else:
@@ -303,6 +315,43 @@ class TopKRouter(Router):
         """Restore the snapshot taken by get_rerun_state()."""
         for n, saved in state.items():
             getattr(self, n).copy_(saved)
+        # A rejected/partial pass must not leave margins that its replay would append to.
+        self._qb_exact_rows = 0
+
+    def _store_marin_exact_margins(self, margins: torch.Tensor, padding_mask):
+        """Append this microbatch's margins to the step buffer without a host sync.
+
+        The buffer is sized for every microbatch of the step on first use and only grows
+        (synchronizing once) if a later step has more rows, e.g. under batch-size ramp-up.
+        """
+        rows = margins.shape[0]
+        start, end = self._qb_exact_rows, self._qb_exact_rows + rows
+        store, valid_store = self._qb_exact_margins, self._qb_exact_valid
+        if store is None or end > store.shape[0]:
+            capacity = max(end, get_num_microbatches() * rows)
+            on_host = self.config.moe_router_quantile_balancing_marin_exact_store == 'cpu'
+            kwargs = (
+                dict(device='cpu', pin_memory=torch.cuda.is_available())
+                if on_host
+                else dict(device=margins.device)
+            )
+            new_store = torch.empty((capacity, margins.shape[1]), dtype=torch.float32, **kwargs)
+            new_valid = torch.empty((capacity,), dtype=torch.bool, **kwargs)
+            if store is not None and start > 0:
+                if margins.is_cuda:
+                    torch.cuda.current_stream().synchronize()  # in-flight async copies
+                new_store[:start].copy_(store[:start])
+                new_valid[:start].copy_(valid_store[:start])
+            store = self._qb_exact_margins = new_store
+            valid_store = self._qb_exact_valid = new_valid
+        store[start:end].copy_(margins, non_blocking=True)
+        valid = (
+            torch.ones(rows, dtype=torch.bool, device=margins.device)
+            if padding_mask is None
+            else ~padding_mask.bool()
+        )
+        valid_store[start:end].copy_(valid, non_blocking=True)
+        self._qb_exact_rows = end
 
     def _maintain_float32_expert_bias(self):
         """
@@ -367,6 +416,8 @@ class TopKRouter(Router):
         it accumulates local counts that are pooled once at the batch boundary.
         ``marin_histogram`` uses raw logits and a live global histogram per forward,
         then token-weights its quantiles across microbatches at the batch boundary.
+        ``marin_exact`` uses raw logits too but retains every microbatch's margins and runs
+        Marin's single global-batch estimator once at the step boundary (no forward collectives).
 
         Returns probs, routing_map and, when a capacity factor is set, the selection margin
         ``(qb_scores - qb_beta) - alpha`` used to rank tokens for dropping, where ``alpha`` is
@@ -407,7 +458,7 @@ class TopKRouter(Router):
             qb_scores = (
                 logits_fp32
                 if self.config.moe_router_quantile_balancing_method in (
-                    'legacy_average', 'marin_histogram'
+                    'legacy_average', 'marin_histogram', 'marin_exact'
                 )
                 else scores
             )
@@ -416,11 +467,14 @@ class TopKRouter(Router):
                 self.config.moe_router_quantile_balancing_method == 'histogram'
             )
             use_marin = self.config.moe_router_quantile_balancing_method == 'marin_histogram'
+            use_exact = self.config.moe_router_quantile_balancing_method == 'marin_exact'
             compute_drop_priority = (
                 self.config.moe_expert_capacity_factor is not None
                 and self.config.moe_token_drop_policy == "probs"
             )
-            if (should_update_beta and (use_histogram or use_marin)) or compute_drop_priority:
+            if (
+                should_update_beta and (use_histogram or use_marin or use_exact)
+            ) or compute_drop_priority:
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
@@ -444,6 +498,12 @@ class TopKRouter(Router):
                     )
                     self.qb_beta_accum.add_(beta_local * token_count)
                     self.qb_beta_count.add_(token_count)
+                elif use_exact:
+                    # No forward collectives: margins wait for the step boundary, where
+                    # Marin's estimator runs once over every token of the global batch.
+                    self._store_marin_exact_margins(
+                        qb_scores - topk_result.values[:, -1:], padding_mask
+                    )
                 elif use_histogram:
                     # Hand the mask down instead of compacting the rows here:
                     # scores[~padding_mask] lowers to nonzero(), which synchronizes the
@@ -515,6 +575,12 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=False,
             precomputed_indices=indices,
+            sigmoid_normalization_epsilon=(
+                1e-9
+                if self.config.moe_router_quantile_balancing_method
+                in ('marin_histogram', 'marin_exact')
+                else 1e-20
+            ),
         )
         return probs, routing_map, drop_priority
 
@@ -1216,6 +1282,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        sigmoid_normalization_epsilon=1e-20,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1230,6 +1297,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            sigmoid_normalization_epsilon=sigmoid_normalization_epsilon,
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -1240,7 +1308,7 @@ class InferenceTopKRouter(TopKRouter):
         if self.qb_beta is not None:
             logits_fp32 = logits.to(dtype=torch.float32)
             if self.config.moe_router_quantile_balancing_method in (
-                'legacy_average', 'marin_histogram'
+                'legacy_average', 'marin_histogram', 'marin_exact'
             ):
                 qb_scores = logits_fp32
             elif self.score_function == "sigmoid":
@@ -1264,6 +1332,12 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            sigmoid_normalization_epsilon=(
+                1e-9 if self.qb_beta is not None
+                and self.config.moe_router_quantile_balancing_method
+                in ('marin_histogram', 'marin_exact')
+                else 1e-20
+            ),
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

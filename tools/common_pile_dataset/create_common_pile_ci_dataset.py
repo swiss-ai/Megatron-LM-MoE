@@ -25,12 +25,13 @@ Usage:
     --num-documents 10000 \
     --copy-vocab-from /path/to/existing/the_pile
 
-  # Large production run (~24GB, matching existing shard00):
-  python tools/common_pile_dataset/create_common_pile_ci_dataset.py \
+  # GPT-only production run (~24 GB, streaming):
+  uv run python tools/common_pile_dataset/create_common_pile_ci_dataset.py \
     --output-dir /path/to/output \
+    --work-dir /path/to/scratch \
     --num-documents 12000000 \
-    --bulk-download --keep-jsonl \
-    --copy-vocab-from /path/to/existing/the_pile
+    --models gpt \
+    --download-vocab
 
   # With vocab download (no existing dataset needed):
   python tools/common_pile_dataset/create_common_pile_ci_dataset.py \
@@ -60,7 +61,7 @@ def _format_eta(seconds):
         return f"{h}h{m:02d}m"
 
 
-def download_common_pile_sample(output_jsonl, num_documents, dataset_name):
+def download_common_pile_sample(output_jsonl, num_documents, dataset_name, revision=None):
     """Download a sample from Common Pile using the datasets library."""
     try:
         from datasets import load_dataset
@@ -71,7 +72,7 @@ def download_common_pile_sample(output_jsonl, num_documents, dataset_name):
     print(f"Downloading {num_documents} documents from {dataset_name}...")
     print("  (Using HF_TOKEN from environment for authentication if set)")
 
-    ds = load_dataset(dataset_name, split="train", streaming=True)
+    ds = load_dataset(dataset_name, revision=revision, split="train", streaming=True)
 
     count = 0
     start_time = time.time()
@@ -106,7 +107,7 @@ def download_common_pile_sample(output_jsonl, num_documents, dataset_name):
     return count
 
 
-def download_common_pile_bulk(output_jsonl, num_documents, dataset_name):
+def download_common_pile_bulk(output_jsonl, num_documents, dataset_name, revision=None):
     """Download from Common Pile using bulk parquet loading for speed.
 
     This is faster than streaming for large downloads (>100K docs) because
@@ -124,7 +125,7 @@ def download_common_pile_bulk(output_jsonl, num_documents, dataset_name):
 
     # Load non-streaming — this downloads parquet shards to the HF cache
     print("  Loading dataset (downloading parquet shards)...")
-    ds = load_dataset(dataset_name, split="train")
+    ds = load_dataset(dataset_name, revision=revision, split="train")
     total_available = len(ds)
     print(f"  Dataset loaded: {total_available:,} documents available")
 
@@ -166,28 +167,34 @@ def download_common_pile_bulk(output_jsonl, num_documents, dataset_name):
     return count
 
 
-def copy_vocab_files(output_dir, source_base):
+def copy_vocab_files(output_dir, source_base, models=("gpt", "bert", "t5")):
     """Copy vocabulary files from existing the_pile dataset directories."""
     copies = [
         (
+            "gpt",
             os.path.join(source_base, "shard00", "bpe", "vocab.json"),
             os.path.join(output_dir, "bpe", "vocab.json"),
         ),
         (
+            "gpt",
             os.path.join(source_base, "shard00", "bpe", "merges.txt"),
             os.path.join(output_dir, "bpe", "merges.txt"),
         ),
         (
+            "bert",
             os.path.join(source_base, "bert_shard00", "vocab.txt"),
             os.path.join(output_dir, "vocab.txt"),
         ),
         (
+            "t5",
             os.path.join(source_base, "t5_shard00", "bert-large-cased-vocab.txt"),
             os.path.join(output_dir, "bert-large-cased-vocab.txt"),
         ),
     ]
 
-    for src, dst in copies:
+    for model, src, dst in copies:
+        if model not in models:
+            continue
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if not os.path.exists(src):
             print(f"  ERROR: Source vocab file not found: {src}")
@@ -200,28 +207,34 @@ def copy_vocab_files(output_dir, source_base):
             f_out.write(f_in.read())
 
 
-def download_vocab_files(output_dir):
+def download_vocab_files(output_dir, models=("gpt", "bert", "t5"), gpt2_revision="main"):
     """Download tokenizer vocabulary files from HuggingFace."""
     downloads = [
         (
-            "https://huggingface.co/openai-community/gpt2/resolve/main/vocab.json",
+            "gpt",
+            f"https://huggingface.co/openai-community/gpt2/resolve/{gpt2_revision}/vocab.json",
             os.path.join(output_dir, "bpe", "vocab.json"),
         ),
         (
-            "https://huggingface.co/openai-community/gpt2/resolve/main/merges.txt",
+            "gpt",
+            f"https://huggingface.co/openai-community/gpt2/resolve/{gpt2_revision}/merges.txt",
             os.path.join(output_dir, "bpe", "merges.txt"),
         ),
         (
+            "bert",
             "https://huggingface.co/google-bert/bert-base-uncased/resolve/main/vocab.txt",
             os.path.join(output_dir, "vocab.txt"),
         ),
         (
+            "t5",
             "https://huggingface.co/google-bert/bert-large-cased/resolve/main/vocab.txt",
             os.path.join(output_dir, "bert-large-cased-vocab.txt"),
         ),
     ]
 
-    for url, dst in downloads:
+    for model, url, dst in downloads:
+        if model not in models:
+            continue
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst):
             print(f"  Already exists: {dst}")
@@ -232,7 +245,7 @@ def download_vocab_files(output_dir):
         req = urllib.request.Request(url)
         if hf_token:
             req.add_header("Authorization", f"Bearer {hf_token}")
-        with urllib.request.urlopen(req) as response, open(dst, 'wb') as f_out:
+        with urllib.request.urlopen(req, timeout=60) as response, open(dst, 'wb') as f_out:
             f_out.write(response.read())
 
 
@@ -264,20 +277,27 @@ def run_preprocess(megatron_dir, jsonl_path, output_prefix, tokenizer_type,
         sys.exit(1)
 
 
-def verify_output(output_dir):
-    """Verify all expected output files exist."""
-    expected_files = [
-        "my-gpt3_00_text_document.bin",
-        "my-gpt3_00_text_document.idx",
-        "my-bert_00_text_sentence.bin",
-        "my-bert_00_text_sentence.idx",
-        "my-t5_00_text_document.bin",
-        "my-t5_00_text_document.idx",
-        "bpe/vocab.json",
-        "bpe/merges.txt",
-        "vocab.txt",
-        "bert-large-cased-vocab.txt",
-    ]
+def verify_output(output_dir, models=("gpt", "bert", "t5")):
+    """Verify the output files for the selected model families."""
+    model_files = {
+        "gpt": [
+            "my-gpt3_00_text_document.bin",
+            "my-gpt3_00_text_document.idx",
+            "bpe/vocab.json",
+            "bpe/merges.txt",
+        ],
+        "bert": [
+            "my-bert_00_text_sentence.bin",
+            "my-bert_00_text_sentence.idx",
+            "vocab.txt",
+        ],
+        "t5": [
+            "my-t5_00_text_document.bin",
+            "my-t5_00_text_document.idx",
+            "bert-large-cased-vocab.txt",
+        ],
+    }
+    expected_files = [name for model in models for name in model_files[model]]
 
     all_ok = True
     for f in expected_files:
@@ -311,6 +331,23 @@ def main():
     parser.add_argument(
         "--dataset-name", type=str, default="common-pile/comma_v0.1_training_dataset",
         help="HuggingFace dataset name (default: common-pile/comma_v0.1_training_dataset)",
+    )
+    parser.add_argument(
+        "--models", nargs="+", choices=("gpt", "bert", "t5"),
+        default=["gpt", "bert", "t5"],
+        help="Model families to prepare (default: gpt bert t5)",
+    )
+    parser.add_argument(
+        "--dataset-revision", default=None,
+        help="Hugging Face dataset revision or commit",
+    )
+    parser.add_argument(
+        "--gpt2-revision", default="main",
+        help="GPT-2 tokenizer revision or commit",
+    )
+    parser.add_argument(
+        "--work-dir", default=None,
+        help="Directory for temporary JSONL files (default: output directory)",
     )
     parser.add_argument(
         "--copy-vocab-from", type=str, default=None,
@@ -356,6 +393,8 @@ def main():
         sys.exit(1)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    work_dir = args.work_dir or args.output_dir
+    os.makedirs(work_dir, exist_ok=True)
 
     # ================================================================
     # Step 1: Get vocabulary files
@@ -366,10 +405,10 @@ def main():
 
     if args.copy_vocab_from:
         print(f"  Copying from: {args.copy_vocab_from}")
-        copy_vocab_files(args.output_dir, args.copy_vocab_from)
+        copy_vocab_files(args.output_dir, args.copy_vocab_from, args.models)
     elif args.download_vocab:
         print("  Downloading from HuggingFace...")
-        download_vocab_files(args.output_dir)
+        download_vocab_files(args.output_dir, args.models, args.gpt2_revision)
     else:
         # Default: try to copy from standard CI location, fall back to download
         default_source = (
@@ -378,10 +417,10 @@ def main():
         )
         if os.path.exists(default_source):
             print(f"  Copying from default location: {default_source}")
-            copy_vocab_files(args.output_dir, default_source)
+            copy_vocab_files(args.output_dir, default_source, args.models)
         else:
             print("  Default vocab source not found, downloading from HuggingFace...")
-            download_vocab_files(args.output_dir)
+            download_vocab_files(args.output_dir, args.models, args.gpt2_revision)
 
     # ================================================================
     # Step 2: Get raw text data
@@ -394,18 +433,25 @@ def main():
         jsonl_path = args.existing_jsonl
         print(f"  Using existing JSONL: {jsonl_path}")
     else:
-        jsonl_path = os.path.join(args.output_dir, "common_pile_raw.jsonl")
+        jsonl_path = os.path.join(work_dir, "common_pile_raw.jsonl")
         if os.path.exists(jsonl_path):
-            print(f"  JSONL already exists: {jsonl_path}")
-            print("  (Delete it to re-download)")
-        elif args.bulk_download:
-            download_common_pile_bulk(
-                jsonl_path, args.num_documents, args.dataset_name
+            raise FileExistsError(
+                f"Raw JSONL already exists: {jsonl_path}. "
+                "Use a new work directory or --existing-jsonl for explicit reuse."
             )
+        partial_jsonl = jsonl_path + ".partial"
+        if args.bulk_download:
+            download = download_common_pile_bulk
         else:
-            download_common_pile_sample(
-                jsonl_path, args.num_documents, args.dataset_name
+            download = download_common_pile_sample
+        count = download(
+            partial_jsonl, args.num_documents, args.dataset_name, args.dataset_revision
+        )
+        if count != args.num_documents:
+            raise RuntimeError(
+                f"Expected {args.num_documents} documents, received {count}"
             )
+        os.replace(partial_jsonl, jsonl_path)
 
     # ================================================================
     # Step 3: Preprocess for GPT (GPT2BPETokenizer)
@@ -416,7 +462,9 @@ def main():
 
     gpt_prefix = os.path.join(args.output_dir, "my-gpt3_00")
     gpt_bin = gpt_prefix + "_text_document.bin"
-    if os.path.exists(gpt_bin):
+    if "gpt" not in args.models:
+        print("  Skipping GPT preprocessing")
+    elif os.path.exists(gpt_bin):
         print(f"  GPT data already exists: {gpt_bin}")
     else:
         run_preprocess(
@@ -439,7 +487,9 @@ def main():
 
     bert_prefix = os.path.join(args.output_dir, "my-bert_00")
     bert_bin = bert_prefix + "_text_sentence.bin"
-    if os.path.exists(bert_bin):
+    if "bert" not in args.models:
+        print("  Skipping BERT preprocessing")
+    elif os.path.exists(bert_bin):
         print(f"  BERT data already exists: {bert_bin}")
     else:
         # BERT with --split-sentences requires two passes when partitions=1:
@@ -480,7 +530,9 @@ def main():
 
     t5_prefix = os.path.join(args.output_dir, "my-t5_00")
     t5_bin = t5_prefix + "_text_document.bin"
-    if os.path.exists(t5_bin):
+    if "t5" not in args.models:
+        print("  Skipping T5 preprocessing")
+    elif os.path.exists(t5_bin):
         print(f"  T5 data already exists: {t5_bin}")
     else:
         run_preprocess(
@@ -500,31 +552,23 @@ def main():
     print("Step 6: Verifying output...")
     print("=" * 60)
 
+    all_ok = verify_output(args.output_dir, args.models)
+    if not all_ok:
+        print("\nERROR: Some expected files are missing. Temporary text files were retained.")
+        sys.exit(1)
+
     if not args.keep_jsonl and not args.existing_jsonl:
-        intermediate = os.path.join(args.output_dir, "common_pile_raw.jsonl")
+        intermediate = os.path.join(work_dir, "common_pile_raw.jsonl")
         if os.path.exists(intermediate):
             print(f"  Removing intermediate JSONL: {intermediate}")
             os.remove(intermediate)
-        ss_intermediate = os.path.join(args.output_dir, "common_pile_raw_ss.jsonl")
+        ss_intermediate = os.path.join(work_dir, "common_pile_raw_ss.jsonl")
         if os.path.exists(ss_intermediate):
             print(f"  Removing sentence-split JSONL: {ss_intermediate}")
             os.remove(ss_intermediate)
 
-    all_ok = verify_output(args.output_dir)
-
-    if all_ok:
-        print(f"\nDataset created successfully at: {args.output_dir}")
-        print("\nTo use in CI tests, update model_config.yaml data paths:")
-        print("  GPT:  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document")
-        print("        --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json")
-        print("        --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt")
-        print("  BERT: --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-bert_00_text_sentence")
-        print("        --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/vocab.txt")
-        print("  T5:   --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-t5_00_text_document")
-        print("        --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bert-large-cased-vocab.txt")
-    else:
-        print("\nERROR: Some expected files are missing!")
-        sys.exit(1)
+    print(f"\nDataset created successfully at: {args.output_dir}")
+    print(f"Prepared model families: {', '.join(args.models)}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -2120,6 +2121,86 @@ def get_batch_on_this_cp_rank(
     return batch
 
 
+def merge_short_documents(cu_seqlens: torch.Tensor, min_len: int) -> torch.Tensor:
+    """Merge every document of at most ``min_len`` tokens into its neighbour.
+
+    Each short document is merged into the next one; the last document, which has no
+    successor, is merged into the previous one if it is still short. Afterwards every
+    segment is longer than ``min_len`` unless the whole sequence is not.
+
+    Args:
+        cu_seqlens: 1-D cumulative sequence lengths, starting at 0.
+        min_len: documents with ``length <= min_len`` are merged; ``<= 0`` disables.
+
+    Returns:
+        cu_seqlens with the merged boundaries removed.
+    """
+    if min_len <= 0 or cu_seqlens.numel() <= 2:
+        return cu_seqlens
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    keep = torch.ones_like(cu_seqlens, dtype=torch.bool)
+    keep[1:-1] = lengths[:-1] > min_len
+    merged = cu_seqlens[keep]
+    # Every segment now ends in a document longer than min_len, except possibly the last.
+    if merged.numel() > 2 and merged[-1] - merged[-2] <= min_len:
+        merged = torch.cat((merged[:-2], merged[-1:]))
+    return merged
+
+
+def pad_thd_batch_for_cp(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    sp_size: int = 1,
+    local_multiple: int = 1,
+):
+    """Pad every document of a packed batch to a multiple of ``2 * cp_size * sp_size``.
+
+    The per-document zigzag partition needs that divisibility and the dataloader's
+    document boundaries do not provide it. Padding goes at each document's causal
+    tail, so no real token can attend to it; it gets zero loss and is flagged in
+    ``padding_mask`` so MoE routing ignores it. The padded total is also rounded up
+    so that every rank holds a multiple of ``local_multiple`` tokens.
+
+    Returns the batch, the padded ``cu_seqlens`` and the padded ``max_seqlen``.
+    """
+    alignment = 2 * cp_size * sp_size
+    cu_seqlens_cpu = cu_seqlens.cpu()
+    # A document of at most `alignment` tokens gets a single token per zigzag chunk, which
+    # CP kernels do not handle. Merging such documents into a neighbour avoids that layout,
+    # but it also removes the inter-document boundary, so it is OPT-IN: it changes the
+    # attention mask and must not alter packing for callers that did not ask for it.
+    # Set MEGATRON_CP_MIN_DOC_TOKENS (e.g. to 2*cp_size*sp_size) to enable it.
+    min_len = int(os.environ.get("MEGATRON_CP_MIN_DOC_TOKENS", 0))
+    merged = merge_short_documents(cu_seqlens_cpu, min_len)
+    if merged.numel() != cu_seqlens_cpu.numel():
+        cu_seqlens_cpu = merged
+        cu_seqlens = merged.to(cu_seqlens.device, dtype=cu_seqlens.dtype)
+    lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    padded_lengths = (lengths + alignment - 1) // alignment * alignment
+    padded_lengths[-1] += -padded_lengths.sum() % (local_multiple * cp_size * sp_size)
+    padded_cu_seqlens_cpu = torch.cat(
+        (cu_seqlens_cpu[:1], padded_lengths.cumsum(0).to(cu_seqlens_cpu.dtype))
+    )
+    padded_cu_seqlens = padded_cu_seqlens_cpu.to(cu_seqlens.device)
+    padded_total = int(padded_cu_seqlens_cpu[-1])
+
+    positions = torch.arange(int(cu_seqlens_cpu[-1]), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    document = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+    destinations = (positions + (padded_cu_seqlens[:-1] - cu_seqlens[:-1])[document]).long()
+
+    padding_mask = torch.ones((1, padded_total), dtype=torch.bool, device=cu_seqlens.device)
+    if batch.get('padding_mask') is not None:
+        padding_mask.index_copy_(1, destinations, batch['padding_mask'])
+    else:
+        padding_mask.index_fill_(1, destinations, False)
+    batch['padding_mask'] = padding_mask
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        if batch.get(key) is not None:
+            batch[key] = batch[key].new_zeros((1, padded_total)).index_copy_(1, destinations, batch[key])
+    return batch, padded_cu_seqlens, padded_lengths.max().reshape(1)
+
+
 def get_thd_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     cu_seqlens: torch.Tensor,
@@ -2131,6 +2212,9 @@ def get_thd_batch_on_this_cp_rank(
     """Slice each sub-sample in a packed sample batch input along
     sequence dimension into multiple chunks, which are parallelized
     across GPUs in a context parallel group.
+
+    Middle pipeline stages carry no tokens, only the packed-sequence metadata and,
+    with BFD packing, the routing ``padding_mask``.
     """
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -2149,13 +2233,15 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
-        )
+        total_tokens = next((data.size(1) for data in batch.values() if data is not None), None)
+        if total_tokens is None:
+            total_tokens = int(cu_seqlens_padded[-1].item())
+        index = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
                 continue
-            batch[key] = data.index_select(1, index)
+            if data is not None:
+                batch[key] = data.index_select(1, index)
 
     return batch, packed_seq_params
 

@@ -1,0 +1,210 @@
+name: Alps test results
+run-name: >-
+  Alps ${{ inputs.suite }}
+  · ${{ inputs.tested_pr && format('PR #{0} · ', inputs.tested_pr) || '' }}${{ inputs.tested_branch || 'unknown branch' }}
+  · ${{ inputs.tested_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Test suite
+        required: true
+        type: choice
+        options:
+          - unit
+          - functional
+      tested_sha:
+        description: Full commit SHA from the test run
+        required: true
+        type: string
+      tested_branch:
+        description: Branch recorded by the test launcher; empty if unknown
+        required: false
+        type: string
+      tested_pr:
+        description: PR verified against the tested branch and commit; empty if unknown
+        required: false
+        type: string
+      report:
+        description: Compact JSON report from tests/publish_results.sh
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarize Alps results and publish commit status
+        id: summary
+        uses: actions/github-script@v8
+        env:
+          ALPS_REPORT: ${{ inputs.report }}
+          ALPS_SUITE: ${{ inputs.suite }}
+          ALPS_TESTED_SHA: ${{ inputs.tested_sha }}
+          ALPS_TESTED_BRANCH: ${{ inputs.tested_branch }}
+          ALPS_TESTED_PR: ${{ inputs.tested_pr }}
+          POLICY_SHA: ${{ github.workflow_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const suite = process.env.ALPS_SUITE;
+            const testedSha = process.env.ALPS_TESTED_SHA;
+            const testedBranch = process.env.ALPS_TESTED_BRANCH || '';
+            const testedPr = process.env.ALPS_TESTED_PR || '';
+
+            if (
+              !['unit', 'functional'].includes(suite) ||
+              !/^[a-f0-9]{40}$/i.test(testedSha) ||
+              (testedPr && (!testedBranch || !/^[1-9][0-9]*$/.test(testedPr)))
+            ) {
+              throw new Error('Invalid suite or tested commit');
+            }
+
+            const target = [
+              context.serverUrl,
+              context.repo.owner,
+              context.repo.repo,
+              'actions/runs',
+              context.runId,
+            ].join('/');
+            const runContext = `alps/${suite}/${context.runId}`;
+            let stableContext = runContext;
+            const status = (state, description, name = stableContext) => {
+              return github.rest.repos.createCommitStatus({
+                ...context.repo,
+                sha: testedSha,
+                state,
+                description,
+                context: name,
+                target_url: target,
+              });
+            };
+
+            try {
+              await status('pending', 'Checking regressions and coverage.');
+              let reportText = process.env.ALPS_REPORT;
+              if (reportText.startsWith('gzip:')) {
+                const zlib = require('zlib');
+                const compressed = Buffer.from(reportText.slice(5), 'base64');
+                reportText = zlib.gunzipSync(compressed, {
+                  maxOutputLength: 5_000_000,
+                }).toString('utf8');
+              }
+              const report = JSON.parse(reportText);
+
+              if (
+                report.suite !== suite ||
+                report.sha !== testedSha ||
+                report.version !== 2 ||
+                report.policy_sha !== process.env.POLICY_SHA ||
+                (report.tested_branch || '') !== testedBranch ||
+                String(report.tested_pr || '') !== testedPr ||
+                (report.tested_pr != null &&
+                  (!Number.isSafeInteger(report.tested_pr) || report.tested_pr < 1)) ||
+                !Array.isArray(report.selections) ||
+                !report.selections.length ||
+                report.selections.length > 256
+              ) {
+                throw new Error('Invalid report or stale policy revision');
+              }
+
+              if (testedPr) {
+                const {data: pr} = await github.rest.pulls.get({
+                  ...context.repo,
+                  pull_number: Number(testedPr),
+                });
+                if (pr.head.sha !== testedSha || pr.head.ref !== testedBranch) {
+                  throw new Error('PR does not match the tested branch and commit');
+                }
+              }
+
+              const trustedFile = async file => {
+                const {data} = await github.rest.repos.getContent({
+                  ...context.repo,
+                  path: file,
+                  ref: process.env.POLICY_SHA,
+                });
+                return Buffer.from(data.content, 'base64').toString('utf8');
+              };
+              const policyFile = 'tests/test_utils/recipes/gh200/known-failures.json';
+              const moduleFile = '.github/workflows/alps-regression-policy.cjs';
+              const policy = JSON.parse(await trustedFile(policyFile));
+              const modulePath = path.resolve('alps-regression-policy.cjs');
+
+              fs.writeFileSync(modulePath, await trustedFile(moduleFile));
+              const {
+                evaluateReport,
+                renderReport,
+                functionalSelections,
+              } = require(modulePath);
+              if (suite === 'functional') {
+                const {data: tree} = await github.rest.git.getTree({
+                  ...context.repo,
+                  tree_sha: process.env.POLICY_SHA,
+                  recursive: 'true',
+                });
+                policy.required_selections.functional = {
+                  ...policy.required_selections.functional,
+                  ...functionalSelections(tree),
+                };
+              }
+              report.repository = `${context.repo.owner}/${context.repo.repo}`;
+              report.workflow_ref = context.ref;
+              const gate = evaluateReport(report, policy);
+              stableContext = gate.scope === 'selected'
+                ? `alps/${suite}/selected` : `alps/${suite}/regressions`;
+              const markdown = renderReport(report, gate);
+
+              for (const test of gate.unexpected.slice(0, 20)) {
+                const detail = test.errors.join('; ').slice(0, 500);
+                core.error(`${test.test_id}: ${detail}`, {
+                  title: 'New or changed test failure',
+                });
+              }
+
+              const artifact = {...report, regression_gate: gate};
+              fs.writeFileSync('alps-results.json', JSON.stringify(artifact, null, 2));
+              fs.writeFileSync('alps-results.md', markdown);
+              await core.summary.addRaw(markdown).write();
+              core.setOutput('state', gate.state);
+
+              const counts = [
+                `${gate.unexpected.length} new`,
+                `${gate.known.length} known`,
+                `${gate.fixed.length} fixed`,
+              ].join(', ');
+              const coverage = gate.incomplete.length ? '; selected coverage incomplete.'
+                : gate.scope === 'selected' ? '; selected tests only.' : '.';
+              const description = counts + coverage;
+
+              await status(gate.state, description);
+              await status(gate.state, description, runContext);
+            } catch (error) {
+              await status('error', 'Report could not be validated.');
+              throw error;
+            }
+
+      - name: Save report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alps-test-report
+          path: |
+            alps-results.json
+            alps-results.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce regression gate
+        if: steps.summary.outputs.state != 'success'
+        run: |
+          echo 'New failures or incomplete test coverage.'
+          exit 1

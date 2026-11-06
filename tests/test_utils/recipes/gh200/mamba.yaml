@@ -1,0 +1,15 @@
+platform: gh200
+gpus_per_node: 4
+
+spec:
+  model: hybrid
+  ranks: 8
+  n_repeat: 5
+  training_script: pretrain_mamba.py
+
+products:
+  - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
+  - test_case: [hybrid_mr_mcore_te_tp1_pp2_vpp2_cp1_dgx_a100_1N8G]
+  - test_case: [hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G]
+  - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
+  - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]

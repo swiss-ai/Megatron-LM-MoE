@@ -35,7 +35,8 @@ class TestCommunicationWithCustomPPGroup:
 
         rank = dist.get_rank()
 
-        device = torch.device(f"cuda:{rank}")
+        # Utils selects the node-local device; rank remains global.
+        device = torch.device("cuda", torch.cuda.current_device())
 
         # Set a random seed based on rank for reproducibility but different values
         torch.manual_seed(rank)
@@ -86,7 +87,7 @@ class TestCommunicationWithCustomPPGroup:
         torch.manual_seed(rank)
 
         # Create unique random data for this rank
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device("cuda", torch.cuda.current_device())
         local_send_data = torch.randn(self.size, dtype=self.dtype, device=device)
 
         # Synchronize before test

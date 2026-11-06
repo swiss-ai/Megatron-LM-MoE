@@ -124,14 +124,15 @@ class TestMarinQB(unittest.TestCase):
                               moe_router_group_topk=None, moe_router_quantile_balancing_method="marin_histogram",
                               moe_router_quantile_balancing_marin_num_bins=10000,
                               moe_router_pre_softmax=False, moe_router_topk_scaling_factor=2.5,
-                              moe_expert_capacity_factor=None,
+                              moe_expert_capacity_factor=None, moe_token_drop_policy="probs",
                               moe_router_quantile_balancing_freeze=False)
         beta = torch.tensor([0.2, 0.1, 0., -0.1])
         router = SimpleNamespace(config=cfg, tp_cp_group=None, tp_dp_cp_group=object(), training=True,
                                  score_function="sigmoid", topk=2, qb_beta=beta.clone(),
                                  qb_beta_accum=torch.zeros(4), qb_beta_count=torch.zeros((), dtype=torch.long))
         logits = torch.tensor([[106., 105., 100., 99.]]).repeat(8, 1)
-        weights, selected, _ = route(router, logits)
+        weights, selected, drop_priority = route(router, logits)
+        self.assertIsNone(drop_priority)
         expected = torch.zeros_like(selected).scatter_(1, (logits - beta).topk(2, dim=1).indices, True)
         sigmoid_selected = torch.zeros_like(selected).scatter_(1, (logits.sigmoid() - beta).topk(2, dim=1).indices, True)
         self.assertTrue(torch.equal(selected, expected))
@@ -151,6 +152,28 @@ class TestMarinQB(unittest.TestCase):
         router.router_replay = None
         _, indices = infer(router, logits)
         torch.testing.assert_close(indices, (logits - beta).topk(2, dim=1).indices)
+
+        # Tiny sigmoid scores expose the denominator epsilon; ordinary scores
+        # cannot distinguish 1e-9 from the previous 1e-20 normalization.
+        tiny = torch.tensor([[-25., -26., -27., -28.]], requires_grad=True)
+        train_weights, train_selected, _ = route(router, tiny)
+        infer_weights, infer_indices = infer(router, tiny)
+        scores = tiny.sigmoid().gather(1, infer_indices)
+        expected_weights = 2.5 * scores / (scores.sum(-1, keepdim=True) + 1e-9)
+        torch.testing.assert_close(infer_weights, expected_weights)
+        torch.testing.assert_close(train_weights.gather(1, infer_indices), expected_weights)
+        self.assertTrue(torch.equal(train_selected.nonzero()[:, 1], infer_indices.flatten()))
+        self.assertLess(infer_weights.sum().item(), 0.1)
+        train_weights.sum().backward()
+        self.assertTrue(torch.isfinite(tiny.grad).all())
+        self.assertGreater(tiny.grad.abs().sum().item(), 0.)
+
+        # Other callers retain the original epsilon by default.
+        default_weights, _ = combine(
+            tiny.detach(), 2, score_function="sigmoid", scaling_factor=2.5,
+            precomputed_indices=infer_indices, dense_output=True,
+        )
+        torch.testing.assert_close(default_weights.sum(), torch.tensor(2.5))
 
     def test_step_boundary_weighted_average_and_centering(self):
         ns = {"torch": torch, "List": List, "Optional": Optional,

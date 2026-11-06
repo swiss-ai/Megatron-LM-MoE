@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import gc
+
 import pytest
 import torch
 
@@ -18,7 +20,12 @@ class TestMoELayerFP8:
     """Test the non-offloading FP8 grouped SwiGLU MLP against a bf16 reference."""
 
     def setup_method(self, method):
-        pass
+        FP8GPUExpertsParameterManager.reset_instance()
+
+    def teardown_method(self, method):
+        FP8GPUExpertsParameterManager.reset_instance()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def test_fp8_moe_forward_backward(
         self, num_moe_experts=64, profile=False, num_repeats=10,

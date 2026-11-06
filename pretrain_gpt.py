@@ -24,6 +24,7 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.doc_aware_cp import get_doc_aware_batch_on_this_cp_rank
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -33,6 +34,7 @@ from megatron.core.utils import (
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
     get_thd_batch_on_this_cp_rank,
+    pad_thd_batch_for_cp,
     get_batch_on_this_hybrid_cp_rank,
     StragglerDetector,
 )
@@ -96,6 +98,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             ``max_seqlen`` to the attention kernel.
           - Middle PP stages also fetch BFD metadata so their MoE routers can
             reconstruct the padding mask.
+          - With context parallelism, every document is first padded to the
+            divisibility the per-document zigzag partition needs.
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
             regardless of pipeline stage.
     """
@@ -130,10 +134,39 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         ), "cu_seqlens must be (1, N) after flatten_batch_for_packed_sequences"
         cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if args.cp_doc_aware and cp_size > 1:
+            # Short documents whole on one CP rank, long ones split (megatron/core/doc_aware_cp.py).
+            batch, packed_seq_params = get_doc_aware_batch_on_this_cp_rank(
+                batch,
+                cu_seqlens,
+                cp_size,
+                parallel_state.get_context_parallel_rank(),
+                sp_size=args.tensor_model_parallel_size if args.sequence_parallel else 1,
+                local_multiple=16 if args.fp8 else 1,
+                max_local_len=args.cp_doc_aware_max_local_len,
+                max_padding=args.cp_doc_aware_max_padding,
+            )
+            padding_mask = batch.pop('padding_mask', None)
+            return (*batch.values(), padding_mask, packed_seq_params)
+        if args.dataloader_inter_document_masking and cp_size > 1:
+            batch, cu_seqlens, max_seqlen = pad_thd_batch_for_cp(
+                batch,
+                cu_seqlens,
+                cp_size,
+                sp_size=args.tensor_model_parallel_size if args.sequence_parallel else 1,
+                local_multiple=16 if args.fp8 else 1,
+            )
+            cu_seqlens_padded = cu_seqlens
 
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen plus any MoE padding mask are needed; skip the full batch.
-    if not is_first_last and is_packed_sequence:
+    # Without CP this is main's path; with CP the stages need the padded layout below.
+    if (
+        not is_first_last
+        and is_packed_sequence
+        and parallel_state.get_context_parallel_world_size() == 1
+    ):
         return None, None, None, None, None, batch.get('padding_mask'), PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
@@ -147,20 +180,6 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
-        if (
-            args.dataloader_inter_document_masking
-            and not args.sft
-            and parallel_state.get_context_parallel_world_size() > 1
-        ):
-            # cu_seqlens here come from EOD boundaries within each document, which
-            # are not guaranteed divisible by 2*context_parallel_size the way SFT's
-            # padded packing is. get_thd_batch_on_this_cp_rank's per-document
-            # zigzag (tex.thd_get_partitioned_indices) assumes that divisibility,
-            # so fail loudly here instead of a confusing assert deep inside TE.
-            raise NotImplementedError(
-                "--dataloader-inter-document-masking does not support "
-                "context-parallelism yet."
-            )
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
@@ -200,6 +219,12 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+        if args.context_parallel_size > 1 and not args.calculate_per_token_loss:
+            # Normalize by the microbatch's token count over all CP ranks: packed
+            # documents and padding do not split the valid tokens evenly. The data
+            # parallel reduction averages gradients over CP ranks, hence the rescale.
+            torch.distributed.all_reduce(num_tokens, group=parallel_state.get_context_parallel_group())
+            loss = loss * args.context_parallel_size
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -382,6 +407,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     args = get_args()
 
     config = core_gpt_dataset_config_from_args(args)
+
+    if args.exit_on_tranche_end:
+        train_blend = config.blend if config.blend is not None else config.blend_per_split[0]
+        if train_blend is None or train_blend[1] is not None:
+            raise ValueError('--exit-on-tranche-end requires an unweighted training data blend')
 
 
     is_packed_sequence = False

@@ -1075,6 +1075,15 @@ class Attention(MegatronModule, ABC):
             rotary_pos_cos = None
             rotary_pos_sin = None
             rotary_pos_cos_sin = None
+        if (
+            rotary_pos_emb is not None
+            and packed_seq_params is not None
+            and packed_seq_params.doc_aware is not None
+        ):
+            raise NotImplementedError(
+                "Document-aware CP does not support RoPE yet (its local and long parts need "
+                "separate CP offsets); use NoPE (--no-rope-freq 1) or plain THD CP."
+            )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

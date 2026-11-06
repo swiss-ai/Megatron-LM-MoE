@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import gc
+
 import pytest
 import torch
 
@@ -7,6 +9,7 @@ from megatron.core.transformer.moe.experts_util import MergedSwiGLU
 from megatron.core.transformer.moe.moe_offload import StreamManager
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
+    OffloadingFP8Config,
     offloading_fp8_grouped_swiglu_mlp,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -14,6 +17,16 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 class TestOffloadingMoELayerFP8:
     """Test MoE layer with FP8 precision and CPU weight offloading."""
+
+    def setup_method(self, method):
+        FP8ExpertsParameterManager.reset_instance()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def teardown_method(self, method):
+        FP8ExpertsParameterManager.reset_instance()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @pytest.mark.parametrize("num_moe_experts", [64])
     def test_offloading_moe_forward_backward(
@@ -66,6 +79,7 @@ class TestOffloadingMoELayerFP8:
             moe_offloading_chunk_size=moe_offloading_chunk_size,
             gradient_accumulation_fusion=True,
         )
+        offloading_config = OffloadingFP8Config.from_transformer_config(transformer_config)
 
         # Draw weights on CUDA so the CUDA RNG stream advances identically to
         # the non-offloading test, then mirror to pinned CPU for the offload path.
@@ -139,7 +153,7 @@ class TestOffloadingMoELayerFP8:
         torch.cuda.synchronize()
 
         stream_manager = StreamManager(moe_offloading_num_stages, 4)
-        FP8ExpertsParameterManager.create_instance(config=transformer_config)
+        FP8ExpertsParameterManager.create_instance(config=offloading_config)
 
         # Realistic upstream gradient: simulate an MSE loss against a random
         # target, so grad_y has the same per-token magnitude structure as in
@@ -165,13 +179,13 @@ class TestOffloadingMoELayerFP8:
                 ),
             ) as prof:
                 for _ in range(num_steps):
-                    output = offloading_fp8_grouped_swiglu_mlp(
+                    output, _ = offloading_fp8_grouped_swiglu_mlp(
                         cpu_w1, cpu_w2, cpu_w1_list, cpu_w2_list,
                         gpu_w1_buffer, gpu_w2_buffer,
                         gpu_w1_chunks, gpu_w2_chunks,
                         hidden_states, tokens_per_expert, num_moe_experts,
                         permuted_probs, None, stream_manager,
-                        transformer_config, [],
+                        offloading_config, [],
                     )
                     torch.cuda.synchronize()
                     output.sum().backward()
@@ -202,18 +216,18 @@ class TestOffloadingMoELayerFP8:
         # --- Offloading path (FP8 with CPU offload) ---
         outputs = []
         for _ in range(num_repeats):
-            output = offloading_fp8_grouped_swiglu_mlp(
+            output, _ = offloading_fp8_grouped_swiglu_mlp(
                 cpu_w1, cpu_w2, cpu_w1_list, cpu_w2_list,
                 gpu_w1_buffer, gpu_w2_buffer,
                 gpu_w1_chunks, gpu_w2_chunks,
                 hidden_states, tokens_per_expert, num_moe_experts,
                 permuted_probs, None, stream_manager,
-                transformer_config, [],
+                offloading_config, [],
             )
             cpu_w1.main_grad.zero_()
             cpu_w2.main_grad.zero_()
             ((output - target).float() ** 2).sum().backward()
-            outputs.append(output)
+            outputs.append(output.detach())
             torch.cuda.synchronize()
 
         # --- Comparison ---

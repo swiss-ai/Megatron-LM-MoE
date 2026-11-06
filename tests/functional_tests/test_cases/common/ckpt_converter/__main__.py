@@ -31,7 +31,7 @@ from megatron.training.training import get_model
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
 
-CHECKPOINTS_DIR = "/tmp/ckpt-converter-tests"
+CHECKPOINTS_DIR = os.environ.get("CHECKPOINT_CONVERTER_TEST_DIR", "/tmp/ckpt-converter-tests")
 FORWARD_ITERS = 1  # *3
 SKIP_CONVERSION = False
 

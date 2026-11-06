@@ -37,12 +37,14 @@ Shape notation:
 """
 
 import itertools
+import os
 
 import pytest
 import torch
 
 try:
     import deep_gemm
+
     HAVE_DEEP_GEMM = deep_gemm is not None
 except ImportError:
     HAVE_DEEP_GEMM = False
@@ -81,6 +83,7 @@ def make_kgrouped_prefixes(tokens_per_expert, device="cuda"):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _skip_if_no_deep_gemm():
     if not HAVE_DEEP_GEMM:
         pytest.skip("deep_gemm not available")
@@ -89,6 +92,7 @@ def _skip_if_no_deep_gemm():
 def _skip_if_no_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")) % torch.cuda.device_count())
 
 
 def quantize_activation(x_bf16):
@@ -331,8 +335,6 @@ class TestGroupedFP8GemmNTContiguous:
 
     def test_matches_multi_stream(self):
         """Verify grouped and multi-stream produce numerically identical results."""
-        from megatron.core.transformer.moe.fp8_utils import multi_stream_fp8_gemm_nt
-
         num_experts = 4
         K, N = 256, 256
         # tokens_per_expert:  [4]             int64   (all multiples of 128)
@@ -344,8 +346,7 @@ class TestGroupedFP8GemmNTContiguous:
         a_bf16 = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
         # b_bf16_list[i]:     [N, K]          bf16
         b_bf16_list = [
-            torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
-            for _ in range(num_experts)
+            torch.randn(N, K, device="cuda", dtype=torch.bfloat16) for _ in range(num_experts)
         ]
 
         # Shared quantization
@@ -358,16 +359,31 @@ class TestGroupedFP8GemmNTContiguous:
             fp8_b_list.append(fw)
             fp8_b_scales_list.append(fs)
 
-        # Multi-stream result
+        # Multi-stream reference using the current per-expert DeepGEMM API.
         streams = [torch.cuda.Stream() for _ in range(2)]
-        # ms_output:          [M, N]          bf16
-        ms_output = multi_stream_fp8_gemm_nt(
-            tokens_per_expert,
-            (fp8_a, fp8_a_scales),
-            (fp8_b_list, fp8_b_scales_list),
-            streams,
-        )
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream())
+        sizes = tokens_per_expert.tolist()
+        a_parts = torch.split(fp8_a, sizes, dim=0)
+        scale_parts = torch.split(fp8_a_scales, sizes, dim=0)
+        outputs = []
+        for i, (a_part, scale_part) in enumerate(zip(a_parts, scale_parts)):
+            with torch.cuda.stream(streams[i % len(streams)]):
+                expert_output = torch.empty(sizes[i], N, device="cuda", dtype=torch.bfloat16)
+                deep_gemm.fp8_gemm_nt(
+                    (a_part.contiguous(), scale_part.contiguous()),
+                    (fp8_b_list[i].contiguous(), fp8_b_scales_list[i].contiguous()),
+                    expert_output,
+                    c=None,
+                    recipe=None,
+                    recipe_a=(1, 128),
+                    recipe_b=(128, 128),
+                    disable_ue8m0_cast=True,
+                )
+                outputs.append(expert_output)
         torch.cuda.synchronize()
+        # ms_output:          [M, N]          bf16, in the original expert order
+        ms_output = torch.cat(outputs, dim=0)
 
         # Grouped result
         # stacked_b:          [G, N, K]       fp8
@@ -380,10 +396,7 @@ class TestGroupedFP8GemmNTContiguous:
 
         # grp_output:         [M, N]          bf16
         grp_output = m_grouped_fp8_gemm_nt_contiguous(
-            psum,
-            (fp8_a, fp8_a_scales),
-            (stacked_b, stacked_b_scales),
-            stream,
+            psum, (fp8_a, fp8_a_scales), (stacked_b, stacked_b_scales), stream
         )
         torch.cuda.synchronize()
 

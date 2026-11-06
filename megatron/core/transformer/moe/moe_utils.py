@@ -307,6 +307,94 @@ def marin_qb_histogram_update(
         return torch.where(token_count > 0, estimate, beta), token_count
 
 
+def marin_qb_exact_update(
+    margins: torch.Tensor,
+    valid: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+    num_bins: int = 10000,
+    *,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_rows: int = 16384,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Marin's exact global-batch upper-quantile estimator over retained margins.
+
+    Reference: marin-community/marin@12d8b6f,
+    experiments/grug/moe_hero_ep/model.py::_qb_beta_hist and _bincount_upper_quantile.
+    ``margins`` [rows, experts] holds every raw-logit margin (logit minus the token's biased
+    Top-(k+1) cutoff) of one optimizer step on this rank, and ``valid`` [rows] marks real
+    (non-padding) tokens. ``margins``/``valid`` may live on the host: they are streamed to
+    ``beta.device`` in chunks, twice (range, then counts). The exact global min/max is found with
+    one MIN and one MAX reduction over ``group``; the per-expert integer histogram on that live
+    grid is summed over ``group``; the upper quantile is interpolated in the crossing bin exactly
+    as Marin does. ``group=None`` is the single-process path.
+
+    Returns ``(estimate, token_count, nonfinite_tokens)``. ``estimate`` is ``beta`` when the
+    pooled batch is empty or any valid token had a non-finite margin (Marin has no such guard: a
+    single NaN poisons its grid). Every rank joins the same three collectives regardless of its
+    local row count.
+    """
+    assert margins.ndim == 2 and valid.shape == margins.shape[:1]
+    num_experts = margins.shape[1]
+    assert beta.shape == (num_experts,) and 0 < topk < num_experts
+    assert num_bins > 0 and chunk_rows > 0
+    device = beta.device
+    rows = margins.shape[0]
+    inf = float('inf')
+
+    def load(start):
+        end = min(start + chunk_rows, rows)
+        chunk = margins[start:end].to(device, non_blocking=True)
+        keep = valid[start:end].to(device, non_blocking=True).bool()
+        finite = torch.isfinite(chunk).all(dim=-1)
+        return chunk, keep & finite, (keep & ~finite).sum()
+
+    with torch.no_grad():
+        lo = torch.full((), inf, device=device)
+        hi = torch.full((), -inf, device=device)
+        bad = torch.zeros((), dtype=torch.int64, device=device)
+        for start in range(0, rows, chunk_rows):
+            chunk, keep, chunk_bad = load(start)
+            bad += chunk_bad
+            lo = torch.minimum(lo, chunk.masked_fill(~keep[:, None], inf).amin())
+            hi = torch.maximum(hi, chunk.masked_fill(~keep[:, None], -inf).amax())
+        extrema = torch.stack((lo, -hi))
+        if group is not None:
+            torch.distributed.all_reduce(extrema, op=torch.distributed.ReduceOp.MIN, group=group)
+            torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.SUM, group=group)
+        lo, hi = extrema[0], -extrema[1]
+        # An empty pooled batch keeps a finite grid; the estimate is discarded below.
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        hi = torch.where(torch.isfinite(hi), hi, lo)
+        hi = torch.maximum(hi, lo + 1e-6)  # Marin's guard for a degenerate all-equal range
+        width = (hi - lo) / num_bins
+
+        # Invalid rows are routed to a scratch block past the last expert and sliced off.
+        block = num_experts * num_bins
+        counts = torch.zeros(2 * block, dtype=torch.int64, device=device)
+        ones = torch.ones(1, dtype=torch.int64, device=device)
+        experts = torch.arange(num_experts, device=device) * num_bins
+        for start in range(0, rows, chunk_rows):
+            chunk, keep, _ = load(start)
+            safe = torch.where(keep[:, None], chunk, lo)
+            bins = ((safe - lo) / width).long().clamp_(0, num_bins - 1)
+            flat = (bins + experts + (~keep)[:, None] * block).reshape(-1)
+            counts.scatter_add_(0, flat, ones.expand_as(flat))
+        counts = counts[:block].reshape(num_experts, num_bins)
+        if group is not None:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+
+        token_count = counts[0].sum()
+        target = token_count.to(torch.float32) * topk / num_experts
+        cumulative = counts.flip(-1).cumsum(-1).flip(-1)
+        crossing = ((cumulative >= target).sum(-1) - 1).clamp(0, num_bins - 1)
+        above = cumulative.gather(-1, crossing[:, None]).squeeze(-1).to(torch.float32)
+        in_bin = counts.gather(-1, crossing[:, None]).squeeze(-1).to(torch.float32)
+        estimate = lo + width * (crossing + (above - target) / in_bin.clamp_min(1.0))
+        accepted = (token_count > 0) & (bad == 0)
+        return torch.where(accepted, estimate, beta), token_count, bad
+
+
 def compute_qb_histogram(
     scores: torch.Tensor,
     alpha: torch.Tensor,
@@ -928,6 +1016,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    sigmoid_normalization_epsilon: float = 1e-20,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -956,6 +1045,9 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices. Defaults to None.
+
+        sigmoid_normalization_epsilon (float, optional): Denominator epsilon for selected
+            sigmoid scores. Defaults to 1e-20; Marin histogram routing uses 1e-9.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1079,7 +1171,10 @@ def topk_routing_with_score_function(
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        probs = (
+            scores / (scores.sum(dim=-1, keepdim=True) + sigmoid_normalization_epsilon)
+            if topk > 1 else scores
+        )
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 

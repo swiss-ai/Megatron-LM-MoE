@@ -577,6 +577,18 @@ class TransformerConfig(ModelParallelConfig):
     SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
     gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
 
+    linear_attention_cp_impl: Literal['a2a', 'kcp'] = 'a2a'
+    """Context-parallel scheme of the linear-attention layers. 'a2a' turns the sequence shard
+    into a head shard with an all-to-all around the kernel, so the per-TP-rank head counts must
+    divide the CP size. 'kcp' (KDA only) keeps tokens sharded and merges the per-rank recurrent
+    states through fla.ops.cp, with no head-count constraint."""
+
+    linear_attention_cp_block_layout: bool = False
+    """With linear_attention_cp_impl='kcp', keep the transformer block's residual stream in the
+    contiguous KCP layout across consecutive KDA layers (and the token-wise MLP/MoE between
+    them), relayouting only before softmax-attention layers and at the end of the block, instead
+    of twice inside every KDA layer. Packed (THD) inputs only."""
+
     linear_attention_full_rank_output_gate: bool = False
     """If True, the KDA output gate is a full-rank projection (hidden -> v_dim) fused into in_proj
     and sharded on value heads, instead of the reference low-rank bottleneck (hidden ->
@@ -1052,7 +1064,7 @@ class TransformerConfig(ModelParallelConfig):
     decisions. This is useful when fine-tuning a pretrained policy with a frozen router."""
 
     moe_router_quantile_balancing_method: Literal[
-        'average', 'legacy_average', 'histogram', 'marin_histogram'
+        'average', 'legacy_average', 'histogram', 'marin_histogram', 'marin_exact'
     ] = 'histogram'
     """Quantile estimator used by quantile balancing. "average" averages independently computed
     microbatch/rank quantiles in sigmoid/softmax score space. "legacy_average" preserves the
@@ -1069,7 +1081,17 @@ class TransformerConfig(ModelParallelConfig):
     token-weighted microbatch quantiles are averaged at the optimizer-step boundary;
     this is not the quantile of the entire accumulated batch. Expert combination
     weights still use moe_router_score_function. Adds three forward collectives.
+    Also the bin count for marin_exact.
     """
+
+    moe_router_quantile_balancing_marin_exact_store: Literal['cpu', 'cuda'] = 'cpu'
+    """Where marin_exact keeps the step's routing margins until the optimizer-step boundary.
+    marin_exact reproduces Marin's single global-batch estimator exactly: every microbatch's
+    raw-logit margins [tokens, experts] (fp32) are retained, the exact global min/max is found,
+    and one histogram quantile is read. This costs tokens_per_gpu_per_step * num_experts * 4
+    bytes per MoE layer (about 0.4 GB per layer for 393k tokens and 256 experts). 'cpu' copies
+    each microbatch's margins to pinned host memory asynchronously (no GPU memory, one D2H copy
+    per layer per microbatch); 'cuda' keeps them on the GPU. Ignored by other methods."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
@@ -1658,24 +1680,29 @@ class TransformerConfig(ModelParallelConfig):
                 self.linear_num_value_heads % self.tensor_model_parallel_size == 0
             ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
 
-            # Check context parallelism compatibility. GDN/KDA's CP all-to-all
+            # Check context parallelism compatibility. The a2a scheme
             # (megatron/core/ssm/gated_delta_net.py) shards Q/K/V/gate/beta/alpha
             # along the head dimension across CP ranks, so the per-TP-rank head
             # counts must themselves divide evenly across CP ranks.
-            assert (
-                self.linear_num_key_heads // self.tensor_model_parallel_size
-            ) % self.context_parallel_size == 0, (
-                "linear_num_key_heads // tensor_model_parallel_size "
-                f"({self.linear_num_key_heads // self.tensor_model_parallel_size}) must be a "
-                f"multiple of context_parallel_size ({self.context_parallel_size})."
-            )
-            assert (
-                self.linear_num_value_heads // self.tensor_model_parallel_size
-            ) % self.context_parallel_size == 0, (
-                "linear_num_value_heads // tensor_model_parallel_size "
-                f"({self.linear_num_value_heads // self.tensor_model_parallel_size}) must be a "
-                f"multiple of context_parallel_size ({self.context_parallel_size})."
-            )
+            if self.linear_attention_cp_impl == 'kcp':
+                assert (
+                    self.experimental_attention_variant == 'kda'
+                ), "linear_attention_cp_impl='kcp' is only implemented for KDA."
+            else:
+                assert (
+                    self.linear_num_key_heads // self.tensor_model_parallel_size
+                ) % self.context_parallel_size == 0, (
+                    "linear_num_key_heads // tensor_model_parallel_size "
+                    f"({self.linear_num_key_heads // self.tensor_model_parallel_size}) must be a "
+                    f"multiple of context_parallel_size ({self.context_parallel_size})."
+                )
+                assert (
+                    self.linear_num_value_heads // self.tensor_model_parallel_size
+                ) % self.context_parallel_size == 0, (
+                    "linear_num_value_heads // tensor_model_parallel_size "
+                    f"({self.linear_num_value_heads // self.tensor_model_parallel_size}) must be "
+                    f"a multiple of context_parallel_size ({self.context_parallel_size})."
+                )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2059,11 +2086,25 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         if "quantile_balancing" in self.moe_router_load_balancing_type:
-            valid_qb_methods = {'average', 'legacy_average', 'histogram', 'marin_histogram'}
+            valid_qb_methods = {
+                'average', 'legacy_average', 'histogram', 'marin_histogram', 'marin_exact'
+            }
             if self.moe_router_quantile_balancing_method not in valid_qb_methods:
                 raise ValueError(
                     "moe_router_quantile_balancing_method must be 'average', "
-                    "'legacy_average', 'histogram', or 'marin_histogram'"
+                    "'legacy_average', 'histogram', 'marin_histogram', or 'marin_exact'"
+                )
+            if self.moe_router_quantile_balancing_marin_exact_store not in ('cpu', 'cuda'):
+                raise ValueError(
+                    "moe_router_quantile_balancing_marin_exact_store must be 'cpu' or 'cuda'"
+                )
+            if (
+                self.moe_router_quantile_balancing_method == 'marin_exact'
+                and self.cuda_graph_impl != 'none'
+            ):
+                raise ValueError(
+                    "marin_exact retains per-microbatch margins in a buffer with a Python-side "
+                    "write cursor and cannot be CUDA-graph captured; set cuda_graph_impl to 'none'"
                 )
             if self.moe_router_quantile_balancing_num_bins <= 0:
                 raise ValueError("moe_router_quantile_balancing_num_bins must be positive")

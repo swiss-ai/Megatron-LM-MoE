@@ -34,6 +34,7 @@ Notes
   NAN_DEBUG_ANOMALY to pinpoint the true backward origin.
 """
 
+import math
 import os
 
 import torch
@@ -49,6 +50,10 @@ _ANOMALY = _flag("NAN_DEBUG_ANOMALY")
 # grad elements so a rare spurious NaN (e.g. fp8-offloading wgrad GEMM on a
 # near-dead expert) can't poison the grad-norm and trigger reruns.
 _SANITIZE = _flag("NAN_DEBUG_SANITIZE")
+# Largest number of non-finite gradient elements on any one rank that the grad-norm
+# check repairs in place (NAN_DEBUG_SANITIZE_MAX). Above it the step is left to the
+# rerun mechanism. 0 = count and log only, always rerun.
+_DEFAULT_SANITIZE_MAX = 16
 try:
     _EVERY = max(1, int(os.environ.get("NAN_DEBUG_EVERY", "1")))
 except ValueError:
@@ -205,29 +210,163 @@ def nan_debug_check_grads(model, iteration: int) -> None:
         )
 
 
-def nan_debug_sanitize_grads(model) -> None:
-    """Zero non-finite elements in parameter gradients (grad + main_grad), in place.
+def _sanitize_limit() -> int:
+    """Per-rank cap on repairable non-finite grad elements (NAN_DEBUG_SANITIZE_MAX)."""
+    try:
+        return max(0, int(os.environ.get("NAN_DEBUG_SANITIZE_MAX", _DEFAULT_SANITIZE_MAX)))
+    except ValueError:
+        return _DEFAULT_SANITIZE_MAX
 
-    Guarded by NAN_DEBUG_SANITIZE (independent of NAN_DEBUG — this is a fix, not a
-    diagnostic). Unconditional ``nan_to_num_`` (nan/inf -> 0): no isfinite check,
-    so no host sync, and a true no-op on finite grads. nan_to_num is element-wise,
-    so a real gradient keeps all its finite values — only the spurious element(s)
-    are zeroed. inf is mapped to 0 too (not to 3.4e38) so it can't re-inflate the
-    grad-norm. Call after backward, before prepare_grad_norm() / the optimizer.
 
-    Safe here because the target is a single ~0-magnitude artifact element from
-    the fp8-offloading wgrad GEMM on a near-dead expert; zeroing it has no training
-    impact. A genuine gradient spike would be handled by grad clipping, not this.
-    """
-    if not _SANITIZE:
-        return
+def _collect_grads(model):
+    """Unique floating-point grad / main_grad tensors of ``model``, grouped by device."""
     chunks = model if isinstance(model, (list, tuple)) else [model]
+    grads_by_device = {}
+    seen = set()
     for chunk in chunks:
         for p in chunk.parameters():
             for gname in ("grad", "main_grad"):
                 g = getattr(p, gname, None)
                 if isinstance(g, torch.Tensor) and g.is_floating_point():
-                    torch.nan_to_num_(g, nan=0.0, posinf=0.0, neginf=0.0)
+                    # grad and main_grad can be aliases of the same tensor.
+                    key = (g.device, g.data_ptr(), tuple(g.shape), tuple(g.stride()), g.dtype)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    grads_by_device.setdefault(g.device, []).append(g)
+    return grads_by_device
+
+
+def _count_nonfinite(grads):
+    """(nan, inf) element counts over ``grads`` (one device), with a single host read."""
+    counts = None
+    for g in grads:
+        tensor_counts = torch.stack((torch.isnan(g).sum(), torch.isinf(g).sum()))
+        counts = tensor_counts if counts is None else counts.add_(tensor_counts)
+    n_nan, n_inf = counts.tolist()
+    return n_nan, n_inf
+
+
+def _zero_nonfinite(grads):
+    """nan/inf -> 0 in place. inf maps to 0 (not 3.4e38) so it cannot re-inflate the norm."""
+    for g in grads:
+        torch.nan_to_num_(g, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _global_max_int(value: int) -> int:
+    """Max of a per-rank integer over all ranks (identity when not distributed)."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return value
+    on_gpu = "nccl" in str(torch.distributed.get_backend())
+    device = torch.device("cuda", torch.cuda.current_device()) if on_gpu else torch.device("cpu")
+    t = torch.tensor([value], dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+    return int(t.item())
+
+
+def nan_debug_sanitize_grads(model, iteration: int = -1, *, known_nonfinite=False) -> None:
+    """Count, zero and report non-finite parameter-gradient elements.
+
+    Enabled independently of module hooks by NAN_DEBUG_SANITIZE. Counts are local
+    to this rank and distinguish NaNs from Infs. First aggregate finite checks
+    per device, with one host read per device and no distributed collective.
+    Only devices with non-finite gradients take the counting/sanitization path.
+    Finite values remain
+    unchanged; sanitization does not establish the cause or safety of the fault.
+    Call after backward, before gradient-norm validation and the optimizer.
+    """
+    if not _SANITIZE:
+        return
+    grads_by_device = _collect_grads(model)
+    if known_nonfinite:
+        bad_devices = list(grads_by_device)
+    else:
+        bad_devices = [
+            device
+            for device, grads in grads_by_device.items()
+            if not torch.stack([torch.isfinite(g).all() for g in grads]).all().item()
+        ]
+    if not bad_devices:
+        return
+    nan_count = inf_count = 0
+    for device in bad_devices:
+        n_nan, n_inf = _count_nonfinite(grads_by_device[device])
+        _zero_nonfinite(grads_by_device[device])
+        nan_count += n_nan
+        inf_count += n_inf
+    if nan_count or inf_count:
+        print(
+            f"[NAN-SANITIZE] rank={_rank()} iter={iteration} "
+            f"nan={nan_count} inf={inf_count} replaced_with_zero={nan_count + inf_count}",
+            flush=True,
+        )
+
+
+def nan_debug_sanitize_after_grad_norm(model, optimizer, iteration, found_inf_flag, grad_norm):
+    """Use the existing norm check to trigger bounded sanitization on the MuonMD path.
+
+    Runs only when the global grad norm is non-finite. Each rank counts its own
+    non-finite gradient elements WITHOUT changing them, and a MAX all-reduce gives every
+    rank the same worst per-rank count (a max, not a sum: gradients are all-reduced,
+    so every data-parallel replica holds the same bad element).
+
+    - worst == 0: no gradient element is non-finite, so the norm is non-finite for
+      another reason (e.g. overflow of finite values). Nothing to repair; leave it
+      to the rerun check.
+    - 0 < worst <= NAN_DEBUG_SANITIZE_MAX (default 16): zero those elements and recompute
+      the norm. A rank that is locally finite still recomputes, because the second norm
+      is a collective that every rank must join.
+    - worst > the cap: leave the gradients alone and return the non-finite norm, so
+      validate_result flags it and the step is rerun rather than trained on a gradient
+      with many elements zeroed.
+
+    Because the decision comes from the all-reduce, every rank takes the same branch
+    and the collectives stay matched. This relies on the norm being global (as with
+    the layer-wise MuonMD optimizer) and on there being no loss scaler.
+    Optimizer gradients may be copies of model main_grad (especially with CPU
+    offloading), hence the second prepare_grad_norm() after a repair.
+    """
+    if not (_SANITIZE and (found_inf_flag or not math.isfinite(grad_norm))):
+        return found_inf_flag, grad_norm
+
+    grads_by_device = _collect_grads(model)
+    nan_count = inf_count = 0
+    for grads in grads_by_device.values():
+        n_nan, n_inf = _count_nonfinite(grads)
+        nan_count += n_nan
+        inf_count += n_inf
+    local = nan_count + inf_count
+    worst = _global_max_int(local)
+    limit = _sanitize_limit()
+    repair = 0 < worst <= limit
+
+    if local:
+        print(
+            f"[NAN-SANITIZE] rank={_rank()} iter={iteration} nan={nan_count} inf={inf_count} "
+            f"replaced_with_zero={local if repair else 0} "
+            f"max_per_rank={worst} threshold={limit}",
+            flush=True,
+        )
+    elif _rank() == 0:
+        if worst == 0:
+            print(
+                f"[NAN-SANITIZE] iter={iteration} grad norm is non-finite but no gradient "
+                f"element is; nothing to repair, leaving it to the rerun",
+                flush=True,
+            )
+        else:
+            print(
+                f"[NAN-SANITIZE] iter={iteration} max_per_rank={worst} threshold={limit} "
+                f"action={'sanitize' if repair else 'rerun'}",
+                flush=True,
+            )
+
+    if not repair:
+        return found_inf_flag, grad_norm
+    if local:
+        for grads in grads_by_device.values():
+            _zero_nonfinite(grads)
+    return optimizer.prepare_grad_norm()
 
 
 def sanitize_enabled() -> bool:

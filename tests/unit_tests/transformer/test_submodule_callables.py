@@ -1,4 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+from functools import partialmethod
+
 import pytest
 import torch
 
@@ -6,6 +8,7 @@ from megatron.core.models.gpt.fine_grained_callables import build_layer_callable
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -112,10 +115,26 @@ class TestTransformerLayerSubmoduleCallables:
     """
 
     def setup_method(self, method):
-        pass
+        self.buffer_patch = pytest.MonkeyPatch()
+        if fused_a2a.HAVE_DEEP_EP:
+            self.buffer_patch.setattr(
+                fused_a2a.Buffer,
+                "__init__",
+                partialmethod(fused_a2a.Buffer.__init__, explicitly_destroy=True),
+            )
 
     def teardown_method(self, method):
-        pass
+        try:
+            if fused_a2a._buffer is not None:
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                fused_a2a._buffer.destroy()
+                fused_a2a._buffer = None
+        finally:
+            try:
+                Utils.destroy_model_parallel()
+            finally:
+                self.buffer_patch.undo()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
@@ -167,4 +186,3 @@ class TestTransformerLayerSubmoduleCallables:
             )
             comp_res = compare_captures(capture_ref, capture_callables, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
-            Utils.destroy_model_parallel()

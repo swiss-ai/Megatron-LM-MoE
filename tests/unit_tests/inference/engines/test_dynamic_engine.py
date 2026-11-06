@@ -453,6 +453,11 @@ class DynamicInferenceEngineTestBase:
                     test_config.inference_moe_token_dispatcher_type
                 ),
                 inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
+                # Keep the optimized transformer when the profile selects NCCL.
+                inference_disable_triton_nvls_kernels=(
+                    test_config.transformer_impl == "inference_optimized"
+                    and os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true"
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -546,6 +551,10 @@ class DynamicInferenceEngineTestBase:
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
+                ),
+                inference_disable_triton_nvls_kernels=(
+                    test_config.transformer_impl == "inference_optimized"
+                    and os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true"
                 ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
@@ -1409,8 +1418,34 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
 
+    def test_generate_runs_dummy_forward_until_ep_peers_finish(self) -> None:
+        """Synchronous generation must keep joining EP steps after local completion."""
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter([0])
+        engine.add_request = mock.Mock()
+        engine.has_unfinished_requests = mock.Mock(side_effect=[True, False, False])
+        engine._any_synchronous_ep_rank_has_work = mock.Mock(
+            side_effect=[True, True, False]
+        )
+        finished_record = types.SimpleNamespace(request_id=0)
+        engine.step_modern = mock.Mock(
+            return_value={"finished_request_records": [finished_record]}
+        )
+        engine._run_ep_dummy_step = mock.Mock()
+
+        result = DynamicInferenceEngine.generate(engine, ["prompt"], SamplingParams())
+
+        assert result == [finished_record]
+        engine.step_modern.assert_called_once_with()
+        engine._run_ep_dummy_step.assert_called_once_with()
+        assert [
+            call.args[0]
+            for call in engine._any_synchronous_ep_rank_has_work.call_args_list
+        ] == [True, False, False]
+
+    # Keep the engine's cached event loop open across tests.
     @pytest.mark.internal
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="session")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -2090,6 +2125,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+
     def test_num_tokens_total(self):
         """Simple test, but using num_tokens_total instead of num_tokens_to_generate."""
         # Run test.
@@ -5824,6 +5860,50 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     so these are separated from TestDynamicInferenceEngine to avoid accumulating
     NCCL communicator memory from repeated init/destroy cycles.
     """
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_generate_with_uneven_ep_work_runs_real_dummy_forward(self) -> None:
+        """An idle EP rank must run the real model dummy path until its peer finishes."""
+        if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+            pytest.skip("Test requires exactly two distributed ranks")
+
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=1,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=2,
+                max_sequence_length=8,
+                num_gap_steps=0,
+                expert_model_parallel_size=2,
+                context_buffer_size_gb=0.01,
+                context_block_size_tokens=64,
+                model_provider="mla",
+            )
+        )
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        prompts = ["active prompt"] if ep_rank == 0 else []
+        env.engine.controller.tokenize_prompt = lambda *args, **kwargs: [1, 2, 3, 4]
+        real_dummy_forward = env.engine.controller.dummy_forward
+        env.engine.controller.dummy_forward = mock.Mock(wraps=real_dummy_forward)
+
+        results = env.engine.generate(
+            prompts,
+            SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+        )
+
+        if ep_rank == 0:
+            assert len(results) == 1
+            assert len(results[0].merge().generated_tokens) == 2
+            assert env.engine.controller.dummy_forward.call_count == 0
+        else:
+            assert results == []
+            assert env.engine.controller.dummy_forward.call_count > 0
+
 
     def teardown_method(self, method):
         delete_cuda_graphs()

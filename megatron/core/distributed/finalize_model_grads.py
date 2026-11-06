@@ -26,6 +26,7 @@ from ..transformer.moe.moe_utils import (
     expert_load_entropy,
     expert_load_violation_batchwise,
     get_updated_expert_bias,
+    marin_qb_exact_update,
     recover_qb_beta_from_histogram,
     save_to_aux_losses_tracker,
 )
@@ -303,6 +304,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_histogram', None) is not None:
                 module.qb_histogram.zero_()
+            if getattr(module, 'qb_exact', False):
+                module._qb_exact_rows = 0
             if getattr(module, 'expert_load_sample_count', None) is not None:
                 module.expert_load_sample_count.zero_()
 
@@ -532,6 +535,51 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
+def _update_marin_exact_router_qb_beta(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    group: Optional[torch.distributed.ProcessGroup],
+):
+    """Run Marin's exact estimator once per layer over every margin retained this step."""
+    assert group is not None, "marin_exact QB requires a TP+DP+CP process group."
+    num_layers = config.num_layers + (getattr(config, 'mtp_num_layers', None) or 0)
+    num_microbatches = get_num_microbatches()
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if not getattr(module, 'qb_exact', False) or not module.training:
+                continue
+            beta = module.qb_beta
+            rows = module._qb_exact_rows
+            if module._qb_exact_margins is None:
+                margins = beta.new_empty((0, beta.shape[0]))
+                valid = torch.empty(0, dtype=torch.bool, device=beta.device)
+            else:
+                margins = module._qb_exact_margins[:rows]
+                valid = module._qb_exact_valid[:rows]
+            estimate, token_count, nonfinite = marin_qb_exact_update(
+                margins,
+                valid,
+                beta,
+                config.moe_router_topk,
+                config.moe_router_quantile_balancing_marin_num_bins,
+                group=group,
+            )
+            accepted = (token_count > 0) & (nonfinite == 0)
+            ema = config.moe_router_quantile_balancing_ema
+            updated = ema * beta + (1.0 - ema) * estimate
+            updated = updated - updated.mean(dim=-1, keepdim=True)  # mean center
+            # Keep the COMPLETE previous bias on an empty or non-finite step.
+            module.qb_beta.copy_(torch.where(accepted, updated, beta))
+            for name, value in (
+                ('qb_exact_nonfinite_tokens', nonfinite.float()),
+                ('qb_exact_update_skipped', (~accepted).float()),
+            ):
+                layer = module.layer_number
+                if getattr(module, 'is_mtp_layer', False):
+                    layer += config.num_layers
+                save_to_aux_losses_tracker(name, value * num_microbatches, layer, num_layers)
+
+
 def _update_router_qb_beta(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -542,6 +590,9 @@ def _update_router_qb_beta(
     if config.moe_router_quantile_balancing_freeze:
         return
 
+    if config.moe_router_quantile_balancing_method == 'marin_exact':
+        _update_marin_exact_router_qb_beta(model, config, tp_dp_cp_group)
+        return
     if config.moe_router_quantile_balancing_method == 'histogram':
         assert tp_dp_cp_group is not None, (
             "Histogram quantile balancing requires a TP+DP+CP process group."
@@ -759,7 +810,7 @@ def finalize_model_grads(
     config = get_model_config(model[0])
     uses_histogram_qb = (
         "quantile_balancing" in config.moe_router_load_balancing_type
-        and config.moe_router_quantile_balancing_method == 'histogram'
+        and config.moe_router_quantile_balancing_method in ('histogram', 'marin_exact')
         and not config.moe_router_quantile_balancing_freeze
     )
     if pg_collection is not None:

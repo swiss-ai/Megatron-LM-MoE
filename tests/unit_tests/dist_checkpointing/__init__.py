@@ -30,7 +30,8 @@ class TempNamedDir(TemporaryDirectory):
 
     def __init__(self, name: Union[str, Path], sync=True, ignore_cleanup_errors=False) -> None:
         self.name = str(name)
-        if Utils.rank == 0:
+        self._cleanup_owner = Utils.rank == 0
+        if self._cleanup_owner:
             os.makedirs(name, exist_ok=True)
             empty_dir(Path(name))
         if sync:
@@ -44,7 +45,8 @@ class TempNamedDir(TemporaryDirectory):
         self._finalizer = weakref.finalize(
             self, self._cleanup, self.name, warn_message="Implicitly cleaning up {!r}".format(self)
         )
-        if sync and Utils.rank != 0:
+        # The creator owns both explicit and implicit cleanup.
+        if not self._cleanup_owner:
             self._finalizer.detach()
         self.sync = sync
 
@@ -55,7 +57,7 @@ class TempNamedDir(TemporaryDirectory):
 
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.barrier()
-        if Utils.rank == 0:
+        if self._cleanup_owner:
             super().cleanup()
 
     def __enter__(self):

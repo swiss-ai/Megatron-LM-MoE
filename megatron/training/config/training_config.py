@@ -60,6 +60,15 @@ class TrainingConfig:
     exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 
+    exit_on_tranche_end: bool = False
+    """Build one pass through the training data, checkpoint and exit at its last full global batch.
+    Preserves the full-run training budget and learning-rate schedule."""
+
+    tranche_start_samples: int | None = None
+    """Global consumed-sample counter at the start of this tranche. Requires exit_on_tranche_end.
+    When omitted, read tranche_end.txt from the checkpoint directory; fall back to the
+    existing phase-transition offset, or zero for the first tranche."""
+
     exit_duration_in_mins: int | None = None
     """Exit the program after this many minutes."""
 
