@@ -3061,6 +3061,8 @@ _ROWCOL_PULL_GAMMAS = {
     "module.decoder.layers.0.mlp.linear_fc1.layer_norm_weight": "pre_dense",
     "module.decoder.layers.0.post_mlp_layernorm.weight": "post",
     "module.decoder.layers.3.self_attention.linear_qkv.layer_norm_weight": "pre",
+    "module.decoder.layers.3.self_attention.q_layernorm.weight": None,
+    "module.decoder.layers.3.self_attention.k_layernorm.weight": None,
     "module.decoder.layers.3.post_self_attn_layernorm.weight": "post",
     "module.decoder.layers.3.pre_mlp_layernorm.weight": None,
     "module.decoder.layers.3.post_mlp_layernorm.weight": "post",
@@ -3070,6 +3072,7 @@ _ROWCOL_PULL_GAMMAS = {
     "module.mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.layer_norm_weight": "pre",
     "module.mtp.layers.0.mtp_model_layer.post_self_attn_layernorm.weight": "post",
     "module.decoder.layers.7.mixer.in_proj.layer_norm_weight": None,
+    "module.decoder.final_layernorm.weight": None,
 }
 
 
@@ -3224,3 +3227,111 @@ def test_rowcol_gain_pull_does_not_revive():
     assert optimizer.revive_collapsed_col_gains(1e-3) is None
     torch.testing.assert_close(optimizer.state[param]["col_gain"], col, rtol=0, atol=0)
     torch.testing.assert_close(param.detach(), weight, rtol=0, atol=0)
+
+
+# --md-gain-pull-scope: also the MoE latent projections ("moe-latent") or every gain ("all")
+
+def test_md_gain_pull_scope_argument():
+    import argparse
+
+    from megatron.training.arguments import _add_training_args
+
+    parser = _add_training_args(argparse.ArgumentParser(allow_abbrev=False))
+    assert parser.parse_args([]).md_gain_pull_scope == "default"
+    assert OptimizerConfig().md_gain_pull_scope == "default"
+    for scope in ("moe-latent", "all"):
+        assert parser.parse_args(["--md-gain-pull-scope", scope]).md_gain_pull_scope == scope
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--md-gain-pull-scope", "router"])
+
+
+_GAIN_PULL_COEFFS = dict(md_rowcol_gain_pull_coeff=0.3, md_attention_in_gain_pull_coeff=5e-3,
+                         md_post_norm_gain_pull_coeff=2e-3, md_attention_in_gain_pull_target=2.0)
+
+
+@pytest.mark.parametrize("moe_mlp_in", [False, True])
+@pytest.mark.parametrize("scope", ["default", "moe-latent"])
+def test_builder_gain_pull_scope_moe_latent(monkeypatch, scope, moe_mlp_in):
+    """Scope "moe-latent" adds the MoE latent projections to the row/col pull, paired like the dense
+    MLP: fc1_latent_proj with the pre_mlp_layernorm gamma (pulled only with
+    --md-moe-mlp-in-gain-revive), fc2_latent_proj with post_mlp_layernorm. Every other tag is the
+    default one: the router, the shared experts and the experts stay untagged."""
+    flags = dict(_GAIN_PULL_COEFFS, md_attention_in_gain_scope="all",
+                 md_dense_mlp_in_gain_revive=True, md_moe_mlp_in_gain_revive=moe_mlp_in)
+    default = _tag_rowcol_pull_params(monkeypatch, True, **flags)
+    params = _tag_rowcol_pull_params(monkeypatch, True, md_gain_pull_scope=scope, **flags)
+    latent = {
+        "module.decoder.layers.3.mlp.fc1_latent_proj.weight": scope == "moe-latent" and moe_mlp_in,
+        "module.decoder.layers.3.mlp.fc2_latent_proj.weight": scope == "moe-latent",
+    }
+    for name, p in params.items():
+        expected = latent.get(name, hasattr(default[name], "md_rowcol_gain_pull_coeff"))
+        assert hasattr(p, "md_rowcol_gain_pull_coeff") == expected, name
+        assert (getattr(p, "md_decay_to_target", None)
+                == getattr(default[name], "md_decay_to_target", None)), name
+
+
+@pytest.mark.parametrize("rowcol_coeff", [0.0, 0.3])
+@pytest.mark.parametrize("pre_coeff", [0.0, 5e-3])
+@pytest.mark.parametrize("sandwich_norm", [False, True])
+def test_builder_gain_pull_scope_all(monkeypatch, rowcol_coeff, pre_coeff, sandwich_norm):
+    """Scope "all" ignores the scope flags: every norm gamma is pulled (the sandwich post-norms with
+    the post-norm coefficient; every other one, QK norms, KDA out_norm, MoE pre-norm, standalone
+    input norms and the final norm included, with the pre-norm coefficient) and every matrix
+    (router, experts, shared experts, latent projections, KDA decay/gate projections, MLA, MTP,
+    Mamba, embedding, output layer) is tagged with the row/col coefficient."""
+    params = _tag_rowcol_pull_params(
+        monkeypatch, sandwich_norm, **dict(_GAIN_PULL_COEFFS, md_gain_pull_scope="all",
+                                           md_rowcol_gain_pull_coeff=rowcol_coeff,
+                                           md_attention_in_gain_pull_coeff=pre_coeff))
+    for name, p in params.items():
+        if name in _ROWCOL_PULL_MATRICES:
+            assert getattr(p, "md_rowcol_gain_pull_coeff", 0.0) == rowcol_coeff, name
+            assert not hasattr(p, "md_decay_to_target"), name
+            continue
+        assert not hasattr(p, "md_rowcol_gain_pull_coeff"), name
+        coeff = 2e-3 if _ROWCOL_PULL_GAMMAS[name] == "post" else pre_coeff
+        if coeff:
+            assert p.md_decay_to_target == (coeff, 2.0, 0.0), name
+        else:
+            assert not hasattr(p, "md_decay_to_target"), name
+
+
+@pytest.mark.parametrize("gain_parametrization", ["softplus", "direct"])
+@pytest.mark.parametrize(
+    "shape, gains_mode, merged_expert",
+    [((8, 4), "flat", False), ((2, 8, 4), "rowcol", True), ((2, 8, 4), "flat", True)],
+)
+def test_rowcol_gain_pull_reaches_flat_and_expert_gains(gain_parametrization, shape, gains_mode,
+                                                        merged_expert):
+    """The tag pulls every gain the matrix has: a flat gain, and the per-expert (E, out) / (E, in)
+    row and column gains or (E,) flat gain of a merged offload-expert weight, folded into the gains
+    AdamW decay like the 2D row/col pull."""
+    wd, lr, target, coeff = 0.1, 0.01, 2.0, 0.3
+    param = torch.nn.Parameter(torch.randn(*shape))
+    param.md_rowcol_gain_pull_coeff = coeff
+    if merged_expert:
+        param.merged_offload_expert = True
+    optimizer = MDDecoupling(
+        params=[param], lr=lr, pg_collection=_NoProcessGroups(), tp_mode="duplicated",
+        hypersphere_mode="row", hypersphere_gains_mode=gains_mode,
+        gain_parametrization=gain_parametrization, use_orthogonal_updates=False,
+        gains_weight_decay=wd, attention_in_gain_pull_target=target)
+    optimizer._maybe_init_gain_state(param)
+    state = optimizer.state[param]
+    raws = {}
+    for name in ("row_gain", "col_gain", "flat_gain"):
+        if name in state:
+            raws[name] = torch.linspace(-2.0, 4.0, state[name].numel()).reshape(state[name].shape)
+            state[name].copy_(raws[name])
+    assert set(raws) == ({"flat_gain"} if gains_mode == "flat" else {"row_gain", "col_gain"})
+    group = optimizer.param_groups[0]
+    group["step"] = 1
+    optimizer._gains_step(param, group, {n: torch.zeros_like(r) for n, r in raws.items()})
+
+    for name, raw in raws.items():
+        if gain_parametrization == "softplus":
+            t = float(optimizer._phi_inv(torch.tensor(target, dtype=torch.float64)))
+        else:
+            t = torch.where(raw < 0, -target, target)
+        torch.testing.assert_close(state[name], raw - lr * (wd * raw + coeff * (raw - t)))

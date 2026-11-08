@@ -1662,17 +1662,24 @@ def validate_args(args, defaults={}):
                 "--md-attention-in-gain-pull-col-gain has no effect without "
                 "--md-attention-in-gain-pull-coeff > 0."
             )
-        if args.md_rowcol_gain_pull_coeff and not (
-                args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff):
+        if (args.md_rowcol_gain_pull_coeff and args.md_gain_pull_scope != "all" and not (
+                args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff)):
             warn_rank_0(
                 "--md-rowcol-gain-pull-coeff has no effect without --md-attention-in-gain-pull-coeff "
                 "or --md-post-norm-gain-pull-coeff > 0 (it only pulls the matrices next to a pulled "
-                "norm gamma)."
+                "norm gamma, unless --md-gain-pull-scope all)."
             )
-        if args.md_rowcol_gain_pull_coeff and args.hypersphere_gains_mode in ("flat", "none"):
+        if args.md_rowcol_gain_pull_coeff and args.hypersphere_gains_mode == "none":
             warn_rank_0(
-                "--md-rowcol-gain-pull-coeff has no effect without row or column gains "
-                f"(--hypersphere-gains-mode {args.hypersphere_gains_mode})."
+                "--md-rowcol-gain-pull-coeff has no effect without gains "
+                "(--hypersphere-gains-mode none)."
+            )
+        if (args.md_gain_pull_scope == "moe-latent" and args.md_rowcol_gain_pull_coeff
+                and not (args.md_moe_mlp_in_gain_revive and args.md_attention_in_gain_pull_coeff)):
+            warn_rank_0(
+                "--md-gain-pull-scope moe-latent pulls fc1_latent_proj only when its "
+                "pre_mlp_layernorm gamma is pulled (--md-moe-mlp-in-gain-revive and "
+                "--md-attention-in-gain-pull-coeff > 0)."
             )
         if args.md_post_norm_gain_pull_coeff and not args.sandwich_norm:
             warn_rank_0(
@@ -3196,7 +3203,7 @@ def _add_training_args(parser):
                        'x <- x - lr * coeff * (x - sign(x) * c), sign kept. Independent of '
                        '--md-attention-in-gain-pull-coeff (the pre-norm pull), so the two can '
                        'differ. Pull only, no revive. The QK-norm, KDA output-norm and final-norm '
-                       'gammas are not touched. 0 disables.')
+                       'gammas are not touched (see --md-gain-pull-scope all). 0 disables.')
     group.add_argument('--md-rowcol-gain-pull-coeff', type=float, default=0.0,
                        help='Coefficient of the pull of the MDDecoupling row and column gains toward '
                        '--md-attention-in-gain-pull-target, only on the matrices next to a pulled '
@@ -3204,9 +3211,21 @@ def _add_training_args(parser):
                        'in_proj, dense linear_fc1) behind a pre-norm gamma pulled by '
                        '--md-attention-in-gain-pull-coeff and the output projection (linear_proj, '
                        'KDA/GDN out_proj, dense linear_fc2) in front of a post-norm gamma pulled by '
-                       '--md-post-norm-gain-pull-coeff. Overrides '
-                       '--md-attention-in-gain-pull-col-gain on the column gain. MoE matrices are '
-                       'not touched. Pull only, no revive. 0 disables.')
+                       '--md-post-norm-gain-pull-coeff. Pulls every gain of the matrix (row and '
+                       'column, or flat). Overrides --md-attention-in-gain-pull-col-gain on the '
+                       'column gain. MoE matrices are not touched unless --md-gain-pull-scope says '
+                       'so. Pull only, no revive. 0 disables.')
+    group.add_argument('--md-gain-pull-scope', type=str, default='default',
+                       choices=['default', 'moe-latent', 'all'],
+                       help='Which gains the pull coefficients reach. default: as in the help of '
+                       'each coefficient. moe-latent: also the MoE latent projections, paired like '
+                       'the dense MLP (fc1_latent_proj with the pre_mlp_layernorm gamma, which '
+                       'needs --md-moe-mlp-in-gain-revive; fc2_latent_proj with post_mlp_layernorm). '
+                       'all: every norm gamma (sandwich post-norms with '
+                       '--md-post-norm-gain-pull-coeff, every other one with '
+                       '--md-attention-in-gain-pull-coeff) and the gains of every MDDecoupling '
+                       'matrix (--md-rowcol-gain-pull-coeff), whatever the scope flags. The revive '
+                       'scope does not change.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

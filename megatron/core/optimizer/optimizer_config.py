@@ -499,17 +499,29 @@ class OptimizerConfig:
     with its own coefficient: x <- x - lr * coeff * (x - sign(x) * c) on the effective gamma, right
     after the chained Adam step. Independent of md_attention_in_gain_pull_coeff, so the pre-norm
     and post-norm pulls can have different strengths (or either can be off). Pull only, no
-    revive. The QK-norm, KDA output-norm and final-norm gammas are not touched. 0 disables."""
+    revive. The QK-norm, KDA output-norm and final-norm gammas are not touched (unless
+    md_gain_pull_scope is "all"). 0 disables."""
 
     md_rowcol_gain_pull_coeff: float = 0.0
-    """Pull of the MDDecoupling row and column gains toward md_attention_in_gain_pull_target, with
-    its own coefficient, on the matrices next to a pulled norm gamma: the input projection behind a
-    pre-norm gamma pulled by md_attention_in_gain_pull_coeff (linear_qkv, KDA/GDN in_proj, dense
-    linear_fc1, following its scope flags) and the output projection in front of a post-norm gamma
-    pulled by md_post_norm_gain_pull_coeff (linear_proj, KDA/GDN out_proj, dense linear_fc2), layer
-    by layer. Matrices next to an unpulled or absent gamma are not touched. Folded into the gains
-    AdamW decay like md_attention_in_gain_pull_col_gain, which it overrides on the column gain.
-    MoE matrices are not touched. Pull only, no revive. 0 disables."""
+    """Pull of the MDDecoupling gains (row, column, or flat) toward md_attention_in_gain_pull_target,
+    with its own coefficient, on the matrices next to a pulled norm gamma: the input projection
+    behind a pre-norm gamma pulled by md_attention_in_gain_pull_coeff (linear_qkv, KDA/GDN in_proj,
+    dense linear_fc1, following its scope flags) and the output projection in front of a post-norm
+    gamma pulled by md_post_norm_gain_pull_coeff (linear_proj, KDA/GDN out_proj, dense linear_fc2),
+    layer by layer. Matrices next to an unpulled or absent gamma are not touched. Folded into the
+    gains AdamW decay like md_attention_in_gain_pull_col_gain, which it overrides on the column
+    gain. MoE matrices are not touched unless md_gain_pull_scope says so. Pull only, no revive.
+    0 disables."""
+
+    md_gain_pull_scope: str = "default"
+    """Which gains the three pull coefficients reach (the revive scope does not change):
+    "default": as documented on each coefficient.
+    "moe-latent": also the MoE latent projections, paired like the dense MLP: fc1_latent_proj
+    with the pre_mlp_layernorm gamma (in the pre-norm scope with md_moe_mlp_in_gain_revive) and
+    fc2_latent_proj with the post_mlp_layernorm gamma.
+    "all": every norm gamma (the sandwich post-norms with md_post_norm_gain_pull_coeff, every other
+    one with md_attention_in_gain_pull_coeff) and the gains of every MDDecoupling matrix
+    (md_rowcol_gain_pull_coeff), whatever the scope flags."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
