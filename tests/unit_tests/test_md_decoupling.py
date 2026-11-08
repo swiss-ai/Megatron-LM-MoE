@@ -3076,7 +3076,7 @@ _ROWCOL_PULL_GAMMAS = {
 }
 
 
-def _tag_rowcol_pull_params(monkeypatch, sandwich_norm, omit=(), **flags):
+def _tag_rowcol_pull_params(monkeypatch, sandwich_norm, omit=(), extra=None, **flags):
     """Run the md_decoupling builder's tagging on the names above (without --sandwich-norm the
     post-norm gammas do not exist; ``omit`` drops more params) and return the params;
     MDDecoupling construction is skipped."""
@@ -3085,6 +3085,7 @@ def _tag_rowcol_pull_params(monkeypatch, sandwich_norm, omit=(), **flags):
                    if sandwich_norm or kind != "post"})
     for n in omit:
         del params[n]
+    params.update(extra or {})
 
     class _FakeModelChunk:
         config = SimpleNamespace(layernorm_zero_centered_gamma=False, num_attention_heads=2,
@@ -3335,3 +3336,25 @@ def test_rowcol_gain_pull_reaches_flat_and_expert_gains(gain_parametrization, sh
         else:
             t = torch.where(raw < 0, -target, target)
         torch.testing.assert_close(state[name], raw - lr * (wd * raw + coeff * (raw - t)))
+
+
+def test_builder_gain_pull_scope_all_merged_experts_and_non_gamma_1d(monkeypatch):
+    """Scope "all": the 3D merged offload experts (experts.weight1 / weight2) and other ndim >= 2
+    tensors get the row/col tag; 1D params that are not norm gammas (KDA A_log, dt_bias, a bias)
+    get no gamma pull."""
+    layer = "module.decoder.layers.3."
+    extra = {layer + "mlp.experts.weight1": torch.nn.Parameter(torch.ones(2, 4, 6)),
+             layer + "mlp.experts.weight2": torch.nn.Parameter(torch.ones(2, 6, 4)),
+             layer + "self_attention.conv1d.weight": torch.nn.Parameter(torch.ones(4, 1, 4)),
+             layer + "self_attention.A_log": torch.nn.Parameter(torch.ones(6)),
+             layer + "self_attention.dt_bias": torch.nn.Parameter(torch.ones(6)),
+             layer + "mlp.router.expert_bias": torch.nn.Parameter(torch.ones(6))}
+    params = _tag_rowcol_pull_params(monkeypatch, True, extra=extra,
+                                     **dict(_GAIN_PULL_COEFFS, md_gain_pull_scope="all"))
+    for name in extra:
+        p = params[name]
+        if p.ndim >= 2:
+            assert p.md_rowcol_gain_pull_coeff == 0.3, name
+        else:
+            assert not hasattr(p, "md_rowcol_gain_pull_coeff"), name
+            assert not hasattr(p, "md_decay_to_target"), name
