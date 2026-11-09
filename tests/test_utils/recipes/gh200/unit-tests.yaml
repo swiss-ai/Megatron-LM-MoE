@@ -1,6 +1,11 @@
 platform: gh200
 gpus_per_node: 4
 
+# UCCL CXI teardown/recreation crash; see known-failures.json for version and evidence.
+deselect_tests:
+  - tests/unit_tests/inference/test_kda_state_layout.py::test_shared_transfer_reshards_kda_tp2_to_tp1[conv-nixl-uccl]
+  - tests/unit_tests/inference/test_kda_state_layout.py::test_shared_transfer_reshards_kda_tp2_to_tp1[recurrent-nixl-uccl]
+
 products:
   - name: model-configs
     ranks: 4

@@ -67,7 +67,9 @@ Use a new `LOG_DIR` for each run. Pass that same directory to
 `tests/publish_results.sh` when previewing or publishing its GitHub report.
 
 Unit groups are defined in
-[`gh200/unit-tests.yaml`](test_utils/recipes/gh200/unit-tests.yaml).
+[`gh200/unit-tests.yaml`](test_utils/recipes/gh200/unit-tests.yaml). Its `deselect_tests`
+list excludes exact pytest cases on GH200; pytest reports these as deselected, not
+passed or skipped.
 
 Check collection and imports in all unit groups without running test bodies:
 

@@ -2,7 +2,9 @@
   "version": 1,
   "environments": [
     "gh200:jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/apertus-2-cuda:alps7-dev-3802febe0fec326b69512641b32deb1e",
-    "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-bd13b7e6467b0018bdab6e1377696b8c"
+    "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-bd13b7e6467b0018bdab6e1377696b8c",
+    "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-fce668b4c2f0d14af26a67d2699809dc",
+    "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-cb6842fe589bbc910f172d8f439e5c8e"
   ],
   "required_selections": {
     "unit": {
@@ -715,6 +717,42 @@
           "blocking": true,
           "error_signatures": [
             "AttributeError: 'tokenizers.Encoding' object has no attribute 'copy'"
+          ]
+        }
+      ]
+    },
+    {
+      "suite": "unit",
+      "environment": "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-fce668b4c2f0d14af26a67d2699809dc",
+      "source_sha": "f40cc885d61263cd076fd1bf4cc736ddcb039867",
+      "source_job": "5305411",
+      "failures": [
+        {
+          "selection": "inference",
+          "test_id": "tests.unit_tests.inference.test_kda_state_layout::test_shared_transfer_reshards_kda_tp2_to_tp1[recurrent-nixl-uccl]",
+          "reason": "Excluded by the GH200 deselect_tests list. UCCL 0.1.1 (commit 78adb5dce345c1ba5c52c77c6de8e09bcd4fe4cb), with NIXL 1.3.2 overlay and libfabric 2.6.0, closes CXI AV/CQ before their endpoint and ignores FI_EBUSY. Recreating an agent after the convolution transfer segfaults in libfabric fabric creation. Endpoint-first cleanup passed the controlled reproduction. Remove the exclusion after the UCCL cleanup fix is validated. This does not explain the separate older SSM packed-CP crash.",
+          "blocking": true,
+          "error_signatures": [
+            "Segmentation fault",
+            "ofi_fabric_insert"
+          ]
+        }
+      ]
+    },
+    {
+      "suite": "unit",
+      "environment": "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-cb6842fe589bbc910f172d8f439e5c8e",
+      "source_sha": "f40cc885d61263cd076fd1bf4cc736ddcb039867",
+      "source_job": "5308626",
+      "failures": [
+        {
+          "selection": "inference",
+          "test_id": "tests.unit_tests.inference.test_kda_state_layout::test_shared_transfer_reshards_kda_tp2_to_tp1[conv-nixl-uccl]",
+          "reason": "Excluded by the GH200 deselect_tests list. UCCL 0.1.1 (commit 78adb5dce345c1ba5c52c77c6de8e09bcd4fe4cb), NIXL 1.3.2 and libfabric 2.6.0: the convolution transfer passes, but UCCL closes CXI AV/CQ before their endpoint and ignores FI_EBUSY during cleanup. This corrupts libfabric state and makes a later NCCL collective segfault in ofi_fabric_insert via the NCCL OFI plugin. The dispatcher passes alone and after the matched NCCL transfer. Remove the exclusion after the UCCL cleanup fix is validated.",
+          "blocking": true,
+          "error_signatures": [
+            "Segmentation fault",
+            "ofi_fabric_insert"
           ]
         }
       ]

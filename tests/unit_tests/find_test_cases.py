@@ -62,9 +62,19 @@ def main():
         if test_case != BUCKET and is_child_of_bucket(test_case, BUCKET):
             files_to_ignore.update(expand_pattern(test_case))
 
-    # Output files to ignore
+    # Output files to ignore and explicit platform-specific case exclusions.
     for file in sorted(files_to_ignore & bucket_files):
         print(f"--ignore={file}")
+
+    result = subprocess.run(
+        ['yq', 'eval', '(.deselect_tests // [])[]', YAML_FILE],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for test_id in result.stdout.splitlines():
+        if test_id.strip():
+            print(f"--deselect={test_id.strip()}")
 
 
 if __name__ == '__main__':

@@ -260,6 +260,13 @@ class TestInferenceCUDAGraphTokenDispatcher:
         Utils.destroy_model_parallel()
 
     def teardown_method(self, method):
+        # Failed-test tracebacks retain locals, including captured NCCL graph references.
+        # Release those resources before teardown_class destroys the process groups.
+        graph = getattr(self, "_cuda_graph", None)
+        if graph is not None:
+            graph.reset()
+            self._cuda_graph = None
+
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
         NCCLAllGatherDispatcher._use_allgather_v = False
@@ -497,7 +504,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
             torch.cuda.current_stream().wait_stream(s)
 
         # Capture
-        graph = torch.cuda.CUDAGraph()
+        graph = self._cuda_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
             if backend == "nvls":
@@ -539,6 +546,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
 
+    @requires_nvls
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(
         "max_rank_tokens",
@@ -596,7 +604,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
             torch.cuda.current_stream().wait_stream(s)
 
         # Capture.
-        graph = torch.cuda.CUDAGraph()
+        graph = self._cuda_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
             dispatcher._local_tokens = local_tokens
