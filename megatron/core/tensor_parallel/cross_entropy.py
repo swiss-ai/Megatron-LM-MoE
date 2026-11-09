@@ -2,7 +2,7 @@
 
 from typing import Tuple
 
-from megatron.core.transformer import output_logit_logging
+from megatron.core.transformer import output_logit_logging, topk_logit_saving
 
 import torch
 
@@ -236,6 +236,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         diagnostic_margin = output_logit_logging.prepare_margin(
             vocab_parallel_logits, target, tp_group
         )
+        topk_logits = topk_logit_saving.prepare(vocab_parallel_logits, target, tp_group)
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
@@ -291,6 +292,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
         output_logit_logging.record_ce(logits_max, sum_exp_logits, loss, diagnostic_margin)
+        topk_logit_saving.record(topk_logits, logits_max, sum_exp_logits)
 
         # Store softmax, target-mask, masked-target and target gradient for backward pass.
         ctx.save_for_backward(exp_logits, target_mask, masked_target_1d, target_grad)

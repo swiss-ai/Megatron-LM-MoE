@@ -296,6 +296,26 @@ class LoggerConfig:
     fraction, top1-top2 margin p99.9/max, and final hidden token L2 norm mean/max.
     Set 1 for per-step logging, 0 (default) to disable. Native/unfused CE only."""
 
+    save_topk_logits_dir: str | None = None
+    """Save the top-k output logits of every valid token (for distillation) under this directory,
+    one file per data-parallel rank and step: <dir>/iter_<step>/rank_<dp>.npz. Needs
+    --save-topk-logits-interval and --save-topk-logits-tokens. See
+    megatron.core.transformer.topk_logit_saving. The native CE paths only (not the TE CE impl)."""
+
+    save_topk_logits_k: int = 256
+    """Number of top logits kept per token."""
+
+    save_topk_logits_interval: int = 0
+    """A saving window starts every N steps (steps 1, N+1, 2N+1, ...)."""
+
+    save_topk_logits_tokens: int = 0
+    """Tokens saved per window; rounded up to whole iterations (global batch size x sequence
+    length tokens each) and capped at the interval."""
+
+    save_topk_logits_clip: float = 16.0
+    """Logits more than this far below the top-1 logit are stored at the clip value. Values are
+    uint8 in steps of clip / 255, so every stored logit is within clip / 510 of the true one."""
+
     router_diag_layers: list[int] | None = None
     """0-based global layer indices to restrict router-input / RMSNorm-gain logging to (e.g. 3).
     All layers when unset."""
