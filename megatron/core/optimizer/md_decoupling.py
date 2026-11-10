@@ -473,10 +473,11 @@ def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float
         W = p.detach().double()
         r = inner._phi(state["row_gain"].double())
         c = inner._phi(state["col_gain"].double())
-        clamp = not inner.gains_no_clamp_min
-        bare = W / ((r.clamp_min(1e-8) if clamp else r)[:, None] * (c.clamp_min(1e-8) if clamp else c)[None, :])
-        rho = bare.norm(dim=1)
-        A = bare * (c / cbar)[None, :]
+        # Exact by construction: A = W / (r c_bar) (= bare * c / c_bar) never divides by a column gain, so
+        # r A gamma c_bar == W gamma holds whatever the size of c; rho is the row radius of the bare weight.
+        r = r.clamp_min(1e-30); c = c.clamp_min(1e-30)
+        rho = (W / (r[:, None] * c[None, :])).norm(dim=1)
+        A = W / (r[:, None] * cbar[None, :])
         if useless is not None and useless.any():
             A[:, useless] = A[:, ~useless].mean(1, keepdim=True)
         a = A.norm(dim=1) / rho
