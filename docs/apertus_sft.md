@@ -68,6 +68,12 @@ positions, and long conversations keep their prefix. Indices are cached; every
 epoch is shuffled independently. AP needs THD-capable attention and rejects
 `--pretraining-packing-strategy bfd`.
 
+Training computes `padding percent mean`, `variance`, `min` and `max` over the
+samples of each global batch. With TensorBoard enabled, these are logged at
+`--tensorboard-log-interval` to TensorBoard and, when configured, W&B. The console
+prints their averages over the log interval. A sample's padding includes CP/SP
+alignment and the zero-loss samples that complete an `--ap-sft-epochs` epoch.
+
 With CP or sequence parallelism, each conversation is padded to a multiple of
 `lcm(2 × CP, CP × SP)` with CP > 1, else SP (SP = TP size with
 `--sequence-parallel`, else 1). Padding has zero weight and is marked in the MoE

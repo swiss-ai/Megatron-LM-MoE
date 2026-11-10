@@ -1982,6 +1982,23 @@ def _pipeline_shape_args(args):
     return args.seq_length, args.micro_batch_size
 
 
+def _sample_statistics(key, values, group):
+    """Reduce per-microbatch [count, sum, sum of squares, min, max] reports over a group."""
+    values = torch.vstack(values)
+    sums = values[:, :3].sum(dim=0)
+    extremes = torch.stack((values[:, 3].min(), -values[:, 4].max()))
+    torch.distributed.all_reduce(sums, group=group)
+    torch.distributed.all_reduce(extremes, op=torch.distributed.ReduceOp.MIN, group=group)
+    count, total, squares = sums
+    mean = total / count
+    return {
+        key + ' mean': mean,
+        key + ' variance': (squares / count - mean**2).clamp_min(0),
+        key + ' min': extremes[0],
+        key + ' max': -extremes[1],
+    }
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -2231,6 +2248,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
                 loss_reduced[key] = val
+            elif val[0].numel() == 5:
+                # CP ranks hold the same samples, so reduce over DP only.
+                loss_reduced.update(_sample_statistics(key, val, mpu.get_data_parallel_group()))
             else:
                 raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
         return (

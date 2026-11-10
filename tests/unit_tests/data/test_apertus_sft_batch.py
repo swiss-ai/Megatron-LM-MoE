@@ -170,8 +170,9 @@ def test_cp_slices_available_tensors_and_padding_on_every_pp_stage(monkeypatch, 
     load_function("pretrain_gpt.py", "_batch_outputs", namespace)
     get_batch = load_function("pretrain_gpt.py", "get_batch", namespace)
     result = get_batch(None)
-    assert len(result) == 8
+    assert len(result) == 9
     assert torch.equal(result[5], padding.reshape(1, -1).index_select(1, indices))
+    assert result[8].tolist() == [37.5, 37.5]
     assert result[6].cu_seqlens_q.ndim == 1
     assert result[6].cu_seqlens_q[-1] == 16
     if cp == 1:
@@ -264,8 +265,12 @@ def test_excluded_target_ids_normalize_loss_and_logits_gradients(
     rows = [[3, 90, 3, 0, 91, 92], [5, 90, 3, 91, 92]]
     weights = [[0, 0.25, 2, 0.5, 1, 0], [0, 1, 0.25, 2, 0.5]] if stored else None
     dataset = make_dataset(
-        tmp_path, rows, weights, context_parallel_size=cp,
-        sft_pack_samples=packing is not None, sft_packing_strategy=packing or 'greedy',
+        tmp_path,
+        rows,
+        weights,
+        context_parallel_size=cp,
+        sft_pack_samples=packing is not None,
+        sft_packing_strategy=packing or 'greedy',
         sft_report_assistant_loss=True,
     )
     indices = [*range(len(dataset)), None]  # Include the exact-epoch dummy path.
@@ -276,10 +281,12 @@ def test_excluded_target_ids_normalize_loss_and_logits_gradients(
     for key in baseline:
         if key != 'loss_mask':
             torch.testing.assert_close(masked[key], baseline[key])
-    expected_weights = torch.tensor([
-        0.0 if target in excluded else weight
-        for target, weight in zip(baseline['labels'].flatten(), baseline['loss_mask'].flatten())
-    ])
+    expected_weights = torch.tensor(
+        [
+            0.0 if target in excluded else weight
+            for target, weight in zip(baseline['labels'].flatten(), baseline['loss_mask'].flatten())
+        ]
+    )
     torch.testing.assert_close(masked['loss_mask'].flatten(), expected_weights)
     dataset.config.loss_mask_token_ids = None
     torch.testing.assert_close(
@@ -294,9 +301,15 @@ def test_excluded_target_ids_normalize_loss_and_logits_gradients(
     args = loss_args()
     args.context_parallel_size = cp
     loss_func = load_function(
-        'pretrain_gpt.py', 'loss_func',
-        {'torch': torch, 'GPTModel': object, 'get_args': lambda: args,
-         'has_nvidia_modelopt': False, 'get_rerun_state_machine': lambda: None},
+        'pretrain_gpt.py',
+        'loss_func',
+        {
+            'torch': torch,
+            'GPTModel': object,
+            'get_args': lambda: args,
+            'has_nvidia_modelopt': False,
+            'get_rerun_state_machine': lambda: None,
+        },
     )
     sums, counts, reports = [], [], []
     for rank in range(cp):
@@ -310,7 +323,8 @@ def test_excluded_target_ids_normalize_loss_and_logits_gradients(
             partitions.append(segment)
         selection = torch.cat(partitions)
         loss, count, report = loss_func(
-            batch['loss_mask'].flatten()[selection], cross_entropy[selection],
+            batch['loss_mask'].flatten()[selection],
+            cross_entropy[selection],
             assistant_mask=batch['assistant_mask'].flatten()[selection],
         )
         sums.append(loss)
@@ -440,8 +454,45 @@ def test_assistant_loss_aggregates_sums_and_counts_across_partitions():
     assert total[0] / total[1] == 3
 
 
+def test_padding_statistics_cover_every_sample_of_the_step(monkeypatch):
+    args = loss_args()
+    loss_func = load_function(
+        'pretrain_gpt.py',
+        'loss_func',
+        {
+            'torch': torch,
+            'GPTModel': object,
+            'get_args': lambda: args,
+            'has_nvidia_modelopt': False,
+            'get_rerun_state_machine': lambda: None,
+        },
+    )
+    statistics = load_function(
+        'megatron/training/training.py', '_sample_statistics', {'torch': torch}
+    )
+    monkeypatch.setattr(torch.distributed, 'all_reduce', lambda tensor, **kwargs: None)
+    microbatches = [torch.tensor([0.0, 50.0]), torch.tensor([12.5])]
+    reports = [
+        loss_func(torch.ones(1), torch.ones(1), padding_percent=p)[2]['padding percent']
+        for p in microbatches
+    ]
+    samples = torch.cat(microbatches)
+    result = statistics('padding percent', reports, None)
+    assert list(result) == [
+        'padding percent mean',
+        'padding percent variance',
+        'padding percent min',
+        'padding percent max',
+    ]
+    torch.testing.assert_close(
+        torch.stack(list(result.values())),
+        torch.stack([samples.mean(), samples.var(correction=0), samples.min(), samples.max()]),
+    )
+
+
+@pytest.mark.parametrize('training', [False, True])
 @pytest.mark.parametrize('schedule_plan', [False, True])
-def test_forward_step_passes_assistant_mask_to_reporting_callback(schedule_plan):
+def test_forward_step_passes_reporting_inputs_to_callback(schedule_plan, training):
     args = loss_args(use_legacy_models=False, overlap_moe_expert_parallel_comm=True)
     namespace = {
         'torch': torch,
@@ -453,9 +504,13 @@ def test_forward_step_passes_assistant_mask_to_reporting_callback(schedule_plan)
     loss_func = load_function('pretrain_gpt.py', 'loss_func', namespace)
     mask = torch.tensor([True, False])
     losses = torch.tensor([2.0, 9.0])
-    batch = (None, None, torch.tensor([0.25, 0.0]), None, None, None, None, mask)
+    padding = torch.tensor([25.0, 75.0])
+    batch = (None, None, torch.tensor([0.25, 0.0]), None, None, None, None, mask, padding)
 
     class Model:
+        def __init__(self):
+            self.training = training
+
         def __call__(self, *args, **kwargs):
             assert 'assistant_mask' not in kwargs
             return losses
@@ -486,3 +541,4 @@ def test_forward_step_passes_assistant_mask_to_reporting_callback(schedule_plan)
     loss, count, report = callback(output)
     assert loss == 0.5 and count == 1
     assert report['assistant_loss'].tolist() == [2.0, 1.0]
+    assert ('padding percent' in report) == training
