@@ -449,6 +449,8 @@ def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float
             if useless.any():
                 gamma_new = torch.where(useless, gamma_new[~useless].mean(), gamma_new)
         plan[key] = dict(cbar=cbar, gamma_old=m["gamma"], gamma_new=gamma_new, useless=useless)
+    assert plan, ("fuse_prenorm_col_gains: no tagged pre-norm reached the optimizer params (md_fuse_norm missing on the "
+                  "main params); refusing to continue as if the fusion had happened")
 
     # 4. Transform what this rank owns.
     max_err = torch.zeros(3, dtype=torch.float64)  # fp32 function, bf16 function, row radii
