@@ -297,8 +297,9 @@ class LoggerConfig:
     Set 1 for per-step logging, 0 (default) to disable. Native/unfused CE only."""
 
     save_topk_logits_dir: str | None = None
-    """Save the top-k output logits of every valid token (for distillation) under this directory,
-    one file per data-parallel rank and step: <dir>/iter_<step>/rank_<dp>.npz. Needs
+    """Save the top-k output logits of every token (for distillation) under this directory,
+    one file per data-parallel rank and step: <dir>/iter_<step>/rank_<dp>.npz. Every token is saved
+    (loss-masked ones too) with its position, sample id and a loss_valid flag. Needs
     --save-topk-logits-interval and --save-topk-logits-tokens. See
     megatron.core.transformer.topk_logit_saving. The native CE paths only (not the TE CE impl)."""
 

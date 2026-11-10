@@ -13,7 +13,14 @@ log-sum-exp is known. Per valid token the file keeps
              ids); ``q`` is in the same ascending-id order;
 * ``top1``   float32: the largest logit;
 * ``lse``    float32: log-sum-exp over the full vocabulary (log-prob = logit - lse);
-* ``labels`` int32: the target token.
+* ``labels`` int32: the target token (for every token, loss-masked or not).
+
+Every token of the microbatch is saved, including loss-masked ones (goldfish drops, masked ids),
+so that a rank's rows form whole, contiguous sequences. Three more per-token fields locate a row:
+
+* ``position``    int32: the position inside its sequence;
+* ``sample``      int32: ``microbatch * batch + index in the microbatch``, counted per rank and step;
+* ``loss_valid``  uint8: 1 if the token counts in the training loss, 0 if it is loss-masked.
 
 Only the output stage's TP rank 0 stores; every TP rank takes part in the merge. No full logits
 survive the forward, and the per-microbatch results are moved to the host immediately.
@@ -38,6 +45,8 @@ _k = 256
 _clip = 16.0
 _pending: List[Dict[str, torch.Tensor]] = []
 _vocab = 0
+_batch = 1
+_micro = 0
 _writer: Optional[ThreadPoolExecutor] = None
 _futures: list = []
 # Rows per top-k tile: bounds the sort workspace, not the (already allocated) logits.
@@ -60,7 +69,9 @@ def window_iterations(tokens_per_window: int, tokens_per_iteration: int, interva
 
 def reset_attempt() -> None:
     """Drop results of a rejected attempt without disabling this step."""
+    global _micro
     _pending.clear()
+    _micro = 0
 
 
 def set_active(active: bool, k: int = 256, clip: float = 16.0) -> None:
@@ -156,11 +167,14 @@ def prepare(logits: torch.Tensor, target: torch.Tensor, tp_group) -> Optional[di
             )
         if group_rank != 0:
             return None
+        lead = tuple(logits.shape[:-1])  # [sequence, batch]
         return {
             "values": values,
             "indices": indices,
             "labels": target.reshape(-1),
             "vocab": vocab * group_size,
+            "seq": lead[0],
+            "batch": lead[1] if len(lead) > 1 else 1,
         }
 
 
@@ -232,7 +246,7 @@ def decode_indices_ef(packed: np.ndarray, vocab: int, k: int, chunk: int = 16384
 def record(
     prepared: Optional[dict], logits_max: torch.Tensor, sum_exp_logits: torch.Tensor
 ) -> None:
-    """Quantize this microbatch's top-k and keep it on the host (valid tokens only)."""
+    """Quantize this microbatch's top-k and keep it on the host (all tokens, with a loss flag)."""
     if prepared is None or not (_active and _in_forward and _in_loss):
         return
     with torch.no_grad():
@@ -247,11 +261,14 @@ def record(
             valid = (_loss_mask.transpose(0, 1).reshape(-1) > 0).to(values.device)
             if valid.numel() != rows:
                 raise ValueError("loss mask must match [sequence, batch] cross-entropy rows")
-        if not bool(valid.any()):
-            return
-        values, indices, labels, lse = values[valid], indices[valid], labels[valid], lse[valid]
-        global _vocab
-        _vocab = int(prepared["vocab"])
+        global _vocab, _batch, _micro
+        _vocab, _batch = int(prepared["vocab"]), int(prepared["batch"])
+        if int(prepared["seq"]) * _batch != rows:
+            raise ValueError("top-k logit rows do not match [sequence, batch]")
+        row = torch.arange(rows, device=values.device)
+        position = (row // _batch).to(torch.int32)
+        sample = (_micro * _batch + row % _batch).to(torch.int32)
+        _micro += 1
         q = quantize(values, _clip)
         indices, order = torch.sort(indices, dim=1)  # ascending ids for the Elias-Fano coding
         _pending.append(
@@ -261,6 +278,9 @@ def record(
                 "top1": values[:, 0].float().cpu(),
                 "lse": lse.float().cpu(),
                 "labels": labels.to(torch.int32).cpu(),
+                "position": position.cpu(),
+                "sample": sample.cpu(),
+                "loss_valid": valid.to(torch.uint8).cpu(),
             }
         )
 
@@ -280,6 +300,7 @@ def flush(step: int, out_dir: str, rank: int) -> Optional[str]:
         step=np.int64(step),
         k=np.int64(_k),
         vocab=np.int64(_vocab),
+        batch=np.int64(_batch),
         clip=np.float32(_clip),
     )
     _pending.clear()
@@ -302,14 +323,20 @@ def wait() -> None:
 
 def decode(path: str) -> Dict[str, np.ndarray]:
     """Read a saved file back, ids ascending within each token: ``indices`` [T, k], ``logits``
-    [T, k], ``lse`` [T], ``labels`` [T]. A log-probability is ``logits - lse[:, None]``."""
+    [T, k], ``lse`` [T], ``labels`` [T], and ``position``, ``sample``, ``loss_valid`` [T] (None for
+    files written before those fields existed). A log-probability is ``logits - lse[:, None]``."""
     with np.load(path) as data:
         clip, k, vocab = float(data["clip"]), int(data["k"]), int(data["vocab"])
         logits = data["top1"][:, None] - data["q"].astype(np.float32) * (clip / 255.0)
+        names = set(data.files)
         return {
             "indices": decode_indices_ef(data["idx_ef"], vocab, k),
             "logits": logits.astype(np.float32),
             "lse": data["lse"],
             "labels": data["labels"],
+            "position": data["position"] if "position" in names else None,
+            "sample": data["sample"] if "sample" in names else None,
+            "loss_valid": data["loss_valid"].astype(bool) if "loss_valid" in names else None,
+            "batch": int(data["batch"]) if "batch" in names else None,
             "step": int(data["step"]),
         }

@@ -69,7 +69,7 @@ class TopKLogitSavingTest(unittest.TestCase):
         logits = torch.randn(seq, batch, vocab) * 4
         target = torch.randint(0, vocab, (seq, batch))
         loss_mask = torch.ones(batch, seq)
-        loss_mask[1, 2:] = 0  # masked tokens are not saved
+        loss_mask[1, 2:] = 0  # loss-masked tokens are still saved, with loss_valid = 0
         run_step(logits, target, loss_mask, k, clip)
         with tempfile.TemporaryDirectory() as tmp:
             path = saving.flush(7, tmp, rank=3)
@@ -78,17 +78,19 @@ class TopKLogitSavingTest(unittest.TestCase):
             out = saving.decode(path)
 
         valid = (loss_mask.transpose(0, 1).reshape(-1) > 0)
-        flat = logits.reshape(-1, vocab)[valid]
+        flat = logits.reshape(-1, vocab)  # every token is saved
         ref_ids, ref_values = topk_by_id(flat, k)
         self.assertEqual(out["step"], 7)
+        np.testing.assert_array_equal(out["loss_valid"], valid.numpy())
+        self.assertEqual(int(out["loss_valid"].sum()), int(valid.sum()))
         np.testing.assert_array_equal(out["indices"], ref_ids.numpy())
         self.assertTrue(np.all(np.diff(out["indices"], axis=1) > 0))  # ids strictly ascending
-        np.testing.assert_array_equal(out["labels"], target.reshape(-1)[valid].numpy())
+        np.testing.assert_array_equal(out["labels"], target.reshape(-1).numpy())
         np.testing.assert_allclose(out["lse"], torch.logsumexp(flat, dim=-1).numpy(), rtol=1e-5)
         in_range = (ref_values.max(dim=1, keepdim=True).values - ref_values) <= clip
         error = np.abs(out["logits"] - ref_values.numpy())
         self.assertLessEqual(float(error[in_range.numpy()].max()), clip / 510 + 1e-4)
-        self.assertEqual(out["logits"].shape, (int(valid.sum()), k))
+        self.assertEqual(out["logits"].shape, (seq * batch, k))
 
     def test_logits_beyond_clip_saturate(self):
         values = torch.tensor([[10.0, 9.0, -50.0, float("-inf")]])
@@ -121,6 +123,60 @@ class TopKLogitSavingTest(unittest.TestCase):
             saving.encode_indices_ef(torch.tensor([[3, 3, 9]]), 100)  # not strictly ascending
         with self.assertRaises(ValueError):
             saving.encode_indices_ef(torch.tensor([[1, 2, 100]]), 100)  # outside the vocabulary
+
+    def test_position_and_sample_locate_every_token(self):
+        torch.manual_seed(6)
+        seq, batch, vocab, k = 5, 2, 200, 8
+        saving.set_active(True, k, 16.0)
+        expected_labels = []
+        for micro in range(3):  # three microbatches in one step
+            logits = torch.randn(seq, batch, vocab)
+            target = torch.randint(0, vocab, (seq, batch))
+            mask = torch.ones(batch, seq)
+            mask[0, micro] = 0
+            with saving.forward_scope(), saving.loss_scope(mask):
+                saving.record(saving.prepare(logits, target, None), *ce_inputs(logits))
+            expected_labels.append(target.reshape(-1))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = saving.flush(2, tmp, 0)
+            saving.wait()
+            out = saving.decode(path)
+        self.assertEqual(out["batch"], batch)
+        rows = np.arange(3 * seq * batch)
+        np.testing.assert_array_equal(out["position"], (rows % (seq * batch)) // batch)
+        # sample = microbatch * batch + index in the microbatch; rows are sequence-major
+        np.testing.assert_array_equal(out["sample"], (rows // (seq * batch)) * batch + rows % batch)
+        np.testing.assert_array_equal(out["labels"], torch.cat(expected_labels).numpy())
+        # a sample's tokens form a contiguous sequence: positions 0..seq-1 once each
+        for sample in range(3 * batch):
+            np.testing.assert_array_equal(out["position"][out["sample"] == sample], np.arange(seq))
+        self.assertEqual(int((~out["loss_valid"]).sum()), 3)  # the three masked tokens, one per microbatch
+
+    def test_counters_reset_between_steps(self):
+        logits = torch.randn(4, 1, 50)
+        target = torch.zeros(4, 1, dtype=torch.long)
+        for step in (1, 2):
+            run_step(logits, target, None, 4, 16.0)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = saving.flush(step, tmp, 0)
+                saving.wait()
+                out = saving.decode(path)
+            self.assertEqual(out["sample"].tolist(), [0, 0, 0, 0])  # microbatch counter restarted
+
+    def test_files_without_locator_fields_still_decode(self):
+        logits = torch.randn(4, 1, 50)
+        run_step(logits, torch.zeros(4, 1, dtype=torch.long), None, 4, 16.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = saving.flush(1, tmp, 0)
+            saving.wait()
+            with np.load(path) as data:
+                legacy = {n: data[n] for n in data.files if n not in ("position", "sample", "loss_valid", "batch")}
+            old = os.path.join(tmp, "old.npz")
+            np.savez(old, **legacy)
+            out = saving.decode(old)
+        self.assertIsNone(out["position"])
+        self.assertIsNone(out["loss_valid"])
+        self.assertEqual(out["indices"].shape, (4, 4))
 
     def test_shard_merge_equals_global_topk(self):
         torch.manual_seed(1)
