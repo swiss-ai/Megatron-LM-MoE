@@ -2295,7 +2295,7 @@ def get_megatron_mddecoupling_optimizer(
                     float(pull_coeff),
                     float(config.md_attention_in_gain_pull_target),
                     float(getattr(param, "md_layernorm_gain_offset", 0.0)),
-                )
+                ) + ((float(config.md_gain_pull_flip_band),) if config.md_gain_pull_flip_band else ())
             module_name = name.rpartition('.')[0]
             while module_name:
                 module = named_modules.get(module_name)

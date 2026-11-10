@@ -523,6 +523,14 @@ class OptimizerConfig:
     one with md_attention_in_gain_pull_coeff) and the gains of every MDDecoupling matrix
     (md_rowcol_gain_pull_coeff), whatever the scope flags."""
 
+    md_gain_pull_flip_band: float = 0.0
+    """Sign-flipping target of the norm-gamma pull (the md_decay_to_target pull: pre-norm,
+    post-norm and, under md_gain_pull_scope "all", every norm gamma). With band b > 0 and the
+    effective gamma x: x in [0, b] is pulled toward -target, x in [-b, 0) toward +target, every
+    other x toward sign(x) * target as before. A gamma stuck near 0 is thus pushed through zero and
+    revived with the opposite sign. The MDDecoupling row/column gains (softplus, always positive)
+    keep the plain pull toward +target. 0 disables (plain sign-keeping pull)."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed

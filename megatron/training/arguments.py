@@ -1648,6 +1648,12 @@ def validate_args(args, defaults={}):
             assert args.md_attention_in_gain_revive_iteration is not None, (
                 "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
                 "(the checkpoint iteration after which the one-shot revive runs).")
+        assert args.md_gain_pull_flip_band >= 0, (
+            f"--md-gain-pull-flip-band must be >= 0; got {args.md_gain_pull_flip_band}.")
+        if args.md_gain_pull_flip_band and not (
+                args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff):
+            warn_rank_0("--md-gain-pull-flip-band has no effect without a norm-gamma pull "
+                        "(--md-attention-in-gain-pull-coeff or --md-post-norm-gain-pull-coeff > 0).")
         assert args.md_post_norm_gain_pull_coeff >= 0, (
             f"--md-post-norm-gain-pull-coeff must be >= 0; got {args.md_post_norm_gain_pull_coeff}.")
         assert args.md_rowcol_gain_pull_coeff >= 0, (
@@ -3226,6 +3232,12 @@ def _add_training_args(parser):
                        '--md-attention-in-gain-pull-coeff) and the gains of every MDDecoupling '
                        'matrix (--md-rowcol-gain-pull-coeff), whatever the scope flags. The revive '
                        'scope does not change.')
+    group.add_argument('--md-gain-pull-flip-band', type=float, default=0.0,
+                       help='Sign-flipping target of the norm-gamma pull (pre-norm, post-norm and, '
+                       'under --md-gain-pull-scope all, every norm gamma): an effective gamma in '
+                       '[0, b] is pulled toward -target, in [-b, 0) toward +target, every other one '
+                       'toward sign(gamma) * target. The MDDecoupling row/column gains keep the plain '
+                       'pull toward +target. 0 (default) keeps the sign.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '

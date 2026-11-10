@@ -3358,3 +3358,58 @@ def test_builder_gain_pull_scope_all_merged_experts_and_non_gamma_1d(monkeypatch
         else:
             assert not hasattr(p, "md_rowcol_gain_pull_coeff"), name
             assert not hasattr(p, "md_decay_to_target"), name
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_decay_to_target_flip_band(offset):
+    """With a flip band b the pull target is -target on [0, b], +target on [-b, 0) and
+    sign(x) * target elsewhere (effective units); without the 4th spec entry nothing changes."""
+    from megatron.core.optimizer.optimizer import _decay_to_target
+
+    # inside / outside the band with margin: the offset round trip in fp32 moves +-1e-5 to +-1.0014e-5
+    x = torch.tensor([0.0, 5e-6, 8e-6, 2e-5, -5e-6, -8e-6, -2e-5, 0.7, -0.7])
+    gamma = torch.nn.Parameter(x - offset)
+    gamma.md_decay_to_target = (0.5, 1.0, offset, 1e-5)
+    plain = torch.nn.Parameter(x - offset)
+    plain.md_decay_to_target = (0.5, 1.0, offset)
+    sgd = torch.optim.SGD([gamma, plain], lr=0.01)
+    _decay_to_target(sgd)
+    t_flip = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0])
+    t_keep = torch.where(x < 0, -1.0, 1.0)
+    torch.testing.assert_close(gamma.detach() + offset, x - 0.01 * 0.5 * (x - t_flip))
+    torch.testing.assert_close(plain.detach() + offset, x - 0.01 * 0.5 * (x - t_keep))
+
+
+def test_decay_to_target_flip_band_crosses_zero():
+    """A gamma just above 0 goes negative within one step and then keeps going to -target."""
+    from megatron.core.optimizer.optimizer import _decay_to_target
+
+    gamma = torch.nn.Parameter(torch.tensor([1e-6, -1e-6, 0.3]))
+    gamma.md_decay_to_target = (0.5, 1.0, 0.0, 1e-5)
+    sgd = torch.optim.SGD([gamma], lr=0.1)
+    for _ in range(400):
+        _decay_to_target(sgd)
+    torch.testing.assert_close(gamma.detach(), torch.tensor([-1.0, 1.0, 1.0]), atol=1e-3, rtol=0)
+
+
+@pytest.mark.parametrize("band", [0.0, 1e-5])
+def test_builder_flip_band_spec(monkeypatch, band):
+    """The band is appended to every md_decay_to_target spec only when set; MD gains are unaffected."""
+    params = _tag_rowcol_pull_params(
+        monkeypatch, True, md_rowcol_gain_pull_coeff=0.05, md_attention_in_gain_pull_coeff=0.05,
+        md_post_norm_gain_pull_coeff=0.05, md_attention_in_gain_pull_target=1.0,
+        md_gain_pull_scope="all", md_gain_pull_flip_band=band)
+    specs = [p.md_decay_to_target for p in params.values() if hasattr(p, "md_decay_to_target")]
+    assert specs and all(len(s) == (4 if band else 3) for s in specs)
+    assert all(s[3] == band for s in specs if band)
+
+
+def test_flip_band_argument():
+    import argparse
+
+    from megatron.training.arguments import _add_training_args
+
+    parser = _add_training_args(argparse.ArgumentParser(allow_abbrev=False))
+    assert parser.parse_args([]).md_gain_pull_flip_band == 0.0
+    assert OptimizerConfig().md_gain_pull_flip_band == 0.0
+    assert parser.parse_args(["--md-gain-pull-flip-band", "1e-5"]).md_gain_pull_flip_band == 1e-5
