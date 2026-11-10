@@ -523,6 +523,24 @@ class OptimizerConfig:
     one with md_attention_in_gain_pull_coeff) and the gains of every MDDecoupling matrix
     (md_rowcol_gain_pull_coeff), whatever the scope flags."""
 
+    md_fuse_prenorm_col_gains_iteration: Optional[int] = None
+    """One-shot fusion of the MDDecoupling column gains of the matrices that read a pre-norm into
+    that pre-norm gamma, right after loading exactly this checkpoint iteration (see
+    md_decoupling.fuse_prenorm_col_gains). A pre-norm with readers W_k = diag(r_k) W_hat_k diag(c_k)
+    gets gamma' = gamma * c_bar (c_bar = geometric mean of the c_k), each reader absorbs c_k / c_bar
+    into its bare weight, re-projected onto its row sphere through its row gain, and its column gain
+    is set to 1. The network function is unchanged. When set, those column gains stay frozen at 1
+    (no update, no pull) at every later step and resume. None disables."""
+
+    md_fuse_revive: str = "none"
+    """With md_fuse_prenorm_col_gains_iteration: also revive the useless input channels of every
+    fused pre-norm at the same load: "none" or "mean" (the gamma entry is set to the mean of the
+    live entries and the bare weight column of every reader to the mean of its live columns)."""
+
+    md_fuse_revive_threshold: float = 0.03
+    """A channel j of a fused pre-norm is useless when its read amplitude
+    |gamma_j| * sqrt(sum_k ||W_k[:, j]||^2) is below this fraction of the median over j."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed

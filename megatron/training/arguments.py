@@ -1648,6 +1648,16 @@ def validate_args(args, defaults={}):
             assert args.md_attention_in_gain_revive_iteration is not None, (
                 "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
                 "(the checkpoint iteration after which the one-shot revive runs).")
+        if args.md_fuse_prenorm_col_gains_iteration is not None:
+            assert args.hypersphere_gains_mode == "rowcol" and args.hypersphere_gains_mode_router in (
+                "rowcol", "inherit"), (
+                "--md-fuse-prenorm-col-gains-iteration needs row and column gains on every reader "
+                "(--hypersphere-gains-mode rowcol, router rowcol or inherit).")
+            assert args.use_layer_wise_distributed_optimizer or not args.use_distributed_optimizer, (
+                "--md-fuse-prenorm-col-gains-iteration needs whole parameters per rank "
+                "(--use-layer-wise-distributed-optimizer or no distributed optimizer).")
+        assert args.md_fuse_revive == "none" or args.md_fuse_prenorm_col_gains_iteration is not None, (
+            "--md-fuse-revive needs --md-fuse-prenorm-col-gains-iteration.")
         assert args.md_post_norm_gain_pull_coeff >= 0, (
             f"--md-post-norm-gain-pull-coeff must be >= 0; got {args.md_post_norm_gain_pull_coeff}.")
         assert args.md_rowcol_gain_pull_coeff >= 0, (
@@ -3226,6 +3236,24 @@ def _add_training_args(parser):
                        '--md-attention-in-gain-pull-coeff) and the gains of every MDDecoupling '
                        'matrix (--md-rowcol-gain-pull-coeff), whatever the scope flags. The revive '
                        'scope does not change.')
+    group.add_argument('--md-fuse-prenorm-col-gains-iteration', type=int, default=None,
+                       help='md_decoupling: ONCE, right after loading exactly this checkpoint '
+                       'iteration, fuse the column gains of the matrices that read each pre-norm '
+                       '(attention linear_qkv / KDA in_proj, dense linear_fc1, and in a latent MoE '
+                       'the router, fc1_latent_proj and shared-expert fc1) into that pre-norm gamma '
+                       '(gamma * geometric mean of the column gains; the readers keep the rest in '
+                       'their bare weight, re-projected through their row gains). The function is '
+                       'unchanged; the optimizer state is mapped with the same reparametrization. '
+                       'When set, those column gains stay frozen at 1 (no update, no pull) at every '
+                       'later step and resume. Needs --hypersphere-gains-mode rowcol.')
+    group.add_argument('--md-fuse-revive', type=str, default='none', choices=['none', 'mean'],
+                       help='With --md-fuse-prenorm-col-gains-iteration: also revive the useless input '
+                       'channels of the fused pre-norms at the same load (mean: gamma entry = mean of '
+                       'the live entries, bare weight column of every reader = mean of its live '
+                       'columns; their gamma Adam moments and weight momentum columns are zeroed).')
+    group.add_argument('--md-fuse-revive-threshold', type=float, default=0.03,
+                       help='Useless channel for --md-fuse-revive: read amplitude |gamma_j| * '
+                       'sqrt(sum over readers of ||W[:, j]||^2) below this fraction of the median.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '
