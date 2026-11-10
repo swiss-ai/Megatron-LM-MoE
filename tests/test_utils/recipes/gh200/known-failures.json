@@ -756,6 +756,24 @@
           ]
         }
       ]
+    },
+    {
+      "suite": "unit",
+      "environment": "gh200:jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/apertus-2-megatron:alps7-dev-cb6842fe589bbc910f172d8f439e5c8e",
+      "source_sha": "e366008d811be2974b06c0aa930e76ea31a44de1",
+      "source_job": "5312607",
+      "failures": [
+        {
+          "selection": "ssm",
+          "test_id": "tests.unit_tests.ssm.test_kda_handoff::test_kda_handoff_preserves_recurrent_decode_and_slot_ownership[nixl-uccl]",
+          "reason": "Excluded by the GH200 deselect_tests list. With NIXL 1.3.2, UCCL 0.1.1 (commit 78adb5dce345c1ba5c52c77c6de8e09bcd4fe4cb) and libfabric 2.6.0, the handoff passes but the following CP padding test segfaults on ranks 0 and 6 in a fresh eight-rank sequence with extra CUDA logging disabled. The CP case passes alone on all eight ranks. An all-rank GDB reproduction in the same job logs UCCL Engine destruction after the passing handoff, then captures SIGSEGV in ofi_fabric_insert via fi_fabric and the NCCL OFI plugin while the CP all_gather initializes its communicator. This matches the previously reproduced CXI cleanup-corruption signature; it is not merely a test assertion or Python fixture failure. The original full-suite CUDA mapping error is not separately attributed by this native stack. The separate NCCL-prefix control also crashed inside its handoff before reaching CP, so it is not a clean passing comparator. This exclusion remains a workaround, not a dependency fix; the NCCL handoff variant remains enabled.",
+          "blocking": true,
+          "error_signatures": [
+            "Segmentation fault",
+            "ofi_fabric_insert"
+          ]
+        }
+      ]
     }
   ]
 }
