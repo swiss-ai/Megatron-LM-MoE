@@ -3060,6 +3060,10 @@ def _add_training_args(parser):
                        choices=['row', 'col', 'flat', 'embed', 'none'],
                        help='Hypersphere mode override for MoE router weights under md_decoupling. '
                        "Defaults to 'row'.")
+    group.add_argument('--hypersphere-skip-input-embedding', action='store_true', default=False,
+                       help='md_decoupling: leave the input embedding (word_embeddings) off the '
+                       'hypersphere (no init/post-step projection); the untied LM head keeps '
+                       '--hypersphere-embedding-mode. Pair with --embedding-rmsnorm.')
     group.add_argument('--hypersphere-tangential-grad', action='store_true', default=False,
                        help='Project p.grad onto the hypersphere tangent space before the update '
                        '(only effective with an active hypersphere mode).')

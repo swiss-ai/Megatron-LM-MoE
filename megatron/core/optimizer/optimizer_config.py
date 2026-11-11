@@ -377,6 +377,11 @@ class OptimizerConfig:
     None disables router-specific normalization."""
 
     hypersphere_tangential_grad: bool = False
+
+    hypersphere_skip_input_embedding: bool = False
+    """md_decoupling: do not project the input embedding (word_embeddings) onto the sphere, at init
+    or after each step, and skip its tangential-grad projection. The untied LM head keeps
+    --hypersphere-embedding-mode. Pair with --embedding-rmsnorm to keep the forward scale fixed."""
     """Project p.grad onto the hypersphere tangent space before the update."""
 
     hypersphere_preserve_init: bool = False

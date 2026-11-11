@@ -575,6 +575,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                     for p in group["params"]:
                         if p.ndim != 2 and not (len(p.shape) == 3 and getattr(p, "merged_offload_expert", False)):
                             continue
+                        if getattr(p, "md_skip_sphere", False):
+                            continue
                         is_qkv = self.is_qkv_fn(p)
                         is_out_proj = getattr(p, "is_out_proj", False)
                         is_embedding = getattr(p, "is_embedding_or_output_parameter", False)
@@ -662,11 +664,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         _will_normalize = (
             (p.ndim == 2 or (p.ndim == 3 and is_merged_offload_expert))
             and self._resolve_mode(is_embedding, is_router) is not None
+            and not getattr(p, "md_skip_sphere", False)
         )
 
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
-        if self.hypersphere_tangential_grad:
+        if self.hypersphere_tangential_grad and not getattr(p, "md_skip_sphere", False):
             self._project_tangent_inplace(
                 p, grad, is_qkv=is_qkv, is_out_proj=is_out_proj,
                 is_embedding=is_embedding, is_router=is_router,
@@ -2196,6 +2199,10 @@ def get_megatron_mddecoupling_optimizer(
                 param.is_router = True
             if len(param.shape) == 2 and name.endswith('word_embeddings.weight'):
                 param.is_md_embedding_parameter = True
+                if config.hypersphere_skip_input_embedding:
+                    # Input embedding off the sphere (stays on the MD Adam branch); the LM head
+                    # keeps --hypersphere-embedding-mode.
+                    param.md_skip_sphere = True
             if len(param.shape) == 2 and name.endswith('output_layer.weight'):
                 if getattr(param, "shared_embedding", False):
                     param.is_md_embedding_parameter = True
