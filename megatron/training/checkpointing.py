@@ -1555,6 +1555,7 @@ def load_args_from_checkpoint(
     _set_arg('pnglu_fusion', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('scale_embeddings_by_sqrt_hidden', force=True)
+    _set_arg('embedding_rmsnorm', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
     _set_arg('residual_output_scaling', force=True)
@@ -1630,6 +1631,7 @@ def load_args_from_checkpoint(
     # load (missing keys) or are silently dropped. Training resume is unaffected (it re-passes every
     # flag on the CLI and doesn't set --use-checkpoint-args).
     _set_arg('scale_embeddings_by_sqrt_hidden', force=True)
+    _set_arg('embedding_rmsnorm', force=True)
     _set_arg('residual_output_scaling', force=True)
     _set_arg('sandwich_norm', force=True)
     _set_arg('keel', force=True)

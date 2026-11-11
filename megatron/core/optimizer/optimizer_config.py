@@ -338,6 +338,13 @@ class OptimizerConfig:
     --weight-decay. Requires a non-hypersphere router (--hypersphere-router-mode none): the
     post-step hypersphere projection would undo it. When unset, routers use the global decay."""
 
+    norm_weight_decay: Optional[float] = None
+    """Decoupled weight decay for the norm gains (every LayerNorm/RMSNorm weight: pre-norms,
+    including the ones fused into a linear, sandwich post-norms, q/k norms, the final norm)
+    under md_decoupling, independent of --weight-decay. Overrides the default no-decay rule for
+    1-D params on these gains only. With --apply-layernorm-1p the decay pulls the effective gain
+    1 + w toward 1. When unset, norm gains are not decayed."""
+
     embedding_lr_multiplier: Optional[float] = None
     """LR multiplier for embedding (and tied LM-head) params under md_decoupling. Final
     max_lr = embedding_lr_multiplier * lr. When unset, those params use the base --lr."""

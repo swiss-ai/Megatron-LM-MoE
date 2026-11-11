@@ -49,7 +49,7 @@ from .optimizer import (
     FP32Optimizer,
     MegatronOptimizer,
 )
-from .optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
+from .optimizer_config import OptimizerConfig, ParamKey, ParamPredicate, ParamWithNamePredicate
 
 try:
     import emerging_optimizers
@@ -2000,6 +2000,22 @@ def _mddecoupling_config_overrides(
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
+    # Norm-gain weight decay. The standard overrides switch decay off (wd_mult=0) for every 1-D
+    # param; narrow those entries to exclude the norm gains (a second, conflicting wd_mult on the
+    # same param would raise), then give the norm gains their own constant decay.
+    if config.norm_weight_decay is not None:
+        for key in [k for k, v in overrides.items() if v.get('wd_mult') == 0.0]:
+            value = overrides.pop(key)
+            narrowed = ParamWithNamePredicate(
+                name=f"not_norm_gain[{key}]",
+                fn=lambda p, n, _k=key: _k.matches(p, n) and not getattr(p, 'is_md_norm_gain', False),
+            )
+            overrides[ParamKey(with_name_predicate=narrowed)] = value
+        overrides[ParamKey(attr='is_md_norm_gain')] = {
+            'start_wd': config.norm_weight_decay,
+            'end_wd': config.norm_weight_decay,
+        }
+
     # Matrix LR for non-embedding/non-output matrix weights. Routers with their own LR are
     # excluded — they get it from the router_override above (two different max_lr overrides on
     # one param would be a conflict).
@@ -2192,6 +2208,8 @@ def get_megatron_mddecoupling_optimizer(
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
+            if param.md_gain_log_family == "layernorm":
+                param.is_md_norm_gain = True
             if _is_revived_pre_norm_gain(name, param, config.md_attention_in_gain_scope,
                                          config.md_dense_mlp_in_gain_revive):
                 # The gamma fused in front of the attention-in projection (and, with

@@ -368,6 +368,12 @@ class TransformerConfig(ModelParallelConfig):
     embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the
     network ~1. This is a fixed (non-learnable) multiplier applied in both forward and backward."""
 
+    embedding_rmsnorm: bool = False
+    """If True, apply a scale-free (no learnable gain) RMSNorm to the embedding output, after any
+    fixed embedding multipliers (MuP / sqrt(hidden)), so every token vector enters the network with
+    RMS 1. Its backward projects out the radial component of the gradient w.r.t. each looked-up
+    embedding row, so the embedding only receives updates tangent to its current direction."""
+
     residual_output_scaling: bool = False
     """If True, scale every sublayer output by a fixed ``alpha = 1/sqrt(2 * num_layers)`` before it
     is added to the residual stream, i.e. each sublayer computes ``x = x + alpha * f(x)`` (2

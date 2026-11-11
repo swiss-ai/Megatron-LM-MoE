@@ -3026,6 +3026,11 @@ def _add_training_args(parser):
                        help='Decoupled weight decay for MoE router weights under md_decoupling, '
                        'independent of --weight-decay. Requires --hypersphere-router-mode none '
                        '(the hypersphere projection would undo it).')
+    group.add_argument('--norm-weight-decay', type=float, default=None,
+                       help='Decoupled weight decay for the norm gains (all LayerNorm/RMSNorm '
+                       'weights) under md_decoupling, independent of --weight-decay. Norm gains '
+                       'are otherwise never decayed. With --apply-layernorm-1p it pulls the '
+                       'effective gain 1 + w toward 1.')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '

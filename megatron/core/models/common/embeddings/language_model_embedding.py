@@ -138,6 +138,13 @@ class LanguageModelEmbedding(MegatronModule):
         if self.config.scale_embeddings_by_sqrt_hidden:
             embeddings = embeddings * math.sqrt(self.config.hidden_size)
 
+        # Scale-free RMSNorm (no gain). Every token vector is full-width here (TP all-reduces /
+        # reduce-scatters along the sequence, never splits hidden), so the norm is local.
+        if self.config.embedding_rmsnorm:
+            x = embeddings.float()
+            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.config.layernorm_epsilon)
+            embeddings = x.to(embeddings.dtype)
+
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
             embeddings = embeddings.float()
