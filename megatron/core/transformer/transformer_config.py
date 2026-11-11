@@ -160,6 +160,16 @@ class TransformerConfig(ModelParallelConfig):
     hidden_dropout: float = 0.1
     """Dropout probability for transformer hidden state."""
 
+    embedding_dropout: Optional[float] = None
+    """Dropout probability on the embedding output. None (default) uses hidden_dropout, the previous
+    behaviour; 0 keeps hidden_dropout on the layer outputs only."""
+
+    block_input_dropout: float = 0.0
+    """Dropout probability on what every attention and MLP block reads: the block input after its
+    pre-norm when the norm is a separate module (MoE pre_mlp_layernorm), before it when the norm is
+    fused into the input projection (attention, dense MLP). The residual carried to the add is not
+    dropped. Training only. 0 disables."""
+
     attention_dropout: float = 0.1
     """Post attention dropout probability."""
 

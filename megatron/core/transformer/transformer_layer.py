@@ -267,6 +267,16 @@ class BaseTransformerLayer(ABC):
         pass
 
 
+
+def _block_input_dropout(x, config, training):
+    """--block-input-dropout: dropout on what a block reads. Returns a new tensor, so the residual
+    (which aliases the block input when the pre-norm is fused into the projection) is untouched."""
+    p = getattr(config, "block_input_dropout", 0.0)
+    if not training or not p:
+        return x
+    return torch.nn.functional.dropout(x, p=p, training=True)
+
+
 class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
@@ -746,6 +756,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # operation in attention's out_proj (linear_proj)
             self._set_proj_residual(residual)
 
+        input_layernorm_output = _block_input_dropout(input_layernorm_output, self.config, self.training)
+
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -921,6 +933,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
+
+        pre_mlp_layernorm_output = _block_input_dropout(pre_mlp_layernorm_output, self.config, self.training)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -1608,6 +1622,8 @@ class MoETransformerLayer(TransformerLayer):
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
+
+        pre_mlp_layernorm_output = _block_input_dropout(pre_mlp_layernorm_output, self.config, self.training)
 
         router_outputs = self.mlp(
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask

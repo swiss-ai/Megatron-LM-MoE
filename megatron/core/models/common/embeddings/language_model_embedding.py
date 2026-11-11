@@ -84,7 +84,10 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings = None
 
         # Embeddings dropout
-        self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
+        embedding_dropout = getattr(self.config, 'embedding_dropout', None)
+        self.embedding_dropout = torch.nn.Dropout(
+            self.config.hidden_dropout if embedding_dropout is None else embedding_dropout
+        )
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""

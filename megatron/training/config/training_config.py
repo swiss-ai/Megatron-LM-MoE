@@ -284,6 +284,12 @@ class LoggerConfig:
     and MLP-output RMS. Set 0 to disable. Requires eager execution without expert
     parallel communication overlap; no activation tensors are retained."""
 
+    clean_loss_interval: int = 0
+    """Every N steps, before training on the step's batch, evaluate that same batch with the model in
+    eval mode (no dropout) and log the result as 'lm loss (no dropout)'. With dropout on, this is the
+    loss comparable to a dropout-free run on the same data. Costs one forward pass of the global
+    batch per N steps. Pipeline / virtual pipeline parallel are not supported. 0 disables."""
+
     activation_spike_stats: bool = False
     """On the --activation-norm-log-interval steps, also log per-layer min, mean, median and max
     of |x| and the kurtosis of x for the same three activations (activation_spike/*). The median

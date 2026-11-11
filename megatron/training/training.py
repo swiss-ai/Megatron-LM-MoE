@@ -1974,6 +1974,65 @@ def _pipeline_shape_args(args):
     return args.seq_length, args.micro_batch_size
 
 
+class _ReplayIterator:
+    """Wraps the training data iterator so that one step's micro-batches can be fetched ahead and served
+    twice (--clean-loss-interval): once to a dropout-free forward pass, then to the training step."""
+
+    def __init__(self, it):
+        self.it = it
+        self.queue = []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.queue.pop(0) if self.queue else next(self.it)
+
+    def prefetch(self, n):
+        assert not self.queue, "previous prefetch not consumed"
+        self.buf = [next(self.it) for _ in range(n)]
+        self.queue = list(self.buf)
+
+    def rewind(self):
+        self.queue = list(self.buf)
+
+
+def _clean_loss(forward_step_func, replay, model, config, forward_backward_func):
+    """lm loss of the next global batch with the model in eval mode (no dropout), on the same micro-batches
+    the training step is then given. Returns the DP-reduced loss per token (or None off the last stage)."""
+    args = get_args()
+    n = get_num_microbatches()
+    replay.prefetch(n)
+    for m in model:
+        m.eval()
+    rerun_state_machine = get_rerun_state_machine()
+    mode = rerun_state_machine.get_mode()
+    rerun_state_machine.set_mode(RerunMode.DISABLED)
+    timers, config.timers = config.timers, None
+    try:
+        with torch.no_grad():
+            loss_dicts = forward_backward_func(
+                forward_step_func=forward_step_func, data_iterator=replay, model=model, num_microbatches=n,
+                seq_length=args.seq_length, micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length, forward_only=True)
+    finally:
+        config.timers = timers
+        rerun_state_machine.set_mode(mode)
+        for m in model:
+            m.train()
+            # eval-mode MoE routing appends per-sequence load samples meant for inference logging
+            for mod in m.modules():
+                samples = getattr(mod, "inference_seq_expert_load_samples", None)
+                if isinstance(samples, list):
+                    samples.clear()
+    replay.rewind()
+    if not mpu.is_pipeline_last_stage(ignore_virtual=True) or not loss_dicts:
+        return None
+    val = torch.vstack([x["lm loss"].view(-1) for x in loss_dicts]).sum(dim=0)
+    torch.distributed.all_reduce(val, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    return float(val[0] / val[1].clamp(min=1))
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -3533,6 +3592,14 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            # Before the per-step diagnostics are switched on, so that the dropout-free pass records nothing.
+            clean_loss = None
+            if getattr(args, "clean_loss_interval", 0) and (iteration + 1) % args.clean_loss_interval == 0:
+                if not isinstance(train_data_iterator, _ReplayIterator):
+                    assert not isinstance(train_data_iterator, list), "--clean-loss-interval: no virtual pipeline"
+                    assert args.pipeline_model_parallel_size == 1, "--clean-loss-interval: no pipeline parallel"
+                    train_data_iterator = _ReplayIterator(train_data_iterator)
+                clean_loss = _clean_loss(forward_step_func, train_data_iterator, model, config, forward_backward_func)
             log_activation_norms = activation_norm_logging.should_log(
                 iteration + 1, args.activation_norm_log_interval
             )
@@ -3582,6 +3649,12 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            if clean_loss is not None:
+                print_rank_last(f"clean loss: iteration {iteration + 1} lm loss (no dropout) {clean_loss:.6E}")
+                if get_tensorboard_writer() is not None:
+                    get_tensorboard_writer().add_scalar("lm loss (no dropout)", clean_loss, iteration + 1)
+                if get_wandb_writer() is not None:
+                    get_wandb_writer().log({"lm loss (no dropout)": clean_loss}, iteration + 1)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
