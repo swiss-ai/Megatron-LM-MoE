@@ -55,9 +55,14 @@ def test_replay_iterator_serves_the_same_batches_twice_then_continues():
 
 
 def test_clean_loss_evaluates_the_training_batches_in_eval_mode(monkeypatch):
-    """_clean_loss puts the model in eval mode for one forward-only pass over the prefetched micro-batches,
-    restores train mode and the rerun mode, clears eval-only routing samples, rewinds the batches for the
-    training step and returns sum(loss) / sum(tokens)."""
+    """_clean_loss puts the model in eval mode for one forward-only pass over the next micro-batches, restores
+    train mode and the rerun mode, clears eval-only routing samples and returns sum(loss) / sum(tokens).
+    Uses the real RerunDataIterator and rerun state machine: afterwards the training step is given the same
+    RerunDataIterator (the state machine rejects any other type), reads the same micro-batches again, buffers
+    them once, and a rerun of the step replays them."""
+    from megatron.core.rerun_state_machine import (
+        RerunDataIterator, RerunMode, RerunStateMachine, get_rerun_state_machine)
+
     seen = {}
 
     class _Router(torch.nn.Module):
@@ -66,32 +71,40 @@ def test_clean_loss_evaluates_the_training_batches_in_eval_mode(monkeypatch):
             self.inference_seq_expert_load_samples = []
 
     model = torch.nn.Sequential(torch.nn.Dropout(0.5), _Router())
+    rsm = get_rerun_state_machine()
+    rsm.set_mode(RerunMode.VALIDATE_RESULTS)
 
     def fake_fb(forward_step_func, data_iterator, model, num_microbatches, forward_only, **kw):
         seen["training"] = [m.training for m in model]
         seen["forward_only"] = forward_only
+        seen["mode"] = rsm.get_mode()
         seen["batches"] = [next(data_iterator) for _ in range(num_microbatches)]
         model[0][1].inference_seq_expert_load_samples.append(torch.ones(3))
         return [{"lm loss": torch.tensor([6.0, 3.0])}, {"lm loss": torch.tensor([2.0, 1.0])}]
 
-    class _RSM:
-        mode = "validate"
-        def get_mode(self): return self.mode
-        def set_mode(self, m): self.mode = m
-    rsm = _RSM()
-    monkeypatch.setattr(training_module, "get_rerun_state_machine", lambda: rsm)
     monkeypatch.setattr(training_module, "get_num_microbatches", lambda: 2)
     monkeypatch.setattr(training_module, "get_args", lambda: SimpleNamespace(seq_length=8, micro_batch_size=1, decoder_seq_length=None))
     monkeypatch.setattr(training_module.mpu, "is_pipeline_last_stage", lambda ignore_virtual=True: True)
     monkeypatch.setattr(training_module.mpu, "get_data_parallel_group", lambda with_context_parallel=True: None)
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, group=None: t)
-    replay = training_module._ReplayIterator(iter(["b0", "b1", "b2"]))
+    data = RerunDataIterator(iter([{"b": i} for i in range(6)]))
     config = SimpleNamespace(timers="T")
-
-    loss = training_module._clean_loss(None, replay, [model], config, fake_fb)
-
-    assert loss == pytest.approx(8.0 / 4.0)
-    assert seen["training"] == [False] and seen["forward_only"] and seen["batches"] == ["b0", "b1"]
-    assert model.training and rsm.mode == "validate" and config.timers == "T"
-    assert model[1].inference_seq_expert_load_samples == []
-    assert [next(replay), next(replay), next(replay)] == ["b0", "b1", "b2"]
+    try:
+        for step in range(2):          # two consecutive clean-loss steps reuse the same replay queue
+            loss = training_module._clean_loss(None, data, [model], config, fake_fb)
+            assert loss == pytest.approx(8.0 / 4.0)
+            assert seen["training"] == [False] and seen["forward_only"] and seen["mode"] == RerunMode.DISABLED
+            assert seen["batches"] == [{"b": 2 * step}, {"b": 2 * step + 1}]
+            assert model.training and rsm.get_mode() == RerunMode.VALIDATE_RESULTS and config.timers == "T"
+            assert model[1].inference_seq_expert_load_samples == []
+            assert isinstance(data, RerunDataIterator) and data.saved_microbatches == [] and not data.replaying
+            # what train_step does with the iterator: the type check, the fetch, a rerun, the advance
+            assert RerunStateMachine._sanitize_data_iterators(rsm, data) == [data]
+            assert [next(data), next(data)] == seen["batches"]
+            assert data.saved_microbatches == seen["batches"]
+            data.rewind()
+            assert [next(data), next(data)] == seen["batches"]
+            data.advance()
+        assert next(data) == {"b": 4}  # a step without the clean pass continues with the next batch
+    finally:
+        rsm.set_mode(RerunMode.DISABLED)

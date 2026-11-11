@@ -1975,8 +1975,10 @@ def _pipeline_shape_args(args):
 
 
 class _ReplayIterator:
-    """Wraps the training data iterator so that one step's micro-batches can be fetched ahead and served
-    twice (--clean-loss-interval): once to a dropout-free forward pass, then to the training step."""
+    """Wraps the iterator a RerunDataIterator reads from so that one step's micro-batches can be fetched
+    ahead and served twice (--clean-loss-interval): once to a dropout-free forward pass, then to the
+    training step. The rerun mode is DISABLED during the first pass, so the RerunDataIterator buffers
+    the micro-batches only once, in the training step."""
 
     def __init__(self, it):
         self.it = it
@@ -1997,11 +1999,17 @@ class _ReplayIterator:
         self.queue = list(self.buf)
 
 
-def _clean_loss(forward_step_func, replay, model, config, forward_backward_func):
+def _clean_loss(forward_step_func, data_iterator, model, config, forward_backward_func):
     """lm loss of the next global batch with the model in eval mode (no dropout), on the same micro-batches
     the training step is then given. Returns the DP-reduced loss per token (or None off the last stage)."""
     args = get_args()
     n = get_num_microbatches()
+    # The training step needs the RerunDataIterator itself (the rerun state machine checks its type), so
+    # the replay queue goes underneath it, around the iterator it reads from.
+    assert isinstance(data_iterator, RerunDataIterator) and not data_iterator.replaying
+    if not isinstance(data_iterator.iterable, _ReplayIterator):
+        data_iterator.iterable = _ReplayIterator(data_iterator.iterable)
+    replay = data_iterator.iterable
     replay.prefetch(n)
     for m in model:
         m.eval()
@@ -2012,7 +2020,7 @@ def _clean_loss(forward_step_func, replay, model, config, forward_backward_func)
     try:
         with torch.no_grad():
             loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func, data_iterator=replay, model=model, num_microbatches=n,
+                forward_step_func=forward_step_func, data_iterator=data_iterator, model=model, num_microbatches=n,
                 seq_length=args.seq_length, micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length, forward_only=True)
     finally:
@@ -3595,10 +3603,9 @@ def train(
             # Before the per-step diagnostics are switched on, so that the dropout-free pass records nothing.
             clean_loss = None
             if getattr(args, "clean_loss_interval", 0) and (iteration + 1) % args.clean_loss_interval == 0:
-                if not isinstance(train_data_iterator, _ReplayIterator):
-                    assert not isinstance(train_data_iterator, list), "--clean-loss-interval: no virtual pipeline"
-                    assert args.pipeline_model_parallel_size == 1, "--clean-loss-interval: no pipeline parallel"
-                    train_data_iterator = _ReplayIterator(train_data_iterator)
+                assert isinstance(train_data_iterator, RerunDataIterator), (
+                    "--clean-loss-interval: needs a single RerunDataIterator (no virtual pipeline)")
+                assert args.pipeline_model_parallel_size == 1, "--clean-loss-interval: no pipeline parallel"
                 clean_loss = _clean_loss(forward_step_func, train_data_iterator, model, config, forward_backward_func)
             log_activation_norms = activation_norm_logging.should_log(
                 iteration + 1, args.activation_norm_log_interval
