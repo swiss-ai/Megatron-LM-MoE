@@ -86,6 +86,18 @@ class LanguageModelEmbedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
+        # --embedding-norm: a norm with a learnable per-channel gain on the embedding output.
+        self.embedding_norm = None
+        if getattr(self.config, "embedding_norm", False):
+            if self.config.transformer_impl == "transformer_engine":
+                from megatron.core.extensions.transformer_engine import TENorm as _Norm
+            else:
+                from megatron.core.transformer.torch_norm import WrappedTorchNorm as _Norm
+            self.embedding_norm = _Norm(
+                config=self.config, hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
@@ -137,6 +149,10 @@ class LanguageModelEmbedding(MegatronModule):
         # fixed (non-learnable) multiplier, applied in both forward and backward.
         if self.config.scale_embeddings_by_sqrt_hidden:
             embeddings = embeddings * math.sqrt(self.config.hidden_size)
+
+        # Optional norm on the embedding output, before the residual stream (--embedding-norm).
+        if self.embedding_norm is not None:
+            embeddings = self.embedding_norm(embeddings)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
