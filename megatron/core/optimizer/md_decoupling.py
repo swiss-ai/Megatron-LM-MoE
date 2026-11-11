@@ -315,15 +315,17 @@ _FUSE_READERS = {
 }
 
 
-def _tag_fused_prenorm_readers(params: Dict[str, torch.Tensor]) -> int:
+def _tag_fused_prenorm_readers(params: Dict[str, torch.Tensor], into_col: bool = False) -> int:
     """Tag every pre-norm gamma and the matrices that read it for fuse_prenorm_col_gains.
 
     The gamma gets ``md_fuse_norm`` (a key shared by all ranks: global layer + norm name) and
     ``md_fuse_num_readers``; each reader gets the same ``md_fuse_norm`` and its index
     ``md_fuse_reader`` (readers sorted by name). A MoE pre_mlp_layernorm is fused only in a latent
     MoE (the routed experts read the latent projection, not the norm); in a plain MoE the routed
-    experts also read it and the fusion would change the function, so it is refused. Returns the
-    number of norms tagged."""
+    experts also read it and the fusion would change the function, so it is refused. With ``into_col``
+    (--md-fuse-prenorm-col-gains-mode into-col) the readers also get ``md_col_gain_direct`` (their
+    column gain is a direct, signed multiplier) and the gamma ``md_fuse_norm_frozen`` (held at 1).
+    Returns the number of norms tagged."""
     readers: Dict[str, list] = {}
     for name, param in params.items():
         m = re.match(r"(.*\.layers\.\d+\.)(.*)$", name)
@@ -344,14 +346,18 @@ def _tag_fused_prenorm_readers(params: Dict[str, torch.Tensor]) -> int:
         key = norm_name if layer is None else f"L{layer}:" + re.sub(r"^.*\.layers\.\d+\.", "", norm_name)
         norm.md_fuse_norm = key
         norm.md_fuse_num_readers = len(names)
+        if into_col:
+            norm.md_fuse_norm_frozen = True
         for k, name in enumerate(sorted(names)):
             params[name].md_fuse_norm = key
             params[name].md_fuse_reader = k
+            if into_col:
+                params[name].md_col_gain_direct = True
     return len(readers)
 
 
 @torch.no_grad()
-def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float = 0.03) -> dict:
+def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float = 0.03, mode: str = "into-norm") -> dict:
     """One-shot, function-preserving fusion of the readers' column gains into each pre-norm gamma,
     run right after the checkpoint is loaded (--md-fuse-prenorm-col-gains-iteration).
 
@@ -380,10 +386,23 @@ def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float
     each then computes the same c_bar / useless mask and transforms its own params, and the new
     values are published to the model params (main -> model copy, layer-wise all-gather). Prints a
     self-check: max relative change of W diag(gamma) on the kept columns (fp32 and bf16-rounded)
-    and of the row-sphere radii. Returns the summary dict."""
+    and of the row-sphere radii. Returns the summary dict.
+
+    mode == "into-col" folds the other way: every reader k absorbs gamma into its OWN column gain, so
+    the readers of a MoE pre-norm stay independent (no shared c_bar):
+        d_k = phi(c_k) * gamma   (stored as a direct, signed multiplier: gamma can be negative or 0)
+        W_k' = W_k diag(gamma)   (the stored effective weight; bare weight and row gains unchanged)
+        gamma' = 1, held at 1 afterwards (md_fuse_norm_frozen), its Adam moments zeroed
+    so W_k' diag(gamma') = W_k diag(gamma) exactly. Gradients of the bare weight and of the row gains
+    are unchanged, so their moments are kept; dL/dd = dL/dg / (phi'(g) gamma) maps the column-gain
+    moments (m / (phi' gamma), v / (phi' gamma)^2; zeroed where gamma == 0 or where they overflow).
+    A column with gamma exactly 0 stays 0 (its bare column is not recoverable). The printed fp32
+    self-check compares the bare columns recovered from the stored values. No revive in this mode."""
     from .distrib_optimizer import DistributedOptimizer
 
     assert revive in ("none", "mean"), revive
+    assert mode in ("into-norm", "into-col"), mode
+    assert mode == "into-norm" or revive == "none", "revive is only implemented for mode into-norm"
     wrappers = list(getattr(optimizer, "chained_optimizers", [optimizer]))
     inners = []
     for wrapper in wrappers:
@@ -454,7 +473,52 @@ def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float
 
     # 4. Transform what this rank owns.
     max_err = torch.zeros(3, dtype=torch.float64)  # fp32 function, bf16 function, row radii
-    for inner, p in _owned():
+    counts = torch.zeros(2, dtype=torch.float64)   # into-col: column gains with gamma == 0, moments restarted
+    for inner, p in (_owned() if mode == "into-col" else ()):
+        pl = plan[p.md_fuse_norm]
+        dev = p.device
+        gam = pl["gamma_old"].to(dev)
+        state = inner.state.get(p) or {}
+        if getattr(p, "md_fuse_reader", None) is None:   # the gamma: 1 from now on
+            offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
+            p.fill_(1.0 - offset)
+            for name in ("exp_avg", "exp_avg_sq"):
+                if torch.is_tensor(state.get(name)):
+                    state[name].zero_()
+            continue
+        W = p.detach().double()
+        g = state["col_gain"].double()
+        d = inner._phi(g) * gam                          # new direct column gain
+        dphi = inner._phi_prime(g)
+        jac = (dphi if torch.is_tensor(dphi) else torch.ones_like(g)) * gam
+        s = torch.where(jac != 0, 1.0 / torch.where(jac != 0, jac, torch.ones_like(jac)), torch.zeros_like(jac))
+        W_new = W * gam[None, :]
+        p_new = W_new.to(p.dtype)
+        d_new = d.to(state["col_gain"].dtype)
+        # Self-check on what is stored: the bare column the optimizer recovers at the next step
+        # (p' / d', as in _preprocess_gains; the row gains cancel) against the one it had (W / phi(c)),
+        # on the columns with gamma != 0. A column whose d underflows to 0 shows up here as error 1.
+        live = gam != 0
+        dd = d_new.double()
+        bare_old = W / inner._phi(g)[None, :]
+        bare_new = p_new.double() / torch.where(dd == 0, torch.ones_like(dd), dd)[None, :]
+        if bool(live.any()):
+            scale = bare_old[:, live].abs().max().clamp_min(1e-30)
+            max_err[0] = max(max_err[0], float((bare_new - bare_old)[:, live].abs().max() / scale))
+        bf = lambda x: x.to(torch.bfloat16).double()
+        fscale = W_new.abs().max().clamp_min(1e-30)
+        max_err[1] = max(max_err[1], float((bf(W_new) - bf(W) * bf(gam)[None, :]).abs().max() / fscale))
+        counts[0] += int((~live).sum())
+        p.copy_(p_new)
+        state["col_gain"].copy_(d_new)
+        m_new = (state["col_gain_m"].double() * s).to(state["col_gain_m"].dtype)
+        v_new = (state["col_gain_v"].double() * s ** 2).to(state["col_gain_v"].dtype)
+        # 1 / (phi' gamma)^2 can overflow the moments' dtype for a vanishing gamma: restart Adam there.
+        bad = ~(torch.isfinite(m_new) & torch.isfinite(v_new))
+        counts[1] += int(bad.sum())
+        state["col_gain_m"].copy_(m_new.masked_fill(bad, 0.0))
+        state["col_gain_v"].copy_(v_new.masked_fill(bad, 0.0))
+    for inner, p in (_owned() if mode == "into-norm" else ()):
         pl = plan[p.md_fuse_norm]
         dev = p.device
         cbar = pl["cbar"].to(dev)
@@ -528,7 +592,12 @@ def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float
         err = max_err.to(torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
         torch.distributed.all_reduce(err, op=torch.distributed.ReduceOp.MAX)
         max_err = err.cpu()
+        cnt = counts.to(err.device)
+        torch.distributed.all_reduce(cnt)
+        counts = cnt.cpu()
     summary = {
+        "zero_gamma_col_gains": int(counts[0]),
+        "restarted_col_gain_moments": int(counts[1]),
         "norms": len(plan),
         "readers": sum(len(m["col"]) for m in merged.values()),
         "revived": {key: int(pl["useless"].sum()) for key, pl in plan.items() if pl["useless"] is not None},
@@ -537,11 +606,15 @@ def fuse_prenorm_col_gains(optimizer, revive: str = "none", rel_threshold: float
         "max_rel_radius_change": float(max_err[2]),
     }
     if _global_rank() == 0:
-        print(f"[fuse_prenorm_col_gains] {summary['norms']} pre-norms, {summary['readers']} readers fused; "
+        print(f"[fuse_prenorm_col_gains] mode {mode}: {summary['norms']} pre-norms, {summary['readers']} readers fused; "
               f"max rel change of W diag(gamma): fp32 {summary['max_rel_change_fp32']:.3e}, "
               f"bf16 {summary['max_rel_change_bf16']:.3e}; row radii {summary['max_rel_radius_change']:.3e}",
               flush=True)
-        for key, pl in plan.items():
+        if mode == "into-col":
+            print(f"[fuse_prenorm_col_gains]   column gains with gamma == 0 (stay 0): "
+                  f"{summary['zero_gamma_col_gains']}; Adam moments restarted (overflow): "
+                  f"{summary['restarted_col_gain_moments']}", flush=True)
+        for key, pl in (plan.items() if mode == "into-norm" else ()):
             n_rev = "" if pl["useless"] is None else f", revived {int(pl['useless'].sum())}/{pl['useless'].numel()}"
             print(f"[fuse_prenorm_col_gains]   {key}: c_bar median {float(pl['cbar'].median()):.4g} "
                   f"[{float(pl['cbar'].min()):.3g}, {float(pl['cbar'].max()):.3g}]{n_rev}", flush=True)
@@ -1964,7 +2037,8 @@ class MDDecoupling(_MDDecouplingBase):
         # raw gains (no-op overhead).
         flat_eff = self._phi(flat) if flat is not None else None
         row_eff = self._phi(row) if row is not None else None
-        col_eff = self._phi(col) if col is not None else None
+        col_direct = col is not None and getattr(p, "md_col_gain_direct", False)
+        col_eff = (col if col_direct else self._phi(col)) if col is not None else None
 
         # Undo gains to recover bare normalized weight. The clamp_min floors the divisor; under
         # --gains-no-clamp-min we skip it so the divide is the exact inverse of _apply_gains'
@@ -1975,7 +2049,14 @@ class MDDecoupling(_MDDecouplingBase):
         if row_eff is not None:
             p.div_(row_eff[layout["row_bk"]].clamp_min(eps) if clamp else row_eff[layout["row_bk"]])
         if col_eff is not None:
-            p.div_(col_eff[layout["col_bk"]].clamp_min(eps) if clamp else col_eff[layout["col_bk"]])
+            if col_direct:
+                # Signed direct column gain (pre-norm gamma folded in, --md-fuse-prenorm-col-gains-mode
+                # into-col): exact inverse of _apply_gains for every nonzero entry; a column with
+                # gain exactly 0 is 0 in p and stays 0 (divide by 1).
+                cd = col_eff[layout["col_bk"]]
+                p.div_(torch.where(cd == 0, torch.ones_like(cd), cd))
+            else:
+                p.div_(col_eff[layout["col_bk"]].clamp_min(eps) if clamp else col_eff[layout["col_bk"]])
 
         # Compute ∂L/∂phi(g) from bare p and the gain-baked grad still on p.grad.
         # Reduction dims shift up by one for 3D experts (in-axis dim 2, out-axis dim 1)
@@ -2013,6 +2094,8 @@ class MDDecoupling(_MDDecouplingBase):
         # the scalar 1.0; skip the multiply.
         if self.gain_parametrization != "direct":
             for name in gain_grads:
+                if name == "col_gain" and col_direct:
+                    continue  # direct multiplier: phi' = 1
                 gain_grads[name] = gain_grads[name] * self._phi_prime(state[name])
 
         # Rescale p.grad so the base step sees ∂L/∂(bare p).
@@ -2078,6 +2161,7 @@ class MDDecoupling(_MDDecouplingBase):
             pull.update(row_gain=rowcol_coeff, col_gain=rowcol_coeff, flat_gain=rowcol_coeff)
         if pull:
             t = float(self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=torch.float64)))
+        col_direct = getattr(p, "md_col_gain_direct", False)
         frozen_col = self.fused_col_gains_frozen and getattr(p, "md_fuse_norm", None) is not None
         for name, grad in gain_grads.items():
             if frozen_col and name == "col_gain":
@@ -2086,14 +2170,16 @@ class MDDecoupling(_MDDecouplingBase):
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
             name_wd, name_target = wd, 0.0
+            direct = self.gain_parametrization == "direct" or (name == "col_gain" and col_direct)
             coeff = pull.get(name)
             if coeff:
-                name_wd, name_target = wd + coeff, coeff * t / (wd + coeff)
+                t_name = self.attention_in_gain_pull_target if direct else t
+                name_wd, name_target = wd + coeff, coeff * t_name / (wd + coeff)
             _fused_gain_adam(
                 gain, m, v, grad,
                 self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
                 beta1, beta2, eps, name_wd, name_target,
-                name_target != 0.0 and self.gain_parametrization == "direct",
+                name_target != 0.0 and direct,
             )
 
     def _gains_lr(self, group) -> float:
@@ -2122,7 +2208,7 @@ class MDDecoupling(_MDDecouplingBase):
         if row is not None:
             p.mul_(self._phi(row)[lay["row_bk"]])
         if col is not None:
-            p.mul_(self._phi(col)[lay["col_bk"]])
+            p.mul_((col if getattr(p, "md_col_gain_direct", False) else self._phi(col))[lay["col_bk"]])
 
     def _resolve_gains_mode(self, p):
         if self.hypersphere_gains_mode is None:
@@ -2571,7 +2657,8 @@ def get_megatron_mddecoupling_optimizer(
                 if param.requires_grad and pulled:
                     param.md_rowcol_gain_pull_coeff = float(config.md_rowcol_gain_pull_coeff)
         if config.md_fuse_prenorm_col_gains_iteration is not None:
-            _tag_fused_prenorm_readers(dict(model_chunk.named_parameters()))
+            _tag_fused_prenorm_readers(dict(model_chunk.named_parameters()),
+                                       into_col=config.md_fuse_prenorm_col_gains_mode == "into-col")
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
     hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
@@ -2662,7 +2749,8 @@ def get_megatron_mddecoupling_optimizer(
         attention_in_gain_pull_coeff=config.md_attention_in_gain_pull_coeff,
         attention_in_gain_pull_target=config.md_attention_in_gain_pull_target,
         attention_in_gain_pull_col_gain=config.md_attention_in_gain_pull_col_gain,
-        fused_col_gains_frozen=config.md_fuse_prenorm_col_gains_iteration is not None,
+        fused_col_gains_frozen=(config.md_fuse_prenorm_col_gains_iteration is not None
+                                and config.md_fuse_prenorm_col_gains_mode == "into-norm"),
     )
 
     optimizers = []

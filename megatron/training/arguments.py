@@ -1656,6 +1656,8 @@ def validate_args(args, defaults={}):
             assert args.use_layer_wise_distributed_optimizer or not args.use_distributed_optimizer, (
                 "--md-fuse-prenorm-col-gains-iteration needs whole parameters per rank "
                 "(--use-layer-wise-distributed-optimizer or no distributed optimizer).")
+        assert args.md_fuse_prenorm_col_gains_mode == "into-norm" or args.md_fuse_revive == "none", (
+            "--md-fuse-revive is only implemented for --md-fuse-prenorm-col-gains-mode into-norm.")
         assert args.md_fuse_revive == "none" or args.md_fuse_prenorm_col_gains_iteration is not None, (
             "--md-fuse-revive needs --md-fuse-prenorm-col-gains-iteration.")
         assert args.md_post_norm_gain_pull_coeff >= 0, (
@@ -3246,6 +3248,12 @@ def _add_training_args(parser):
                        'unchanged; the optimizer state is mapped with the same reparametrization. '
                        'When set, those column gains stay frozen at 1 (no update, no pull) at every '
                        'later step and resume. Needs --hypersphere-gains-mode rowcol.')
+    group.add_argument('--md-fuse-prenorm-col-gains-mode', type=str, default='into-norm',
+                       choices=['into-norm', 'into-col'],
+                       help='Direction of --md-fuse-prenorm-col-gains-iteration. into-norm: the readers\' '
+                       'column gains are folded into the pre-norm gamma and frozen at 1. into-col: the '
+                       'gamma is folded into each reader\'s own column gain (a direct, signed multiplier '
+                       'from then on) and held at 1, so the readers of one norm stay independent.')
     group.add_argument('--md-fuse-revive', type=str, default='none', choices=['none', 'mean'],
                        help='With --md-fuse-prenorm-col-gains-iteration: also revive the useless input '
                        'channels of the fused pre-norms at the same load (mean: gamma entry = mean of '

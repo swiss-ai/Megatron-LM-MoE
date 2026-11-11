@@ -116,6 +116,8 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'md_fuse_norm',
     'md_fuse_reader',
     'md_fuse_num_readers',
+    'md_fuse_norm_frozen',
+    'md_col_gain_direct',
     'is_embedding_or_output_parameter',
     'is_embedding_parameter',
     'is_md_embedding_parameter',
@@ -134,6 +136,10 @@ def _decay_to_target(torch_optimizer: torch.optim.Optimizer) -> None:
     optimizer step, before the main -> model copy. No-op for untagged params (the default)."""
     for group in torch_optimizer.param_groups:
         for p in group["params"]:
+            if getattr(p, "md_fuse_norm_frozen", False):
+                # pre-norm gamma folded into its readers' column gains: held at 1, never pulled
+                p.fill_(1.0 - float(getattr(p, "md_layernorm_gain_offset", 0.0)))
+                continue
             spec = getattr(p, "md_decay_to_target", None)
             if spec is not None:
                 coeff, target, offset = spec

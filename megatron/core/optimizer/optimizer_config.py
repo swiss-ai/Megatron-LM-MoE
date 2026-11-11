@@ -532,6 +532,12 @@ class OptimizerConfig:
     is set to 1. The network function is unchanged. When set, those column gains stay frozen at 1
     (no update, no pull) at every later step and resume. None disables."""
 
+    md_fuse_prenorm_col_gains_mode: str = "into-norm"
+    """Direction of the one-shot fusion. "into-norm": the readers' column gains are folded into the
+    pre-norm gamma (shared by every reader of that norm) and frozen at 1. "into-col": the gamma is
+    folded into each reader's own column gain, which becomes a direct (signed) multiplier, and the
+    gamma is held at 1; the readers of a MoE pre-norm keep independent per-channel gains."""
+
     md_fuse_revive: str = "none"
     """With md_fuse_prenorm_col_gains_iteration: also revive the useless input channels of every
     fused pre-norm at the same load: "none" or "mean" (the gamma entry is set to the mean of the

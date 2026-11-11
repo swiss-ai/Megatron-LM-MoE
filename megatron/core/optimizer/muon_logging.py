@@ -473,7 +473,8 @@ def _accumulate_md_matrix_stats(
                 # Matrix-level gain statistics are based on effective gains phi(raw_gain). Store
                 # their squared sum for effective RMS and, for softplus, their log sum for gauge
                 # metrics. TP combines these sufficient statistics before either value is formed.
-                if md_optimizer.gain_parametrization == "softplus":
+                if md_optimizer.gain_parametrization == "softplus" and not (
+                        axis == "col" and getattr(param, "md_col_gain_direct", False)):
                     gain_stats = (
                         _compiled_softplus_matrix_gain_stats
                         if raw_gain.is_cuda
@@ -820,7 +821,8 @@ def _collect_muon_stats(
                         raw_gain,
                         bucket,
                         layer_scope,
-                        md_optimizer.gain_parametrization == "softplus",
+                        md_optimizer.gain_parametrization == "softplus"
+                        and not (axis == "col" and getattr(param, "md_col_gain_direct", False)),
                     )
                 )
     # LayerNorm scales are direct 1D gains owned by the chained Adam optimizer. Add one for

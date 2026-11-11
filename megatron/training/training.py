@@ -1916,9 +1916,15 @@ def setup_model_and_optimizer(
         # One-shot column-gain fusion, tied to one checkpoint like the revive above; the fused column
         # gains stay frozen at 1 afterwards (MDDecoupling.fused_col_gains_frozen).
         fuse = args.iteration == args.md_fuse_prenorm_col_gains_iteration
+        # Loading an earlier (unfused) checkpoint with the flag set would freeze / reparametrize gains
+        # that were never fused and silently change the model.
+        assert args.iteration >= args.md_fuse_prenorm_col_gains_iteration, (
+            f"loaded iteration {args.iteration} is before --md-fuse-prenorm-col-gains-iteration "
+            f"{args.md_fuse_prenorm_col_gains_iteration}: the fusion would never run")
         if fuse:
             from megatron.core.optimizer.md_decoupling import fuse_prenorm_col_gains
-            fuse_prenorm_col_gains(optimizer, args.md_fuse_revive, args.md_fuse_revive_threshold)
+            fuse_prenorm_col_gains(optimizer, args.md_fuse_revive, args.md_fuse_revive_threshold,
+                                   args.md_fuse_prenorm_col_gains_mode)
         print_rank_0(
             f'pre-norm column-gain fusion: loaded iteration {args.iteration}, fusion iteration '
             f'{args.md_fuse_prenorm_col_gains_iteration} -> '
