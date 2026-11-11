@@ -2029,7 +2029,17 @@ def _mddecoupling_config_overrides(
     # get_megatron_mddecoupling_optimizer), so no MDDecoupling override is needed here.
     hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
     if hypersphere_embedding_mode is not None:
-        overrides[ParamKey(attr='is_embedding_or_output_parameter')] = {
+        emb_key = ParamKey(attr='is_embedding_or_output_parameter')
+        if config.md_input_embedding_external:
+            # The word embedding is in the chained Adam (--md-input-embedding-external): an override
+            # there would split it into a second Adam group with the same identity keys, which the
+            # checkpoint loader cannot match on resume.
+            emb_key = ParamKey(predicate=ParamPredicate(
+                name="md_embedding_or_output_in_md",
+                fn=lambda p: (getattr(p, "is_embedding_or_output_parameter", False)
+                              and not getattr(p, "is_md_embedding_parameter", False)),
+            ))
+        overrides[emb_key] = {
             'use_orthogonal_updates': False
         }
 
@@ -2329,9 +2339,14 @@ def get_megatron_mddecoupling_optimizer(
                 continue
             is_emb = getattr(param, 'is_embedding_or_output_parameter', False)
             is_merged_offload_expert = getattr(param, 'merged_offload_expert', False)
+            # --md-input-embedding-external: the word embedding (and a head tied to it) leaves
+            # MDDecoupling for the chained Adam, whatever the embedding hypersphere mode is.
+            input_emb_external = (config.md_input_embedding_external
+                                  and getattr(param, 'is_md_embedding_parameter', False))
             if (
                 len(param.shape) == 2
                 and (not is_emb or emb_in_md)
+                and not input_emb_external
                 and not getattr(param, 'is_kda_decay_parameter', False)
             ):
                 linear_params.append(param)

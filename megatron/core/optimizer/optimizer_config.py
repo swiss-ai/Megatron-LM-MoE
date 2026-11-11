@@ -513,6 +513,11 @@ class OptimizerConfig:
     gain. MoE matrices are not touched unless md_gain_pull_scope says so. Pull only, no revive.
     0 disables."""
 
+    md_input_embedding_external: bool = False
+    """Route the input (word) embedding to the chained Adam optimizer instead of MDDecoupling: plain
+    Adam at the base lr, no hypersphere projection, so every token row is free to change its norm.
+    The LM head keeps its hypersphere_embedding_mode (a tied head follows the embedding)."""
+
     md_gain_pull_scope: str = "default"
     """Which gains the three pull coefficients reach (the revive scope does not change):
     "default": as documented on each coefficient.

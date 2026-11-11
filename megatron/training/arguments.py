@@ -3215,6 +3215,10 @@ def _add_training_args(parser):
                        'column, or flat). Overrides --md-attention-in-gain-pull-col-gain on the '
                        'column gain. MoE matrices are not touched unless --md-gain-pull-scope says '
                        'so. Pull only, no revive. 0 disables.')
+    group.add_argument('--md-input-embedding-external', action='store_true', default=False,
+                       help='md_decoupling: train the input (word) embedding with the chained Adam '
+                       'optimizer (base lr, no hypersphere projection) instead of MDDecoupling. The '
+                       'LM head keeps --hypersphere-embedding-mode.')
     group.add_argument('--md-gain-pull-scope', type=str, default='default',
                        choices=['default', 'moe-latent', 'all'],
                        help='Which gains the pull coefficients reach. default: as in the help of '
