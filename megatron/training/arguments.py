@@ -3215,6 +3215,11 @@ def _add_training_args(parser):
                        'column, or flat). Overrides --md-attention-in-gain-pull-col-gain on the '
                        'column gain. MoE matrices are not touched unless --md-gain-pull-scope says '
                        'so. Pull only, no revive. 0 disables.')
+    group.add_argument('--residual-gate-convert-iteration', type=int, default=None,
+                       help='With --residual-gate: when the loaded checkpoint is at this iteration, '
+                       'convert it from the plain residual (function-preserving): the residual gates '
+                       'and pre-affines are set from the sandwich post-norm gains. Later resumes '
+                       'load them from their own checkpoints.')
     group.add_argument('--md-gain-pull-scope', type=str, default='default',
                        choices=['default', 'moe-latent', 'all'],
                        help='Which gains the pull coefficients reach. default: as in the help of '

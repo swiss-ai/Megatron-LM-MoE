@@ -457,6 +457,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.residual_output_scaling and not self.keel:
             self.residual_output_scale = 1.0 / math.sqrt(2 * self.config.num_layers)
 
+        # --residual-gate: x <- sqrt(1 - beta^2) x + beta PostNorm(f(PreNorm(lambda x))) per sublayer.
+        # The gate replaces both the post-norm gain (frozen; it only keeps a sign) and the fixed
+        # residual scale; residual_gate_plain_scale remembers that scale for the one-shot conversion
+        # of a plain-residual checkpoint (convert_to_residual_gates).
+        self.residual_gate = bool(getattr(self.config, "residual_gate", False))
+        if self.residual_gate:
+            from megatron.core.transformer.residual_gate import PreAffine, ResidualGate
+
+            assert not self.keel, "--residual-gate is not compatible with KEEL"
+            assert not self.config.layernorm_zero_centered_gamma, "--residual-gate: no zero-centered gamma"
+            assert not self.config.inference_fuse_tp_communication, "--residual-gate: no fused TP inference"
+            assert self.hidden_dropout == 0, "--residual-gate does not support hidden dropout"
+            for norm in (self.post_self_attn_layernorm, self.post_mlp_layernorm):
+                assert not isinstance(norm, IdentityOp) and hasattr(norm, "weight"), (
+                    "--residual-gate needs sandwich post-norms (--sandwich-norm)")
+                norm.weight.requires_grad_(False)
+            temperature = self.config.residual_gate_temperature
+            self.attn_pre_affine = PreAffine(self.config.hidden_size)
+            self.mlp_pre_affine = PreAffine(self.config.hidden_size)
+            self.post_attn_residual_gate = ResidualGate(self.config.hidden_size, temperature)
+            self.post_mlp_residual_gate = ResidualGate(self.config.hidden_size, temperature)
+            self.residual_gate_plain_scale = (
+                1.0 if self.residual_output_scale is None else self.residual_output_scale
+            )
+            self.residual_output_scale = None
+
         # Optionally zero-init the post-attention sandwich-norm gain so the attention sublayer
         # contributes nothing at init (x = x + 0 * Norm(Attn(Norm(x))) = x); the network then starts
         # as a pure stack of MLP/MoE blocks, which can help the MoE router settle. Only the
@@ -714,6 +740,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
+            assert not self.residual_gate, "--residual-gate does not support norm recompute"
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -721,7 +748,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+                input_layernorm_output = apply_module(self.input_layernorm)(
+                    self.attn_pre_affine(hidden_states) if self.residual_gate else hidden_states
+                )
 
         if isinstance(input_layernorm_output, tuple):
             if len(input_layernorm_output) != 2:
@@ -796,10 +825,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # self attention module.
             hidden_states = attention_output_with_bias[0]
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
-                )
+            if self.residual_gate:
+                assert attention_output_with_bias[1] is None
+                hidden_states = self.post_attn_residual_gate(residual, attention_output_with_bias[0])
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(
+                        self.training, self.config.bias_dropout_fusion
+                    )(attention_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -872,6 +905,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         if self.recompute_pre_mlp_layernorm:
+            assert not self.residual_gate, "--residual-gate does not support norm recompute"
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -879,7 +913,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(
+                    self.mlp_pre_affine(hidden_states) if self.residual_gate else hidden_states
+                )
 
         return pre_mlp_layernorm_output
 
@@ -1053,10 +1089,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
-                )
+            if self.residual_gate:
+                assert mlp_output_with_bias[1] is None
+                hidden_states = self.post_mlp_residual_gate(residual, mlp_output_with_bias[0])
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                        mlp_output_with_bias, residual, self.hidden_dropout
+                    )
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.

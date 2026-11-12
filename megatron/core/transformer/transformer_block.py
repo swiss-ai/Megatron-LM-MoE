@@ -381,6 +381,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+        # --residual-gate: the final norm also reads the stream through a per-channel pre-affine.
+        self.final_pre_affine = None
+        if getattr(self.config, "residual_gate", False) and self.final_layernorm is not None:
+            from megatron.core.transformer.residual_gate import PreAffine
+
+            self.final_pre_affine = PreAffine(self.config.hidden_size)
+
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
 
@@ -868,6 +875,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
+            if self.final_pre_affine is not None:
+                hidden_states = self.final_pre_affine(cast(Tensor, hidden_states))
             hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is

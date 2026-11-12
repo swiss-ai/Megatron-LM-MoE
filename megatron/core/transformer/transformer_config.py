@@ -164,6 +164,15 @@ class TransformerConfig(ModelParallelConfig):
     """Apply a norm (config.normalization, with a learnable per-channel gain) to the embedding
     output, after the sqrt(hidden) scale and before it enters the residual stream."""
 
+    residual_gate: bool = False
+    """Gated residual stream: every sublayer updates x <- sqrt(1 - beta^2) x + beta h with a
+    per-channel beta = sigmoid(gate / residual_gate_temperature) and h the sandwich post-norm output
+    (its gain frozen), and a per-channel pre-affine scales the stream before every norm that reads
+    it. Needs sandwich norms. See megatron/core/transformer/residual_gate.py."""
+
+    residual_gate_temperature: float = 0.3
+    """Temperature of the residual gates (beta = sigmoid(gate / temperature))."""
+
     attention_dropout: float = 0.1
     """Post attention dropout probability."""
 

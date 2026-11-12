@@ -1872,6 +1872,22 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
+
+        if getattr(args, 'residual_gate_convert_iteration', None) is not None:
+            # One-shot switch of a plain-residual checkpoint to the gated residual (--residual-gate),
+            # tied to one checkpoint; later resumes load the gates from their own checkpoints.
+            assert args.iteration >= args.residual_gate_convert_iteration, (
+                f"loaded iteration {args.iteration} is before --residual-gate-convert-iteration "
+                f"{args.residual_gate_convert_iteration}: the gates would never be set")
+            if args.iteration == args.residual_gate_convert_iteration:
+                from megatron.core.transformer.residual_gate import convert_to_residual_gates
+
+                summary = convert_to_residual_gates(model)
+                print_rank_0(f'residual-gate conversion at iteration {args.iteration}: {summary}')
+            else:
+                print_rank_0(
+                    f'residual-gate conversion: loaded iteration {args.iteration} > '
+                    f'{args.residual_gate_convert_iteration}, gates come from the checkpoint')
         one_logger and one_logger.log_metrics(
             {
                 'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
