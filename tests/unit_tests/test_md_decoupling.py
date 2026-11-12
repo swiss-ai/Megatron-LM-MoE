@@ -3358,3 +3358,16 @@ def test_builder_gain_pull_scope_all_merged_experts_and_non_gamma_1d(monkeypatch
         else:
             assert not hasattr(p, "md_rowcol_gain_pull_coeff"), name
             assert not hasattr(p, "md_decay_to_target"), name
+
+
+def test_builder_gain_pull_scope_all_skips_embedding_norm(monkeypatch):
+    """Scope "all" pulls every norm gamma except the --embedding-norm gain, which stays free to set
+    the embedding's size; the other gammas keep their pull."""
+    extra = {"module.embedding.embedding_norm.weight": torch.nn.Parameter(torch.ones(4))}
+    params = _tag_rowcol_pull_params(monkeypatch, True, extra=extra,
+                                     **dict(_GAIN_PULL_COEFFS, md_gain_pull_scope="all"))
+    emb = params["module.embedding.embedding_norm.weight"]
+    assert emb.md_gain_log_family == "layernorm"
+    assert not hasattr(emb, "md_decay_to_target")
+    assert not hasattr(emb, "md_rowcol_gain_pull_coeff")
+    assert sum(hasattr(p, "md_decay_to_target") for p in params.values()) == len(_ROWCOL_PULL_GAMMAS)

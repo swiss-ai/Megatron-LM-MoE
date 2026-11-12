@@ -2281,12 +2281,14 @@ def get_megatron_mddecoupling_optimizer(
             # md_attention_in_gain_pull_coeff, the sandwich-norm output gammas
             # (post_self_attn_layernorm, post_mlp_layernorm) md_post_norm_gain_pull_coeff;
             # both share md_attention_in_gain_pull_target. Scope "all" gives every other norm
-            # gamma the pre-norm coefficient.
+            # gamma the pre-norm coefficient, except the --embedding-norm gain, which is left free
+            # to set the size of the embedding in the residual stream.
             if getattr(param, "md_revived_pre_norm_gain", False):
                 pull_coeff = config.md_attention_in_gain_pull_coeff
             elif _is_sandwich_post_norm_gain(name, param):
                 pull_coeff = config.md_post_norm_gain_pull_coeff
-            elif config.md_gain_pull_scope == "all" and param.md_gain_log_family == "layernorm":
+            elif (config.md_gain_pull_scope == "all" and param.md_gain_log_family == "layernorm"
+                  and not name.endswith("embedding_norm.weight")):
                 pull_coeff = config.md_attention_in_gain_pull_coeff
             else:
                 pull_coeff = 0.0
