@@ -948,6 +948,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
             logger.info('***WARNING*** loading optimizer from an old checkpoint ...')
+        # A non-strict load drops the state of parameters the checkpoint does not have; when every
+        # parameter of this optimizer is new, the whole 'state' entry is gone.
+        state_dict[optimizer_key].setdefault('state', {})
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
@@ -1001,6 +1004,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             source_group = saved_group if len(saved_group) == len(current_group) else model_group
             for current_param, saved_param in zip(current_group, source_group):
                 current_param.data.copy_(saved_param.data)
+            if source_group is model_group and current_group:
+                # A non-strict load of a checkpoint that lacks some of this group's parameters: the
+                # whole group's fp32 master params restart from the (bf16) model params.
+                logger.warning(
+                    f'fp32 master params of a param group of {len(current_group)} copied from the model '
+                    f'params (saved group has {len(saved_group)})'
+                )
 
 
 class FP32Optimizer(MegatronOptimizer):
