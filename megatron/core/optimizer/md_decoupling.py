@@ -631,19 +631,19 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                                         is_merged_offload_expert=is_merged_offload_expert)
 
     def load_state_dict(self, state_dict):
-        """Load optimizer state, keeping this run's per-group LR bounds.
+        """Load optimizer state, keeping this run's per-group LR bounds and Muon momentum.
 
-        Param groups (including max_lr / min_lr) are saved in the checkpoint, and
+        Param groups (including max_lr / min_lr / momentum_beta) are saved in the checkpoint, and
         torch.optim.Optimizer.load_state_dict restores the saved values, so a changed
-        --matrix-lr / --router-lr / --output-lr on resume would be silently ignored. The
-        scheduler recomputes group['lr'] from max_lr / min_lr every step, so restoring the
-        configured bounds after the load is enough. Groups are matched by position, which is
-        how torch pairs saved and current groups.
+        --matrix-lr / --router-lr / --output-lr / --muon-momentum on resume would be silently
+        ignored. The scheduler recomputes group['lr'] from max_lr / min_lr every step and the
+        step reads group['momentum_beta'], so restoring the configured values after the load is
+        enough. Groups are matched by position, which is how torch pairs saved and current groups.
         """
-        configured = [(g.get('max_lr'), g.get('min_lr')) for g in self.param_groups]
+        configured = [(g.get('max_lr'), g.get('min_lr'), g.get('momentum_beta')) for g in self.param_groups]
         super().load_state_dict(state_dict)
-        for i, (group, (max_lr, min_lr)) in enumerate(zip(self.param_groups, configured)):
-            for key, value in (('max_lr', max_lr), ('min_lr', min_lr)):
+        for i, (group, (max_lr, min_lr, momentum_beta)) in enumerate(zip(self.param_groups, configured)):
+            for key, value in (('max_lr', max_lr), ('min_lr', min_lr), ('momentum_beta', momentum_beta)):
                 if value is None:
                     continue
                 if group.get(key) != value:
