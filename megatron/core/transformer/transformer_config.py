@@ -160,6 +160,10 @@ class TransformerConfig(ModelParallelConfig):
     hidden_dropout: float = 0.1
     """Dropout probability for transformer hidden state."""
 
+    embedding_norm: bool = False
+    """Apply a norm (config.normalization, with a learnable per-channel gain) to the embedding
+    output, after the sqrt(hidden) scale and before it enters the residual stream."""
+
     attention_dropout: float = 0.1
     """Post attention dropout probability."""
 

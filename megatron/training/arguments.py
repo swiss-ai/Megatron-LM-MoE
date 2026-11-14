@@ -1599,6 +1599,11 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
+    # --embedding-norm: with MTP on a later pipeline stage, that stage builds its own copy of the
+    # embedding (and of the norm), which nothing keeps in sync with the first stage's.
+    if getattr(args, 'embedding_norm', False) and args.mtp_num_layers and args.pipeline_model_parallel_size > 1:
+        raise AssertionError('--embedding-norm is not supported with --mtp-num-layers and pipeline parallelism.')
+
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
