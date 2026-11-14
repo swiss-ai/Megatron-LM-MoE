@@ -97,6 +97,13 @@ class LanguageModelEmbedding(MegatronModule):
                 config=self.config, hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            if self.config.sequence_parallel:
+                # The norm runs before the scatter in forward(). Its gradient is partial (one slice
+                # of the sequence per TP rank, summed by finalize_model_grads) only when the
+                # embeddings were already reduce-scattered; otherwise every TP rank normalizes the
+                # full sequence and its gradient is already complete.
+                for param in self.embedding_norm.parameters():
+                    setattr(param, "sequence_parallel", self.reduce_scatter_embeddings)
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
