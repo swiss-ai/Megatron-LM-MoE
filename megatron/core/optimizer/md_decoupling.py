@@ -192,21 +192,34 @@ def _is_sandwich_post_norm_gain(name: str, param: torch.Tensor) -> bool:
                                 or name.endswith(".post_mlp_layernorm.weight"))
 
 
-def _rowcol_gain_pull_norm_name(name: str, param: torch.Tensor) -> Optional[str]:
-    """Name of the norm gamma next to an MDDecoupling matrix whose row and column gains
-    md_rowcol_gain_pull_coeff pulls when that gamma is pulled, None for every other param: the gamma
-    fused into the input projection (linear_qkv, KDA/GDN in_proj, dense linear_fc1) and the
-    same layer's sandwich post-norm in front of the output projection (linear_proj, KDA/GDN
-    out_proj -> post_self_attn_layernorm; dense linear_fc2 -> post_mlp_layernorm). MoE matrices
-    have none."""
+# (matrix suffix, suffix of the same layer's standalone norm next to it) for the row/col gain pull.
+_ROWCOL_PULL_NORM_PAIRS = (
+    (".self_attention.linear_proj.weight", ".post_self_attn_layernorm.weight"),
+    (".self_attention.out_proj.weight", ".post_self_attn_layernorm.weight"),
+    (".mlp.linear_fc2.weight", ".post_mlp_layernorm.weight"),
+)
+_MOE_LATENT_PULL_NORM_PAIRS = (
+    (".mlp.fc1_latent_proj.weight", ".pre_mlp_layernorm.weight"),
+    (".mlp.fc2_latent_proj.weight", ".post_mlp_layernorm.weight"),
+)
+
+
+def _rowcol_gain_pull_norm_name(name: str, param: torch.Tensor,
+                                moe_latent: bool = False) -> Optional[str]:
+    """Name of the norm gamma next to an MDDecoupling matrix whose gains md_rowcol_gain_pull_coeff
+    pulls when that gamma is pulled, None for every other param: the gamma fused into the input
+    projection (linear_qkv, KDA/GDN in_proj, dense linear_fc1) and the same layer's sandwich
+    post-norm in front of the output projection (linear_proj, KDA/GDN out_proj ->
+    post_self_attn_layernorm; dense linear_fc2 -> post_mlp_layernorm). With ``moe_latent`` (scope
+    "moe-latent") also the MoE latent projections (fc1_latent_proj -> pre_mlp_layernorm,
+    fc2_latent_proj -> post_mlp_layernorm). Other MoE matrices have none."""
     if param.ndim != 2:
         return None
     if name.endswith((".self_attention.linear_qkv.weight", ".self_attention.in_proj.weight",
                       ".mlp.linear_fc1.weight")):
         return name[:-len("weight")] + "layer_norm_weight"
-    for suffix, norm in ((".self_attention.linear_proj.weight", ".post_self_attn_layernorm.weight"),
-                         (".self_attention.out_proj.weight", ".post_self_attn_layernorm.weight"),
-                         (".mlp.linear_fc2.weight", ".post_mlp_layernorm.weight")):
+    pairs = _ROWCOL_PULL_NORM_PAIRS + (_MOE_LATENT_PULL_NORM_PAIRS if moe_latent else ())
+    for suffix, norm in pairs:
         if name.endswith(suffix):
             return name[:-len(suffix)] + norm
     return None
@@ -1804,15 +1817,15 @@ class MDDecoupling(_MDDecouplingBase):
         # gain is the multiplier and may be negative, so it is pulled toward sign(g) * t'; under
         # "softplus" the multiplier is always positive and the raw gain is pulled toward t'.
         # Only with attention_in_gain_pull_col_gain; otherwise the plain decay toward 0.
-        # Matrices tagged md_rowcol_gain_pull_coeff pull their row and column gains the same way
-        # with that coefficient (it takes precedence for the column gain).
+        # Matrices tagged md_rowcol_gain_pull_coeff pull all their gains (row and column, or flat)
+        # the same way with that coefficient (it takes precedence for the column gain).
         pull = {}
         if (self.attention_in_gain_pull_coeff and self.attention_in_gain_pull_col_gain
                 and self._is_revived_matrix(p)):
             pull["col_gain"] = self.attention_in_gain_pull_coeff
         rowcol_coeff = getattr(p, "md_rowcol_gain_pull_coeff", 0.0)
         if rowcol_coeff:
-            pull.update(row_gain=rowcol_coeff, col_gain=rowcol_coeff)
+            pull.update(row_gain=rowcol_coeff, col_gain=rowcol_coeff, flat_gain=rowcol_coeff)
         if pull:
             t = float(self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=torch.float64)))
         for name, grad in gain_grads.items():
@@ -2267,11 +2280,14 @@ def get_megatron_mddecoupling_optimizer(
             # on the effective gain p + offset. The pre-norm gammas use
             # md_attention_in_gain_pull_coeff, the sandwich-norm output gammas
             # (post_self_attn_layernorm, post_mlp_layernorm) md_post_norm_gain_pull_coeff;
-            # both share md_attention_in_gain_pull_target.
+            # both share md_attention_in_gain_pull_target. Scope "all" gives every other norm
+            # gamma the pre-norm coefficient.
             if getattr(param, "md_revived_pre_norm_gain", False):
                 pull_coeff = config.md_attention_in_gain_pull_coeff
             elif _is_sandwich_post_norm_gain(name, param):
                 pull_coeff = config.md_post_norm_gain_pull_coeff
+            elif config.md_gain_pull_scope == "all" and param.md_gain_log_family == "layernorm":
+                pull_coeff = config.md_attention_in_gain_pull_coeff
             else:
                 pull_coeff = 0.0
             if pull_coeff:
@@ -2288,12 +2304,18 @@ def get_megatron_mddecoupling_optimizer(
                     param.md_gain_log_layer = int(layer_number) - 1
                     break
                 module_name = module_name.rpartition('.')[0]
-        # Row/col gain pull: only the matrices whose neighbouring gamma is pulled (tagged above).
+        # Row/col gain pull: the matrices whose neighbouring gamma is pulled (tagged above), or
+        # every matrix under scope "all" (a param without MDDecoupling gains ignores the tag).
         if config.md_rowcol_gain_pull_coeff:
             chunk_params = dict(model_chunk.named_parameters())
+            moe_latent = config.md_gain_pull_scope == "moe-latent"
             for name, param in chunk_params.items():
-                norm = chunk_params.get(_rowcol_gain_pull_norm_name(name, param))
-                if param.requires_grad and hasattr(norm, "md_decay_to_target"):
+                if config.md_gain_pull_scope == "all":
+                    pulled = param.ndim >= 2
+                else:
+                    norm = chunk_params.get(_rowcol_gain_pull_norm_name(name, param, moe_latent))
+                    pulled = hasattr(norm, "md_decay_to_target")
+                if param.requires_grad and pulled:
                     param.md_rowcol_gain_pull_coeff = float(config.md_rowcol_gain_pull_coeff)
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
