@@ -195,7 +195,7 @@ from megatron.core.optimizer.muon_logging import (
 )
 from megatron.core.transformer.moe import router_input_logging
 from megatron.core.transformer import activation_norm_logging
-from megatron.core.transformer import output_logit_logging
+from megatron.core.transformer import output_logit_logging, topk_logit_saving
 from megatron.core.optimizer.router_update_logging import (
     collect_router_update_stats,
     pop_router_update_stats,
@@ -1991,6 +1991,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         nan_debug_new_step(iteration + 1, model)
         activation_norm_logging.reset_attempt()
         output_logit_logging.reset_attempt()
+        topk_logit_saving.reset_attempt()
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2051,6 +2052,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             diagnostic_forward_step = activation_norm_logging.wrap_forward_step(diagnostic_forward_step)
         if output_logit_logging.is_active():
             diagnostic_forward_step = output_logit_logging.wrap_forward_step(diagnostic_forward_step)
+        if topk_logit_saving.is_active():
+            diagnostic_forward_step = topk_logit_saving.wrap_forward_step(diagnostic_forward_step)
         losses_reduced = forward_backward_func(
             forward_step_func=diagnostic_forward_step,
             data_iterator=data_iterator,
@@ -3563,6 +3566,35 @@ def train(
                     args._output_logit_unsupported_warned = True
                 log_output_logits = False
             output_logit_logging.set_active(log_output_logits)
+            save_topk_logits = False
+            if args.save_topk_logits_dir:
+                assert args.save_topk_logits_interval > 0 and args.save_topk_logits_tokens > 0, (
+                    "--save-topk-logits-dir needs --save-topk-logits-interval and "
+                    "--save-topk-logits-tokens"
+                )
+                topk_window = topk_logit_saving.window_iterations(
+                    args.save_topk_logits_tokens,
+                    args.global_batch_size * args.seq_length,
+                    args.save_topk_logits_interval,
+                )
+                save_topk_logits = topk_logit_saving.should_save(
+                    iteration + 1, args.save_topk_logits_interval, topk_window
+                )
+            if save_topk_logits and (
+                config.cuda_graph_impl != "none"
+                or config.overlap_moe_expert_parallel_comm
+                or (config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl != 'native')
+            ):
+                if not getattr(args, '_topk_logit_unsupported_warned', False):
+                    print_rank_0(
+                        "WARNING: --save-topk-logits requires the native CE impl, CUDA graphs off, "
+                        "and MoE EP communication overlap off; skipping."
+                    )
+                    args._topk_logit_unsupported_warned = True
+                save_topk_logits = False
+            topk_logit_saving.set_active(
+                save_topk_logits, args.save_topk_logits_k, args.save_topk_logits_clip
+            )
             # Router-input diagnostics: record during this step's forwards; collected below.
             log_router_input = bool(
                 args.router_input_log_interval
@@ -3582,6 +3614,17 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+        if topk_logit_saving.is_active():
+            if skipped_iter:
+                topk_logit_saving.reset_attempt()
+            elif mpu.is_pipeline_last_stage(ignore_virtual=True) and (
+                mpu.get_tensor_model_parallel_rank() == 0
+            ):
+                topk_logit_saving.flush(
+                    iteration + 1,
+                    args.save_topk_logits_dir,
+                    mpu.get_data_parallel_rank(with_context_parallel=True),
+                )
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
