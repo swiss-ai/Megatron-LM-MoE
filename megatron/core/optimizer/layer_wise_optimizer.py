@@ -306,6 +306,89 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             _allgather_helper_experts_param(self.expt_dp_params_list, self.pg_collection.expt_dp)
 
     @torch.no_grad()
+    def allgather_params_chunked(self, max_chunk_bytes: int = 256 * 1024 * 1024) -> None:
+        """Same result as :meth:`allgather_params`, with a bounded GPU footprint.
+
+        ``allgather_params`` allocates one receive buffer per other rank (together about the size
+        of every other rank's parameter shard) and leaves those blocks in the caching allocator.
+        Here every shard is broadcast from its owner through ONE scratch buffer of at most
+        ``max_chunk_bytes`` that is reused for every chunk and freed at the end, so the transient
+        stays small and reusable. Used for the one-shot publish after the load-time gain cap
+        (md_decoupling.clamp_large_gains), which runs before the first training step, when the
+        extra cached memory of the full all-gather can leave NCCL without room for its buffers.
+        """
+        if self.pg_collection is None:
+            return
+        if self.dp_cp_params_list:
+            self._broadcast_shards_chunked(
+                self.dp_cp_params_list, self.pg_collection.dp_cp, max_chunk_bytes
+            )
+        if self.expt_dp_params_list:
+            self._broadcast_shards_chunked(
+                self.expt_dp_params_list, self.pg_collection.expt_dp, max_chunk_bytes
+            )
+
+    @staticmethod
+    def _broadcast_shards_chunked(params_list, group, max_chunk_bytes: int) -> None:
+        """Broadcast every rank's shard from its owner through a reused scratch buffer.
+
+        ``params_list[r]`` is the shard owned by rank ``r`` of ``group``; every rank holds all the
+        params, so every rank derives the same schedule (rank order, then dtype, then chunks of at
+        most ``max_chunk_bytes`` that may split a param) and issues the same collectives. A param
+        larger than a chunk is sent in pieces. The scratch lives on the GPU whenever CUDA is
+        available (also for CPU-offloaded params), like the CPU-offload path of allgather_params.
+        """
+        rank = get_pg_rank(group)
+        world_size = get_pg_size(group)
+        dtypes = sorted({p.dtype for shard in params_list for p in shard}, key=str)
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else next(p.device for shard in params_list for p in shard)
+        )
+        for dtype in dtypes:
+            max_numel = max(1, max_chunk_bytes // torch.empty((), dtype=dtype).element_size())
+            shards = [[p for p in shard if p.dtype == dtype] for shard in params_list]
+            largest_shard = max(sum(p.numel() for p in shard) for shard in shards)
+            if largest_shard == 0:
+                continue
+            scratch = torch.empty(min(max_numel, largest_shard), device=device, dtype=dtype)
+
+            def _flush(chunk, src_rank):
+                total = sum(end - start for _, start, end in chunk)
+                buf = scratch[:total]
+                if src_rank == rank:
+                    offset = 0
+                    for p, start, end in chunk:
+                        buf[offset : offset + end - start].copy_(p.data.view(-1)[start:end])
+                        offset += end - start
+                torch.distributed.broadcast(
+                    buf, src=torch.distributed.get_global_rank(group, src_rank), group=group
+                )
+                if src_rank != rank:
+                    offset = 0
+                    for p, start, end in chunk:
+                        p.data.view(-1)[start:end].copy_(buf[offset : offset + end - start])
+                        offset += end - start
+
+            for src_rank in range(world_size):
+                chunk, chunk_numel = [], 0
+                for p in shards[src_rank]:
+                    assert p.data.is_contiguous(), "chunked publish needs contiguous params"
+                    start, n = 0, p.numel()
+                    while start < n:
+                        take = min(n - start, scratch.numel() - chunk_numel)
+                        chunk.append((p, start, start + take))
+                        chunk_numel += take
+                        start += take
+                        if chunk_numel == scratch.numel():
+                            _flush(chunk, src_rank)
+                            chunk, chunk_numel = [], 0
+                if chunk:
+                    _flush(chunk, src_rank)
+            del scratch
+
+    @torch.no_grad()
     def broadcast_params(self):
         """All rank broadcast updated local params."""
         # Broadcast linear layer weights to all other ranks. Kept as reference test.

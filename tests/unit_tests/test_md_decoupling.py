@@ -2789,11 +2789,7 @@ def test_clamp_large_gains_skips_params_without_gain_state():
     assert torch.equal(param.detach(), before)
 
 
-def test_clamp_large_gains_publishes_to_model_params():
-    """The load-time entry point caps the MuonMD gains only, leaves the norm gammas of the chained
-    Adam untouched, then copies main -> model on every wrapper and all-gathers once."""
-    calls = []
-
+def _clamp_publish_fixture(calls, **publishers):
     class _Wrapper:
         def __init__(self, inner):
             self.optimizer = inner
@@ -2808,17 +2804,98 @@ def test_clamp_large_gains_publishes_to_model_params():
     gamma = torch.nn.Parameter(torch.tensor([3.0, 1.0, 2.5]))
     gamma.md_gain_log_family = "layernorm"
     adam = torch.optim.AdamW([gamma], lr=0.0)
-    chained = SimpleNamespace(
-        chained_optimizers=[_Wrapper(md), _Wrapper(adam)],
+    chained = SimpleNamespace(chained_optimizers=[_Wrapper(md), _Wrapper(adam)], **publishers)
+    return chained, md, param, gamma
+
+
+def test_clamp_large_gains_publishes_to_model_params():
+    """The load-time entry point caps the MuonMD gains only, leaves the norm gammas of the chained
+    Adam untouched, then copies main -> model on every wrapper and publishes once, through the
+    bounded-memory chunked broadcast when the optimizer has it (not the full all-gather)."""
+    calls = []
+    chained, md, param, gamma = _clamp_publish_fixture(
+        calls,
         allgather_params=lambda: calls.append("allgather"),
+        allgather_params_chunked=lambda: calls.append("chunked"),
     )
 
     assert md_module.clamp_large_gains(chained, 2.0) == 1  # the one column gain above the cap
-    assert calls == ["copy", "copy", "allgather"]
+    assert calls == ["copy", "copy", "chunked"]
     assert abs(float(md._phi(md.state[param]["col_gain"])[0]) - 2.0) < 1e-5
     assert gamma.detach().tolist() == [3.0, 1.0, 2.5], "norm gammas must not be capped"
     with pytest.raises(AssertionError):
         md_module.clamp_large_gains(chained, 0.0)
+
+
+def test_clamp_large_gains_falls_back_to_allgather_params():
+    calls = []
+    chained, *_ = _clamp_publish_fixture(calls, allgather_params=lambda: calls.append("allgather"))
+    assert md_module.clamp_large_gains(chained, 2.0) == 1
+    assert calls == ["copy", "copy", "allgather"]
+
+
+@pytest.mark.parametrize("chunk_bytes", [8, 40, 100_000])
+def test_chunked_publish_broadcasts_every_shard_from_its_owner(monkeypatch, chunk_bytes):
+    """allgather_params_chunked's core: after it, every rank holds every shard's values, with
+    chunks smaller than a param (params are split), several chunks per shard and mixed dtypes.
+    A 3-rank world is simulated with threads and a barrier-based broadcast."""
+    import threading
+
+    world_size = 3
+    shapes = [(5, 3), (7,), (4, 4), (2, 6), (9,), (3, 3), (11,)]
+    dtypes = [torch.float32, torch.float32, torch.bfloat16, torch.float32, torch.bfloat16,
+              torch.float32, torch.float32]
+    owners = [0, 1, 2, 2, 1, 0, 1]
+    generator = torch.Generator().manual_seed(0)
+    truth = [torch.randn(shape, generator=generator).to(dtype) for shape, dtype in zip(shapes, dtypes)]
+    # rank r holds the true values of the params it owns and garbage for the others
+    models = [
+        [t.clone() if owners[i] == r else torch.full_like(t, -1) for i, t in enumerate(truth)]
+        for r in range(world_size)
+    ]
+
+    local = threading.local()
+    barrier = threading.Barrier(world_size, timeout=30)
+    slot = {}
+    broadcasts = []
+
+    def fake_broadcast(tensor, src, group=None):
+        if local.rank == src:
+            slot["data"] = tensor.clone()
+            broadcasts.append((src, tensor.numel()))
+        barrier.wait()
+        if local.rank != src:
+            tensor.copy_(slot["data"])
+        barrier.wait()
+
+    monkeypatch.setattr(layer_wise_module, "get_pg_rank", lambda group: local.rank)
+    monkeypatch.setattr(layer_wise_module, "get_pg_size", lambda group: world_size)
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+    monkeypatch.setattr(torch.distributed, "get_global_rank", lambda group, r: r)
+    errors = []
+
+    def run(rank):
+        local.rank = rank
+        try:
+            params_list = [[models[rank][i] for i in range(len(truth)) if owners[i] == o]
+                           for o in range(world_size)]
+            LayerWiseDistributedOptimizer._broadcast_shards_chunked(params_list, None, chunk_bytes)
+        except BaseException as exc:  # surface thread failures in the test
+            errors.append(exc)
+            barrier.abort()
+
+    threads = [threading.Thread(target=run, args=(r,)) for r in range(world_size)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+    assert not errors, errors
+    for r in range(world_size):
+        for i, t in enumerate(truth):
+            assert torch.equal(models[r][i], t), (r, i)
+    # the scratch is bounded: no broadcast is larger than one chunk (the smallest element is 2 bytes)
+    assert max(n for _, n in broadcasts) <= max(1, chunk_bytes // 2)
+    if chunk_bytes == 8:
+        assert len(broadcasts) > len(shapes), "small chunks must split params into pieces"
 
 
 def test_attention_in_pre_norm_gain_tag_predicate():

@@ -310,11 +310,12 @@ def clamp_large_gains(optimizer, max_value: float) -> int:
     Caps, on the fp32 main params that the MDDecoupling optimizer steps on, the magnitude of every
     MDDecoupling row, column and flat gain (see :meth:`MDDecoupling.clamp_large_gains`), zeroes the
     Adam moments of the capped entries, then publishes the new values to the model params: main ->
-    model copy on every wrapper, then the layer-wise all-gather so every DP rank sees the owner's
-    values. Norm gammas (the chained Adam) are NOT touched. The cap is elementwise, so it needs no
+    model copy on every wrapper, then a bounded-memory broadcast of every shard from its owner
+    (the layer-wise all-gather result) so every DP rank sees the owner's values. Norm gammas (the chained Adam) are NOT touched. The cap is elementwise, so it needs no
     cross-rank reduction and is idempotent. Returns the number of entries capped on this rank.
     """
     assert max_value > 0, f"the gain cap must be positive; got {max_value}"
+    mem_before = _cuda_memory_mb()
     wrappers = list(getattr(optimizer, "chained_optimizers", [optimizer]))
     total = None
     for wrapper in wrappers:
@@ -331,12 +332,32 @@ def clamp_large_gains(optimizer, max_value: float) -> int:
             wrapper, "_copy_main_params_to_model_params"
         ):
             wrapper._copy_main_params_to_model_params()
-    if hasattr(optimizer, "allgather_params"):
-        optimizer.allgather_params()
+    # Publish with the bounded-memory broadcast when the optimizer has it: the plain all-gather
+    # allocates the size of every other rank's shard before the first step, and the blocks it
+    # leaves in the caching allocator can starve NCCL's first-use buffers (observed as an NCCL
+    # "out of memory" in the first step).
+    publish = getattr(optimizer, "allgather_params_chunked", None) or getattr(
+        optimizer, "allgather_params", None
+    )
+    if publish is not None:
+        publish()
     n = int(total) if total is not None else 0
-    if n:
-        print(f"[rank {_global_rank()}] gain clamp: {n} entries capped at {max_value}", flush=True)
+    if n or _global_rank() == 0:
+        after = _cuda_memory_mb()
+        print(
+            f"[rank {_global_rank()}] gain clamp: {n} entries capped at {max_value}; GPU MB "
+            f"allocated {mem_before[0]:.0f} -> {after[0]:.0f}, reserved "
+            f"{mem_before[1]:.0f} -> {after[1]:.0f}",
+            flush=True,
+        )
     return n
+
+
+def _cuda_memory_mb() -> tuple:
+    """(allocated, reserved) GPU memory in MB, (0, 0) without CUDA."""
+    if not torch.cuda.is_available():
+        return (0.0, 0.0)
+    return (torch.cuda.memory_allocated() / 2**20, torch.cuda.memory_reserved() / 2**20)
 
 
 def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
