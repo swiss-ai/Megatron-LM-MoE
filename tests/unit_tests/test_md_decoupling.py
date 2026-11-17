@@ -2693,6 +2693,134 @@ def test_revive_collapsed_gains_publishes_to_model_params():
     assert md._phi(md.state[param]["col_gain"])[0] > 1e-3 and abs(float(gamma[0]) - 1.0) < 1e-6
 
 
+# ---------------------------------------------------------------------------------------------
+# One-shot gain cap (--md-gain-clamp-max), applied once at load time
+
+
+def _clamp_matrix_optimizer(param, parametrization="softplus", gains_mode="rowcol"):
+    param.is_qkv = True
+    optimizer = _gqa_qkv_optimizer(
+        param,
+        hypersphere_mode="row",
+        hypersphere_gains_mode=gains_mode,
+        gain_parametrization=parametrization,
+        use_orthogonal_updates=False,
+    )
+    optimizer._maybe_init_gain_state(param)
+    return optimizer
+
+
+def _bake_gains(optimizer, param, **effective):
+    """Set the gains to the given effective values (row/col/flat), put a random effective weight
+    on the param and fill the gain Adam moments so zeroing is observable."""
+    state = optimizer.state[param]
+    for axis, eff in effective.items():
+        state[f"{axis}_gain"].copy_(optimizer._phi_inv(torch.as_tensor(eff, dtype=torch.float32)))
+        state[f"{axis}_gain_m"].fill_(0.3)
+        state[f"{axis}_gain_v"].fill_(0.2)
+    param.data.copy_(torch.nn.functional.normalize(torch.randn_like(param), dim=1))
+    optimizer._apply_gains(param)
+
+
+@pytest.mark.parametrize("parametrization", ["softplus", "direct"])
+def test_clamp_large_gains_row_col(parametrization):
+    """Gains with |phi| above the cap are set to the cap, entries at or below it stay bitwise
+    unchanged, the bare weight is kept (the effective weight is rescaled by phi_new / phi_old) and
+    the moments of the capped entries are zeroed."""
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    optimizer = _clamp_matrix_optimizer(param, parametrization)
+    state = optimizer.state[param]
+    row_eff = torch.tensor([0.5, 3.0, 1.99, 7.5, 1.0, 2.5, 0.1, 2.0001])
+    col_eff = torch.tensor([5.0, 0.7, 1.99, 2.0001])
+    if parametrization == "direct":
+        row_eff[1] = -3.0  # the sign is kept
+        col_eff[2] = 2.0   # exactly at the cap: not above it
+    _bake_gains(optimizer, param, row=row_eff, col=col_eff)
+    old_p = param.detach().clone()
+    old_raw = {a: state[f"{a}_gain"].clone() for a in ("row", "col")}
+    old_eff = {a: optimizer._phi(old_raw[a]) for a in ("row", "col")}
+    big = {a: old_eff[a].abs() > 2.0 for a in ("row", "col")}
+
+    n = optimizer.clamp_large_gains(2.0)
+
+    assert int(n) == 4 + 2
+    new_eff = {a: optimizer._phi(state[f"{a}_gain"]) for a in ("row", "col")}
+    for a in ("row", "col"):
+        torch.testing.assert_close(new_eff[a][big[a]], 2.0 * torch.sign(old_eff[a][big[a]]),
+                                   rtol=1e-5, atol=1e-6)
+        assert torch.equal(state[f"{a}_gain"][~big[a]], old_raw[a][~big[a]]), "entries below the cap must be bitwise unchanged"
+        assert state[f"{a}_gain_m"][big[a]].abs().max() == 0
+        assert state[f"{a}_gain_v"][big[a]].abs().max() == 0
+        assert state[f"{a}_gain_m"][~big[a]].min() > 0
+    ratio_row = torch.where(big["row"], new_eff["row"] / old_eff["row"], torch.ones(8))
+    ratio_col = torch.where(big["col"], new_eff["col"] / old_eff["col"], torch.ones(4))
+    torch.testing.assert_close(
+        param.detach(), old_p * ratio_row[:, None] * ratio_col[None, :], rtol=1e-5, atol=1e-6)
+    # idempotent: a second cap changes nothing
+    after = param.detach().clone()
+    assert int(optimizer.clamp_large_gains(2.0)) == 0
+    assert torch.equal(param.detach(), after)
+
+
+def test_clamp_large_gains_flat():
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    optimizer = _clamp_matrix_optimizer(param, gains_mode="flat")
+    _bake_gains(optimizer, param, flat=4.0)
+    old_p = param.detach().clone()
+
+    assert int(optimizer.clamp_large_gains(2.0)) == 1
+
+    state = optimizer.state[param]
+    torch.testing.assert_close(optimizer._phi(state["flat_gain"]), torch.tensor(2.0), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(param.detach(), old_p * 0.5, rtol=1e-5, atol=1e-6)
+    assert state["flat_gain_m"].abs().max() == 0
+
+
+def test_clamp_large_gains_skips_params_without_gain_state():
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    param.is_qkv = True
+    optimizer = _gqa_qkv_optimizer(
+        param, hypersphere_mode="row", hypersphere_gains_mode="rowcol",
+        gain_parametrization="softplus", use_orthogonal_updates=False)
+    before = param.detach().clone()
+    assert optimizer.clamp_large_gains(2.0) is None  # gain state is created on the first step
+    assert torch.equal(param.detach(), before)
+
+
+def test_clamp_large_gains_publishes_to_model_params():
+    """The load-time entry point caps the MuonMD gains only, leaves the norm gammas of the chained
+    Adam untouched, then copies main -> model on every wrapper and all-gathers once."""
+    calls = []
+
+    class _Wrapper:
+        def __init__(self, inner):
+            self.optimizer = inner
+            self.is_stub_optimizer = False
+
+        def _copy_main_params_to_model_params(self):
+            calls.append("copy")
+
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    md = _clamp_matrix_optimizer(param)
+    _bake_gains(md, param, col=torch.tensor([5.0, 1.0, 1.0, 1.0]))
+    gamma = torch.nn.Parameter(torch.tensor([3.0, 1.0, 2.5]))
+    gamma.md_gain_log_family = "layernorm"
+    adam = torch.optim.AdamW([gamma], lr=0.0)
+    chained = SimpleNamespace(
+        chained_optimizers=[_Wrapper(md), _Wrapper(adam)],
+        allgather_params=lambda: calls.append("allgather"),
+    )
+
+    assert md_module.clamp_large_gains(chained, 2.0) == 1  # the one column gain above the cap
+    assert calls == ["copy", "copy", "allgather"]
+    assert abs(float(md._phi(md.state[param]["col_gain"])[0]) - 2.0) < 1e-5
+    assert gamma.detach().tolist() == [3.0, 1.0, 2.5], "norm gammas must not be capped"
+    with pytest.raises(AssertionError):
+        md_module.clamp_large_gains(chained, 0.0)
+
+
 def test_attention_in_pre_norm_gain_tag_predicate():
     one_d = torch.nn.Parameter(torch.ones(4))
     two_d = torch.nn.Parameter(torch.ones(4, 4))

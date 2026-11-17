@@ -1653,6 +1653,14 @@ def validate_args(args, defaults={}):
             assert args.md_attention_in_gain_revive_iteration is not None, (
                 "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
                 "(the checkpoint iteration after which the one-shot revive runs).")
+        if args.md_gain_clamp_max is not None:
+            assert args.md_gain_clamp_max > 0, (
+                f"--md-gain-clamp-max must be > 0; got {args.md_gain_clamp_max}.")
+            assert args.md_gain_clamp_iteration is not None, (
+                "--md-gain-clamp-max needs --md-gain-clamp-iteration "
+                "(the checkpoint iteration after which the one-shot cap runs).")
+        elif args.md_gain_clamp_iteration is not None:
+            warn_rank_0("--md-gain-clamp-iteration has no effect without --md-gain-clamp-max.")
         assert args.md_post_norm_gain_pull_coeff >= 0, (
             f"--md-post-norm-gain-pull-coeff must be >= 0; got {args.md_post_norm_gain_pull_coeff}.")
         assert args.md_rowcol_gain_pull_coeff >= 0, (
@@ -3171,6 +3179,18 @@ def _add_training_args(parser):
                        choices=['all', 'live'],
                        help='Entries the revive mean averages over: the whole gain vector (all) '
                        'or only the entries at or above the threshold (live).')
+    group.add_argument('--md-gain-clamp-max', type=float, default=None,
+                       help='md_decoupling: ONCE, right after loading the checkpoint named by '
+                       '--md-gain-clamp-iteration, cap every gain whose effective magnitude is above '
+                       'this value at it (e.g. 2 sets every gain larger than 2 to 2), and zero the '
+                       'Adam moments of the capped entries. Acts on the MDDecoupling (MuonMD) row, '
+                       'column and flat gains only (the weight is rescaled so its bare direction is '
+                       'unchanged); norm gammas are NOT touched. Gains at or below the value are '
+                       'untouched. Off when unset.')
+    group.add_argument('--md-gain-clamp-iteration', type=int, default=None,
+                       help='Checkpoint iteration the one-shot gain cap is tied to: it runs only '
+                       'when exactly this iteration is loaded; a resume from any later (or earlier) '
+                       'checkpoint never caps again. Required with --md-gain-clamp-max.')
     group.add_argument('--md-attention-in-gain-scope', type=str, default='softmax',
                        choices=['softmax', 'all'],
                        help='Which attention-in projections the revive and the pull touch: the fused '

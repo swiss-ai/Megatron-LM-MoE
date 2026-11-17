@@ -302,6 +302,43 @@ def revive_collapsed_gains(optimizer, threshold: float, mean_mode: str = "all") 
     return n
 
 
+@torch.no_grad()
+def clamp_large_gains(optimizer, max_value: float) -> int:
+    """One-shot cap of every MuonMD gain above ``max_value``, run once right after the checkpoint
+    is loaded (see --md-gain-clamp-max / --md-gain-clamp-iteration in training.py).
+
+    Caps, on the fp32 main params that the MDDecoupling optimizer steps on, the magnitude of every
+    MDDecoupling row, column and flat gain (see :meth:`MDDecoupling.clamp_large_gains`), zeroes the
+    Adam moments of the capped entries, then publishes the new values to the model params: main ->
+    model copy on every wrapper, then the layer-wise all-gather so every DP rank sees the owner's
+    values. Norm gammas (the chained Adam) are NOT touched. The cap is elementwise, so it needs no
+    cross-rank reduction and is idempotent. Returns the number of entries capped on this rank.
+    """
+    assert max_value > 0, f"the gain cap must be positive; got {max_value}"
+    wrappers = list(getattr(optimizer, "chained_optimizers", [optimizer]))
+    total = None
+    for wrapper in wrappers:
+        if getattr(wrapper, "is_stub_optimizer", False):
+            continue
+        inner = wrapper.optimizer
+        if not isinstance(inner, MDDecoupling):
+            continue  # the chained Adam holds the norm gammas, which this cap leaves alone
+        n = inner.clamp_large_gains(max_value)
+        if n is not None:
+            total = n if total is None else total + n
+    for wrapper in wrappers:
+        if not getattr(wrapper, "is_stub_optimizer", False) and hasattr(
+            wrapper, "_copy_main_params_to_model_params"
+        ):
+            wrapper._copy_main_params_to_model_params()
+    if hasattr(optimizer, "allgather_params"):
+        optimizer.allgather_params()
+    n = int(total) if total is not None else 0
+    if n:
+        print(f"[rank {_global_rank()}] gain clamp: {n} entries capped at {max_value}", flush=True)
+    return n
+
+
 def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
     """Dimension along which TP shards ``p``, or None when ``p`` is not TP-sharded.
 
@@ -1683,6 +1720,53 @@ class MDDecoupling(_MDDecouplingBase):
                 state["col_gain_v"].mul_(keep)
                 n = dead.sum()
                 total = n if total is None else total + n
+        return total
+
+    @torch.no_grad()
+    def clamp_large_gains(self, max_value: float) -> Optional[torch.Tensor]:
+        """Load-time half of :func:`clamp_large_gains` for the MDDecoupling row/col/flat gains.
+
+        For every param with gain state, entries with |phi(g)| > ``max_value`` are set to
+        ``max_value`` (sign kept under "direct"; softplus gains are always positive) by storing the
+        raw gain phi_inv(max_value), and their gain Adam moments are zeroed. The stored param is the
+        effective weight bare * phi(r) * phi(c), so each capped row / column / flat entry rescales
+        the weight by phi(g_new) / phi(g_old), exactly like the revive: the bare weight is
+        unchanged, and entries at or below the cap are multiplied by exactly 1 and left bitwise
+        untouched. Returns the number of entries capped (a GPU scalar) or None when no param holds
+        gain state.
+        """
+        total = None
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state:
+                    continue
+                layout = None
+                for axis in ("row", "col", "flat"):
+                    raw = state.get(f"{axis}_gain")
+                    if raw is None:
+                        continue
+                    # clone: under "direct" phi is the identity and returns ``raw`` itself, which the
+                    # in-place update below would otherwise change under old_eff.
+                    old_eff = self._phi(raw).clone()
+                    big = old_eff.abs() > max_value
+                    if self.gain_parametrization == "softplus":
+                        capped = self._phi_inv(torch.full_like(raw, max_value))
+                    else:
+                        capped = torch.where(raw < 0, -max_value, max_value).to(raw.dtype)
+                    raw.copy_(torch.where(big, capped.to(raw.dtype), raw))
+                    # Divide only where capped (|old_eff| > max_value > 0), so the unselected branch
+                    # of the where never divides by a small or zero gain.
+                    divisor = torch.where(big, old_eff, torch.ones_like(old_eff))
+                    scale = torch.where(big, self._phi(raw) / divisor, torch.ones_like(old_eff))
+                    if layout is None:
+                        layout = self._gain_layout(p)
+                    p.mul_(scale[layout[f"{axis}_bk"]].to(p.dtype))
+                    keep = (~big).to(raw.dtype)
+                    state[f"{axis}_gain_m"].mul_(keep)
+                    state[f"{axis}_gain_v"].mul_(keep)
+                    n = big.sum()
+                    total = n if total is None else total + n
         return total
 
     def _is_revived_matrix(self, p) -> bool:

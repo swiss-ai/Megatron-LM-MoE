@@ -1912,6 +1912,20 @@ def setup_model_and_optimizer(
             f'{"applied" if revive else "skipped (other checkpoint)"}'
         )
 
+    if getattr(args, 'md_gain_clamp_max', None) is not None:
+        # One-shot gain cap: applied here, on the state just loaded, only when that checkpoint is
+        # --md-gain-clamp-iteration; a resume from any other iteration never caps again (see
+        # md_decoupling.clamp_large_gains). Runs after the revive above.
+        clamp = args.iteration == args.md_gain_clamp_iteration
+        if clamp:
+            from megatron.core.optimizer.md_decoupling import clamp_large_gains
+            clamp_large_gains(optimizer, args.md_gain_clamp_max)
+        print_rank_0(
+            f'gain clamp: loaded iteration {args.iteration}, clamp iteration '
+            f'{args.md_gain_clamp_iteration} (max {args.md_gain_clamp_max}) -> '
+            f'{"applied" if clamp else "skipped (other checkpoint)"}'
+        )
+
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
