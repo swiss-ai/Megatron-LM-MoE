@@ -2789,6 +2789,28 @@ def test_clamp_large_gains_skips_params_without_gain_state():
     assert torch.equal(param.detach(), before)
 
 
+def test_clamp_large_gains_skips_router():
+    """Router gains are never capped (routing uses checkpointed qb_beta thresholds fitted to the
+    uncapped logits): gains, weight and moments stay bitwise unchanged. The same matrix without
+    the router tag is capped."""
+    torch.manual_seed(0)
+    param = torch.nn.Parameter(torch.randn(8, 4))
+    optimizer = _clamp_matrix_optimizer(param)
+    _bake_gains(optimizer, param, row=torch.full((8,), 5.0), col=torch.full((4,), 5.0))
+    state = optimizer.state[param]
+    param.is_router = True
+    before_p = param.detach().clone()
+    before = {k: state[k].clone() for k in ("row_gain", "col_gain", "row_gain_m", "col_gain_v")}
+
+    assert optimizer.clamp_large_gains(2.0) is None
+
+    assert torch.equal(param.detach(), before_p)
+    for k, v in before.items():
+        assert torch.equal(state[k], v), k
+    param.is_router = False
+    assert int(optimizer.clamp_large_gains(2.0)) == 8 + 4
+
+
 def _clamp_publish_fixture(calls, **publishers):
     class _Wrapper:
         def __init__(self, inner):

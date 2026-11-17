@@ -3185,8 +3185,9 @@ def _add_training_args(parser):
                        'this value at it (e.g. 2 sets every gain larger than 2 to 2), and zero the '
                        'Adam moments of the capped entries. Acts on the MDDecoupling (MuonMD) row, '
                        'column and flat gains only (the weight is rescaled so its bare direction is '
-                       'unchanged); norm gammas are NOT touched. Gains at or below the value are '
-                       'untouched. Off when unset.')
+                       'unchanged); norm gammas and the MoE router gains are NOT touched (routing '
+                       'uses checkpointed qb_beta thresholds fitted to the uncapped logits). Gains '
+                       'at or below the value are untouched. Off when unset.')
     group.add_argument('--md-gain-clamp-iteration', type=int, default=None,
                        help='Checkpoint iteration the one-shot gain cap is tied to: it runs only '
                        'when exactly this iteration is loaded; a resume from any later (or earlier) '

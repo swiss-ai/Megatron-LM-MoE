@@ -1759,6 +1759,13 @@ class MDDecoupling(_MDDecouplingBase):
         total = None
         for group in self.param_groups:
             for p in group["params"]:
+                # Router gains are never capped: routing ranks experts by (logits - qb_beta), and
+                # qb_beta is a per-expert threshold restored from the checkpoint and fitted to the
+                # uncapped logits. Capping the router's row/col gains shifts the logits against the
+                # stale thresholds, which can concentrate tokens on a few experts until QB re-fits
+                # (observed as expert-backward OOMs in the first step).
+                if getattr(p, "is_router", False):
+                    continue
                 state = self.state.get(p)
                 if not state:
                     continue
