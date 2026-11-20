@@ -32,11 +32,12 @@ from tests.unit_tests.test_utilities import Utils
 ENCODER_NAME = "images"
 
 
-def _get_shared_tmpdir():
-    """Create a shared temp directory across all ranks."""
+def _get_shared_tmpdir(tmp_path_dist_ckpt):
+    """Create a temporary checkpoint directory on shared storage."""
     tmpdir_list = [None]
     if dist.get_rank() == 0:
-        tmpdir_list[0] = tempfile.mkdtemp(prefix="mimo_ckpt_test_")
+        # Broadcasting a /tmp path shares its name, not its storage across nodes.
+        tmpdir_list[0] = tempfile.mkdtemp(prefix="mimo_ckpt_test_", dir=tmp_path_dist_ckpt)
     dist.broadcast_object_list(tmpdir_list, src=0)
     return tmpdir_list[0]
 
@@ -96,6 +97,7 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
 
 
 def run_checkpoint_test(
+    tmp_path_dist_ckpt,
     encoder_tp,
     encoder_pp,
     encoder_dp,
@@ -127,7 +129,7 @@ def run_checkpoint_test(
     )
     params_a = {name: p.clone() for name, p in model_a.named_parameters()}
 
-    ckpt_dir = _get_shared_tmpdir()
+    ckpt_dir = _get_shared_tmpdir(tmp_path_dist_ckpt)
     try:
         model_ckpt = os.path.join(ckpt_dir, 'model')
         optim_ckpt = os.path.join(ckpt_dir, 'optimizer')
@@ -224,10 +226,11 @@ class TestMimoCheckpoint:
     def teardown_method(self):
         destroy_all_grids()
 
-    def test_encoder_tp2_llm_tp2_pp3(self):
+    def test_encoder_tp2_llm_tp2_pp3(self, tmp_path_dist_ckpt):
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
         run_checkpoint_test(
+            tmp_path_dist_ckpt=tmp_path_dist_ckpt,
             encoder_tp=2,
             encoder_pp=1,
             encoder_dp=1,
@@ -240,10 +243,11 @@ class TestMimoCheckpoint:
             num_layers=3,
         )
 
-    def test_encoder_tp1_llm_pp7(self):
+    def test_encoder_tp1_llm_pp7(self, tmp_path_dist_ckpt):
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
         run_checkpoint_test(
+            tmp_path_dist_ckpt=tmp_path_dist_ckpt,
             encoder_tp=1,
             encoder_pp=1,
             encoder_dp=1,
@@ -256,10 +260,11 @@ class TestMimoCheckpoint:
             num_layers=7,
         )
 
-    def test_encoder_tp2_pp2_llm_tp2_pp2(self):
+    def test_encoder_tp2_pp2_llm_tp2_pp2(self, tmp_path_dist_ckpt):
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
         run_checkpoint_test(
+            tmp_path_dist_ckpt=tmp_path_dist_ckpt,
             encoder_tp=2,
             encoder_pp=2,
             encoder_dp=1,

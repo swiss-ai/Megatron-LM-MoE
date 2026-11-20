@@ -2448,7 +2448,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float()
+                        # .main_grad may be host-resident (moe_offload_main_grad) while the fp32
+                        # master shard is kept on the device
+                        shard_main_param.grad = shard_model_grad.to(
+                            device=shard_main_param.device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        )
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:

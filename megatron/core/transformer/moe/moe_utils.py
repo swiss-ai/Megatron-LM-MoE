@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -22,7 +23,8 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_model_config, internal_api, is_te_min_version
+from megatron.core.jit import jit_fuser
+from megatron.core.utils import get_model_config, internal_api, is_te_min_version, get_attr_wrapped_model
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -37,6 +39,11 @@ if HAVE_TE:
         fused_unpermute,
         te_general_gemm,
     )
+
+    # NOTE (fuguan): with TE >= 2.12.0, fused_permute_and_pad_with_probs
+    # introduces extra synchronization operations that is slow.
+    # as a temporary workaround, disable fused_permute_and_pad_with_probs for now.
+    fused_permute_and_pad_with_probs = None
 else:
     (
         fused_compute_score_for_moe_aux_loss,
@@ -126,13 +133,21 @@ def switch_load_balancing_loss_func(
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
 
+    # A data-parallel padding sample can contain no valid tokens. Its masked
+    # probabilities and counts are both zero, so the correct loss is zero,
+    # not a division-by-zero NaN.
+    if isinstance(total_num_tokens, torch.Tensor):
+        safe_total_num_tokens = torch.clamp(total_num_tokens, min=1)
+    else:
+        safe_total_num_tokens = max(total_num_tokens, 1)
+
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
-            total_num_tokens=total_num_tokens,
+            total_num_tokens=safe_total_num_tokens,
             topk=topk,
             num_experts=num_experts,
             coeff=moe_aux_loss_coeff,
@@ -140,7 +155,9 @@ def switch_load_balancing_loss_func(
 
     aggregated_probs_per_expert = probs.sum(dim=0)
     aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
-        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+        num_experts
+        * moe_aux_loss_coeff
+        / (topk * safe_total_num_tokens * safe_total_num_tokens)
     )
     return aux_loss
 
@@ -220,11 +237,166 @@ def qb_dual_update(
     return indices, beta_local
 
 
+def marin_qb_histogram_update(
+    logits: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+    num_bins: int = 10000,
+    *,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Marin's live-range upper-quantile estimator, in subtractive-beta convention.
+
+    Reference: marin-community/marin@12d8b6f,
+    experiments/grug/moe_hero_ep/model.py::_qb_beta_hist.
+    Pool raw-logit margins over a single forward's TP+DP+CP token shards. The
+    caller holds beta fixed through accumulation and token-weights these estimates.
+    No margins survive this call. A None group is the single-process CPU path.
+    """
+    assert logits.ndim == 2 and alpha.shape == logits.shape[:1]
+    assert beta.shape == logits.shape[1:] and 0 < topk < logits.shape[1]
+    assert num_bins > 0
+    assert padding_mask is None or padding_mask.shape == alpha.shape
+    with torch.no_grad():
+        margins = logits.detach().float() - alpha.detach().float().unsqueeze(1)
+        valid = (
+            torch.ones_like(alpha, dtype=torch.bool)
+            if padding_mask is None else ~padding_mask.bool()
+        )
+        # Empty shards still join collectives. numel() checks metadata, not device data.
+        if margins.numel() == 0:
+            lo, hi = margins.new_tensor(float('inf')), margins.new_tensor(-float('inf'))
+        elif padding_mask is None:
+            lo, hi = margins.amin(), margins.amax()
+        else:
+            lo = margins.masked_fill(~valid[:, None], float('inf')).amin()
+            hi = margins.masked_fill(~valid[:, None], -float('inf')).amax()
+        if group is not None:
+            torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
+            torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
+        # All-padding forwards preserve beta. Keep the grid finite without a CPU sync.
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        hi = torch.where(torch.isfinite(hi), hi, lo)
+        span = (hi - lo).clamp_min(1e-6)
+        width = span / num_bins
+        safe_margins = torch.where(valid[:, None], margins, lo)
+        bins = ((safe_margins - lo) / width).long().clamp_(0, num_bins - 1)
+        experts = torch.arange(logits.shape[1], device=logits.device) * num_bins
+        indices = (bins + experts).flatten()
+        counts = torch.zeros(logits.shape[1] * num_bins, dtype=torch.int64, device=logits.device)
+        weights = valid[:, None].expand_as(bins).reshape(-1).to(torch.int64)
+        counts.scatter_add_(0, indices, weights)
+        counts = counts.reshape(logits.shape[1], num_bins)
+        if group is not None:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+        token_count = counts[0].sum()
+        target = token_count.to(torch.float32) * topk / logits.shape[1]
+        cumulative = counts.flip(-1).cumsum(-1).flip(-1)
+        crossing = ((cumulative >= target).sum(-1) - 1).clamp(0, num_bins - 1)
+        above = cumulative.gather(-1, crossing[:, None]).squeeze(-1)
+        in_bin = counts.gather(-1, crossing[:, None]).squeeze(-1)
+        estimate = lo + width * (
+            crossing + (above - target) / in_bin.clamp_min(1)
+        )
+        return torch.where(token_count > 0, estimate, beta), token_count
+
+
+def marin_qb_exact_update(
+    margins: torch.Tensor,
+    valid: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+    num_bins: int = 10000,
+    *,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_rows: int = 16384,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Marin's exact global-batch upper-quantile estimator over retained margins.
+
+    Reference: marin-community/marin@12d8b6f,
+    experiments/grug/moe_hero_ep/model.py::_qb_beta_hist and _bincount_upper_quantile.
+    ``margins`` [rows, experts] holds every raw-logit margin (logit minus the token's biased
+    Top-(k+1) cutoff) of one optimizer step on this rank, and ``valid`` [rows] marks real
+    (non-padding) tokens. ``margins``/``valid`` may live on the host: they are streamed to
+    ``beta.device`` in chunks, twice (range, then counts). The exact global min/max is found with
+    one MIN and one MAX reduction over ``group``; the per-expert integer histogram on that live
+    grid is summed over ``group``; the upper quantile is interpolated in the crossing bin exactly
+    as Marin does. ``group=None`` is the single-process path.
+
+    Returns ``(estimate, token_count, nonfinite_tokens)``. ``estimate`` is ``beta`` when the
+    pooled batch is empty or any valid token had a non-finite margin (Marin has no such guard: a
+    single NaN poisons its grid). Every rank joins the same three collectives regardless of its
+    local row count.
+    """
+    assert margins.ndim == 2 and valid.shape == margins.shape[:1]
+    num_experts = margins.shape[1]
+    assert beta.shape == (num_experts,) and 0 < topk < num_experts
+    assert num_bins > 0 and chunk_rows > 0
+    device = beta.device
+    rows = margins.shape[0]
+    inf = float('inf')
+
+    def load(start):
+        end = min(start + chunk_rows, rows)
+        chunk = margins[start:end].to(device, non_blocking=True)
+        keep = valid[start:end].to(device, non_blocking=True).bool()
+        finite = torch.isfinite(chunk).all(dim=-1)
+        return chunk, keep & finite, (keep & ~finite).sum()
+
+    with torch.no_grad():
+        lo = torch.full((), inf, device=device)
+        hi = torch.full((), -inf, device=device)
+        bad = torch.zeros((), dtype=torch.int64, device=device)
+        for start in range(0, rows, chunk_rows):
+            chunk, keep, chunk_bad = load(start)
+            bad += chunk_bad
+            lo = torch.minimum(lo, chunk.masked_fill(~keep[:, None], inf).amin())
+            hi = torch.maximum(hi, chunk.masked_fill(~keep[:, None], -inf).amax())
+        extrema = torch.stack((lo, -hi))
+        if group is not None:
+            torch.distributed.all_reduce(extrema, op=torch.distributed.ReduceOp.MIN, group=group)
+            torch.distributed.all_reduce(bad, op=torch.distributed.ReduceOp.SUM, group=group)
+        lo, hi = extrema[0], -extrema[1]
+        # An empty pooled batch keeps a finite grid; the estimate is discarded below.
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        hi = torch.where(torch.isfinite(hi), hi, lo)
+        hi = torch.maximum(hi, lo + 1e-6)  # Marin's guard for a degenerate all-equal range
+        width = (hi - lo) / num_bins
+
+        # Invalid rows are routed to a scratch block past the last expert and sliced off.
+        block = num_experts * num_bins
+        counts = torch.zeros(2 * block, dtype=torch.int64, device=device)
+        ones = torch.ones(1, dtype=torch.int64, device=device)
+        experts = torch.arange(num_experts, device=device) * num_bins
+        for start in range(0, rows, chunk_rows):
+            chunk, keep, _ = load(start)
+            safe = torch.where(keep[:, None], chunk, lo)
+            bins = ((safe - lo) / width).long().clamp_(0, num_bins - 1)
+            flat = (bins + experts + (~keep)[:, None] * block).reshape(-1)
+            counts.scatter_add_(0, flat, ones.expand_as(flat))
+        counts = counts[:block].reshape(num_experts, num_bins)
+        if group is not None:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+
+        token_count = counts[0].sum()
+        target = token_count.to(torch.float32) * topk / num_experts
+        cumulative = counts.flip(-1).cumsum(-1).flip(-1)
+        crossing = ((cumulative >= target).sum(-1) - 1).clamp(0, num_bins - 1)
+        above = cumulative.gather(-1, crossing[:, None]).squeeze(-1).to(torch.float32)
+        in_bin = counts.gather(-1, crossing[:, None]).squeeze(-1).to(torch.float32)
+        estimate = lo + width * (crossing + (above - target) / in_bin.clamp_min(1.0))
+        accepted = (token_count > 0) & (bad == 0)
+        return torch.where(accepted, estimate, beta), token_count, bad
+
+
 def compute_qb_histogram(
     scores: torch.Tensor,
     alpha: torch.Tensor,
     beta: torch.Tensor,
     num_bins: int,
+    padding_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Histogram the per-token QB bias required by every expert.
 
@@ -241,6 +413,11 @@ def compute_qb_histogram(
         alpha: Biased Top-(k+1) cutoff for each token, shaped ``[num_tokens]``.
         beta: Current per-expert subtractive QB threshold, shaped ``[num_experts]``.
         num_bins: Number of uniform histogram bins.
+        padding_mask: Optional ``[num_tokens]`` bool mask, True for padding rows to
+            exclude. Excluded here rather than by compacting ``scores`` at the call site,
+            where a boolean-mask gather would lower to ``nonzero`` and synchronize the
+            device; padded rows are binned into a scratch block that is sliced off, for
+            identical counts with no sync (the same reason bincount became scatter_add_).
 
     Returns:
         Per-expert integer counts shaped ``[num_experts, num_bins]``.
@@ -249,6 +426,9 @@ def compute_qb_histogram(
     assert alpha.dim() == 1 and alpha.shape[0] == scores.shape[0]
     assert beta.dim() == 1 and beta.shape[0] == scores.shape[1]
     assert num_bins > 0
+    assert padding_mask is None or (
+        padding_mask.dim() == 1 and padding_mask.shape[0] == scores.shape[0]
+    )
 
     num_experts = scores.shape[1]
     # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
@@ -267,9 +447,24 @@ def compute_qb_histogram(
 
     expert_offsets = torch.arange(num_experts, device=scores.device) * num_bins
     bin_indices.add_(expert_offsets)
-    return torch.bincount(
-        bin_indices.reshape(-1), minlength=num_experts * num_bins
-    ).reshape(num_experts, num_bins)
+    num_blocks = num_experts
+    if padding_mask is not None:
+        # Shift padded rows into a scratch block past the last expert, sliced off below.
+        # A whole block rather than one slot: they keep their per-expert spread, so the
+        # scatter_add_ atomics stay as contended as they were (one slot measured 673us
+        # against 244us for the old compacting path; a whole block measures 190us).
+        bin_indices.add_(padding_mask.unsqueeze(1) * (num_experts * num_bins))
+        num_blocks = 2 * num_experts
+    # torch.bincount does not support CUDA-graph capturable because it
+    # internally has d2h sync.
+    # revert to scatter_add_. A fixed-size buffer has a static output shape, and a
+    # stride-0 expanded ones source avoids the bin_indices-sized values tensor.
+    flat_indices = bin_indices.reshape(-1)
+    ones = torch.ones(1, dtype=flat_indices.dtype, device=flat_indices.device)
+    histogram = torch.zeros(
+        num_blocks * num_bins, dtype=torch.long, device=flat_indices.device
+    ).scatter_add_(0, flat_indices, ones.expand_as(flat_indices))
+    return histogram[: num_experts * num_bins].reshape(num_experts, num_bins)
 
 
 def recover_qb_beta_from_histogram(
@@ -782,6 +977,28 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
+# Debug counter for MOE_VALIDATE_ROUTING (see topk_routing_with_score_function and
+# Router.routing). Maps device -> on-device scalar tensor holding the number of routed
+# expert indices that were out of bounds and clamped since the last drain. Kept on the
+# device so accumulation never forces a host sync on the routing hot path.
+_ROUTING_OOB_ACCUM: Dict[torch.device, torch.Tensor] = {}
+
+
+def pop_routing_oob_accum(device: torch.device) -> Optional[torch.Tensor]:
+    """Return and reset the out-of-bounds routed-index count for ``device``.
+
+    The value is an on-device tensor (no host sync); callers hand it to the aux-loss
+    tracker, which reads it only at the logging interval. Returns None when the guard
+    has recorded nothing for this device (or is disabled). See MOE_VALIDATE_ROUTING.
+    """
+    acc = _ROUTING_OOB_ACCUM.get(device)
+    if acc is None:
+        return None
+    val = acc.clone()
+    acc.zero_()
+    return val
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -795,6 +1012,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    sigmoid_normalization_epsilon: float = 1e-20,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -824,6 +1042,9 @@ def topk_routing_with_score_function(
                                        own top-k is bypassed and probs are computed at these
                                        indices. Defaults to None.
 
+        sigmoid_normalization_epsilon (float, optional): Denominator epsilon for selected
+            sigmoid scores. Defaults to 1e-20; Marin histogram routing uses 1e-9.
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             When dense_output=False (default):
@@ -844,6 +1065,24 @@ def topk_routing_with_score_function(
     assert not (
         fused and precomputed_indices is not None
     ), "precomputed_indices is not supported with the fused top-k score function."
+
+    # Debug guard ($MOE_VALIDATE_ROUTING=1): caller-supplied routed indices -- e.g. the
+    # quantile-balancing / sequence-parallel all-gather path -- can be out of range and
+    # otherwise detonate as a bare device-side ScatterGatherKernel "index out of bounds"
+    # assert in the gather/scatter below (or later in the token dispatcher), with only a
+    # block/thread id to go on. Count the offenders on-device (no host sync) and clamp
+    # them into range so the run survives a rare routing race; the per-layer count is
+    # logged via the aux-loss tracker in Router.routing(). Off by default so production
+    # routing is never silently altered. NOTE: covers the router index path only; a bad
+    # index inside the token dispatcher's own scatter is a separate site.
+    if precomputed_indices is not None and os.environ.get("MOE_VALIDATE_ROUTING", "0") == "1":
+        oob = (precomputed_indices < 0) | (precomputed_indices >= num_experts)
+        acc = _ROUTING_OOB_ACCUM.get(precomputed_indices.device)
+        if acc is None:
+            acc = torch.zeros((), dtype=torch.long, device=precomputed_indices.device)
+            _ROUTING_OOB_ACCUM[precomputed_indices.device] = acc
+        acc += oob.sum()
+        precomputed_indices = torch.clamp(precomputed_indices, 0, num_experts - 1)
 
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
@@ -928,7 +1167,10 @@ def topk_routing_with_score_function(
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        probs = (
+            scores / (scores.sum(dim=-1, keepdim=True) + sigmoid_normalization_epsilon)
+            if topk > 1 else scores
+        )
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -1015,6 +1257,8 @@ def apply_router_token_dropping(
     capacity_factor: float,
     drop_policy: str = "probs",
     pad_to_capacity: bool = False,
+    drop_priority: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply token dropping to top-k expert selection.
 
@@ -1031,6 +1275,12 @@ def apply_router_token_dropping(
         drop_policy (str, optional): Policy to drop tokens - "probs" or "position".
                                      Defaults to "probs".
         pad_to_capacity (bool, optional): Whether to pad to capacity. Defaults to False.
+        drop_priority (torch.Tensor, optional): [num_tokens, num_experts] scores that replace
+            routing_probs as the ranking of the "probs" policy, non-negative for selected
+            entries. Quantile balancing passes its selection margin here. Defaults to None.
+        padding_mask (torch.Tensor, optional): [num_tokens] bool mask, True for padding
+            tokens. Padding tokens are ranked below every valid token, so they only take
+            capacity that valid tokens leave unused. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1051,16 +1301,25 @@ def apply_router_token_dropping(
         # No need to drop tokens if capacity exceeds the number of tokens
         capacity_mask = torch.ones_like(routing_probs).bool()
     else:
+        padded_selection = None
+        if padding_mask is not None:
+            padded_selection = routing_map & padding_mask.unsqueeze(-1)
         if drop_policy == "probs":
-            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
-            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+            priority = routing_probs if drop_priority is None else drop_priority
+            if drop_priority is not None or padded_selection is not None:
+                # Selected valid entries are >= 0, padded ones -1, unselected ones -inf.
+                priority = priority.masked_fill(~routing_map, float("-inf"))
+                if padded_selection is not None:
+                    priority = priority.masked_fill(padded_selection, -1.0)
         elif drop_policy == "position":
-            _, capacity_indices = torch.topk(
-                routing_map.int(), k=expert_capacity, dim=0, sorted=False
-            )
-            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+            # topk keeps the earliest rows among equal values.
+            priority = routing_map.int()
+            if padded_selection is not None:
+                priority = priority + (routing_map & ~padded_selection).int()
         else:
             raise ValueError(f"Invalid drop_policy: {drop_policy}")
+        _, capacity_indices = torch.topk(priority, k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
 
     # Apply capacity constraints
     if pad_to_capacity:
@@ -1072,6 +1331,53 @@ def apply_router_token_dropping(
         final_probs = routing_probs * final_map
 
     return final_probs, final_map
+
+
+@jit_fuser
+def dropped_token_fraction(
+    routing_map: torch.Tensor,
+    dropped_routing_map: torch.Tensor,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fraction of token-expert assignments removed by the capacity limit.
+
+    Args:
+        routing_map (torch.Tensor): [num_tokens, num_experts] bool selection before dropping.
+        dropped_routing_map (torch.Tensor): The selection after apply_router_token_dropping.
+        padding_mask (torch.Tensor, optional): [num_tokens] bool mask, True for padding tokens.
+            Padding tokens are excluded from both the numerator and the denominator.
+
+    Returns:
+        torch.Tensor: 0-dim float32 tensor on the routing_map device. Fused, static shape and
+            no host sync, so it is cheap on every MoE layer and CUDA-graph safe.
+    """
+    dropped = routing_map & ~dropped_routing_map
+    if padding_mask is not None:
+        valid = ~padding_mask.unsqueeze(-1)
+        routing_map = routing_map & valid
+        dropped = dropped & valid
+    num_assigned = routing_map.sum(dtype=torch.float32)
+    return dropped.sum(dtype=torch.float32) / num_assigned.clamp(min=1.0)
+
+
+def expert_load_entropy(tokens_per_expert: torch.Tensor) -> torch.Tensor:
+    """Compute normalized entropy of an expert-load distribution."""
+    loads = tokens_per_expert.float()
+    num_experts = loads.shape[-1]
+    if num_experts == 1:
+        return torch.ones(loads.shape[:-1], dtype=loads.dtype, device=loads.device)
+
+    total_load = loads.sum(dim=-1, keepdim=True)
+    probabilities = loads / total_load.clamp_min(1)
+    entropy = -(
+        probabilities * probabilities.clamp_min(torch.finfo(loads.dtype).tiny).log()
+    ).sum(dim=-1)
+    normalized_entropy = entropy / math.log(num_experts)
+    return torch.where(
+        total_load.squeeze(-1) > 0,
+        normalized_entropy,
+        torch.ones_like(normalized_entropy),
+    )
 
 
 def expert_load_violation_batchwise(
@@ -1305,6 +1611,20 @@ def clear_aux_losses_tracker() -> None:
         tracker[name]["values"].zero_()
 
 
+def _reduce_one_aux_loss(entry, pp_group, dp_group) -> None:
+    """Reduce a single tracker entry, the original one-collective-per-step path."""
+    values = entry["values"]
+    torch.distributed.all_reduce(values, group=pp_group)
+    if entry.get('reduce_group') is not None:
+        torch.distributed.all_reduce(values, group=entry.get('reduce_group'))
+        if not entry.get('reduce_group_has_dp', False):
+            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+    if entry.get('avg_group') is not None:
+        torch.distributed.all_reduce(
+            values, group=entry['avg_group'], op=torch.distributed.ReduceOp.AVG
+        )
+
+
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
 ) -> None:
@@ -1330,24 +1650,69 @@ def reduce_aux_losses_tracker_across_ranks(
         pp_group = pg_collection.pp
         dp_group = pg_collection.dp
 
-    for name in track_names:
-        values = tracker[name]["values"]
-        # TODO(Hepteract): delete the usage of the global parallel_state.
-        # Collect aux losses across PP.
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce aux losses across ranks.
-        if tracker[name].get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+    names = [name for name in track_names if name in tracker]
+    if not names:
+        return
+
+    # Every tracked metric is a torch.zeros(num_layers) on the same device (see
+    # save_to_aux_losses_tracker), so they can be stacked into one [n_metrics, num_layers]
+    # buffer and reduced together.
+    per_metric = [tracker[name]["values"] for name in names]
+    shape = per_metric[0].shape
+    if not all(v.shape == shape and v.device == per_metric[0].device for v in per_metric):
+        # Mismatched trackers cannot be stacked; fall back to reducing them one by one.
+        for name in names:
+            _reduce_one_aux_loss(tracker[name], pp_group, dp_group)
+        return
+
+    values = torch.stack(per_metric)
+
+    def _reduce_rows(rows, group, op):
+        """One collective over the selected rows, or over the whole buffer if it is all."""
+        if not rows:
+            return
+        if len(rows) == len(names):
+            torch.distributed.all_reduce(values, group=group, op=op)
+            return
+        gathered = values[rows].contiguous()
+        torch.distributed.all_reduce(gathered, group=group, op=op)
+        values[rows] = gathered
+
+    def _bucket(buckets, group, row):
+        """Append `row` to the bucket for `group`, keeping first-appearance order."""
+        for bucket_group, rows in buckets:
+            if bucket_group is group:
+                rows.append(row)
+                return
+        buckets.append((group, [row]))
+
+    # Bucket by the collective each metric still needs.  All ranks walk `names` in the same
+    # order and derive the same groups, so the buckets -- and therefore the order the
+    # collectives are issued in -- match across ranks.
+    reduce_buckets, avg_buckets, dp_rows = [], [], []
+    for row, name in enumerate(names):
+        entry = tracker[name]
+        reduce_group = entry.get('reduce_group')
+        if reduce_group is not None:
+            _bucket(reduce_buckets, reduce_group, row)
             # Need to conduct reduction across data parallel ranks. When the reduce_group
             # does not have 'dp' attribute, do it manually.
-            if not tracker[name].get('reduce_group_has_dp', False):
-                torch.distributed.all_reduce(
-                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
-                )
-        if tracker[name].get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+            if not entry.get('reduce_group_has_dp', False):
+                dp_rows.append(row)
+        avg_group = entry.get('avg_group')
+        if avg_group is not None:
+            _bucket(avg_buckets, avg_group, row)
+
+    # Same per-metric order: PP, then reduce_group, then DP, then avg_group
+    torch.distributed.all_reduce(values, group=pp_group)
+    for group, rows in reduce_buckets:
+        _reduce_rows(rows, group, torch.distributed.ReduceOp.SUM)
+    _reduce_rows(dp_rows, dp_group, torch.distributed.ReduceOp.AVG)
+    for group, rows in avg_buckets:
+        _reduce_rows(rows, group, torch.distributed.ReduceOp.AVG)
+
+    for row, name in enumerate(names):
+        tracker[name]["values"].copy_(values[row])
 
 
 def track_moe_metrics(
@@ -1510,6 +1875,18 @@ def get_moe_layer_wise_logging_tracker() -> dict:
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
+def save_router_state(model):
+    return [
+        (m, m.get_router_rerun_state())
+        for chunk in model
+        for m in get_attr_wrapped_model(chunk, 'modules')()
+        if hasattr(m, 'get_router_rerun_state')
+    ]
+
+def restore_router_state(state):
+    for module, saved in state:
+        if hasattr(module, 'set_router_rerun_state'):
+            module.set_router_rerun_state(saved)
 
 @internal_api
 class RandomSTE(torch.autograd.Function):

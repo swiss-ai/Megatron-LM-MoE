@@ -91,6 +91,8 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         attention_backend=AttnBackend.flash,
         fp32_residual_connection=False,
         nccl_all_reduce_for_prefill=False,
+        cuda_graph_impl="none",
+        inference_sampling_seed=123,
     )
     cfg.fp16 = False
     cfg.bf16 = True
@@ -199,9 +201,7 @@ class TestGPTModelBatchInvariant:
         wrapper = GPTInferenceWrapper(inference_model, ctx)
         tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
         controller = TextGenerationController(wrapper, tokenizer)
-        engine = DynamicInferenceEngine(
-            controller=controller, context=ctx, enable_cuda_graph=False, random_seed=123
-        )
+        engine = DynamicInferenceEngine(controller=controller, context=ctx)
 
         base_vals = [3, 15, 27, 39]
         lengths = [18, 11, 23, 13]
@@ -262,7 +262,7 @@ class TestGPTModelBatchInvariant:
 
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
-                model_config=based_model.config,
+                model_config=base_model.config,
                 inference_config=InferenceConfig(
                     max_sequence_length=seq_len,
                     buffer_size_gb=0.125,
@@ -277,9 +277,7 @@ class TestGPTModelBatchInvariant:
             wrapper = GPTInferenceWrapper(inference_model, ctx)
             tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
             controller = TextGenerationController(wrapper, tokenizer)
-            engine = DynamicInferenceEngine(
-                controller=controller, context=ctx, enable_cuda_graph=False, random_seed=123
-            )
+            engine = DynamicInferenceEngine(controller=controller, context=ctx)
 
             base_vals = [3, 15, 27, 39]
             lengths = [18, 11, 23, 13]

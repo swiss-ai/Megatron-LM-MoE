@@ -7,7 +7,7 @@ import sys
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
+from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
@@ -66,19 +66,24 @@ def should_disable_forward_pre_hook(args):
 class TestFP8Param:
 
     def setup_method(self, method):
+        FP8GlobalStateManager.reset()
         self.seq_length = 512
         self.micro_batch_size = 2
         self.cuda_graph_helper = None
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-        destroy_global_vars()
-        destroy_num_microbatches_calculator()
-        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
-            self.cuda_graph_helper.delete_cuda_graphs()
-            self.cuda_graph_helper = None
-        gc.collect()
+        try:
+            # Captured graphs must release their communicators before group teardown.
+            if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+                self.cuda_graph_helper.delete_cuda_graphs()
+                self.cuda_graph_helper = None
+        finally:
+            FP8GlobalStateManager.reset()
+            Utils.destroy_model_parallel()
+            destroy_global_vars()
+            destroy_num_microbatches_calculator()
+            gc.collect()
 
     def model_provider(
         self,
@@ -199,6 +204,8 @@ class TestFP8Param:
 
         set_args(args)
         torch.manual_seed(_SEED)
+        # Each reference run builds a fresh model and replaces its process groups.
+        FP8GlobalStateManager.reset()
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(

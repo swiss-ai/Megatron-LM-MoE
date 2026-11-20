@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,8 @@ class PackedSeqParams:
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
+    # Document-aware CP layout of this micro-batch (megatron.core.doc_aware_cp), or None.
+    doc_aware: Any = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

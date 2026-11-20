@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 from contextlib import nullcontext
+from functools import partialmethod
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
+from megatron.core.transformer.moe import fused_a2a
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
@@ -252,9 +254,27 @@ class TestA2AOverlap:
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=4,
         )
+        self.buffer_patch = pytest.MonkeyPatch()
+        if fused_a2a.HAVE_DEEP_EP:
+            # Explicit cleanup unregisters UCCL proxies before the next Flex case.
+            self.buffer_patch.setattr(
+                fused_a2a.Buffer,
+                '__init__',
+                partialmethod(fused_a2a.Buffer.__init__, explicitly_destroy=True),
+            )
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+        try:
+            if fused_a2a.HAVE_DEEP_EP and fused_a2a._buffer is not None:
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                fused_a2a._buffer.destroy()
+                fused_a2a._buffer = None
+        finally:
+            try:
+                Utils.destroy_model_parallel()
+            finally:
+                self.buffer_patch.undo()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_transformer_layer_overlap_dense(self):

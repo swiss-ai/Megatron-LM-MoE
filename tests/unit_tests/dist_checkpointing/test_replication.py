@@ -55,7 +55,6 @@ def equal_(a, b):
 @pytest.mark.parametrize(('tp,pp'), [(2, 4), (1, 1)])
 def test_all_gather_batch(tp, pp):
     Utils.initialize_model_parallel(tp, pp)
-    torch.cuda.set_device(dist.get_rank())
     t0 = torch.arange(4, device="cuda").reshape((2, 2))
     t1 = torch.arange(6, device="cuda").reshape((3, 1, 2))
     t2 = torch.arange(12, device="cuda").reshape((2, 3, 2))

@@ -863,8 +863,9 @@ def validate_args(args, defaults={}):
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer or args.use_megatron_fsdp \
-            or args.optimizer == 'dist_muon', \
-            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+            or args.optimizer == 'dist_muon' \
+            or (args.optimizer == 'md_decoupling' and args.use_layer_wise_distributed_optimizer), \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, dist_muon, or md_decoupling with the layer-wise distributed optimizer'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -1028,6 +1029,23 @@ def validate_args(args, defaults={}):
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
+    if args.exit_on_tranche_end:
+        assert args.save, '--exit-on-tranche-end requires --save'
+        assert args.dataloader_type == 'single', '--exit-on-tranche-end requires --dataloader-type single'
+        assert not args.rampup_batch_size, '--exit-on-tranche-end requires a fixed global batch size'
+        assert not args.decrease_batch_size_if_needed, '--exit-on-tranche-end does not support decreased batch sizes'
+        assert not args.mock_data and not args.perform_rl_step and not args.sft, (
+            '--exit-on-tranche-end requires a finite GPT pretraining dataset'
+        )
+        assert not args.skip_train, '--exit-on-tranche-end cannot be used with --skip-train'
+        assert args.rerun_strategy != 'skip_iteration', (
+            '--exit-on-tranche-end requires replaying the same batch, not --rerun-strategy skip_iteration'
+        )
+    if args.tranche_start_samples is not None:
+        assert args.exit_on_tranche_end and args.tranche_start_samples >= 0, (
+            '--tranche-start-samples requires --exit-on-tranche-end and a nonnegative offset'
+        )
+
     # data
     assert args.num_dataset_builder_threads > 0
 
@@ -1125,15 +1143,40 @@ def validate_args(args, defaults={}):
             '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
             'SFT packing already restricts attention to each packed sequence.'
         )
-        assert args.context_parallel_size == 1, (
-            '--dataloader-inter-document-masking does not support context parallelism '
-            'yet: document boundaries are not guaranteed to be divisible by '
-            '2 * context-parallel-size, which the THD CP partitioning requires.'
-        )
+        if args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1:
+            # Per-document CP padding makes the physical sequence length vary per microbatch.
+            args.variable_seq_lengths = True
         assert not args.hybrid_context_parallel, (
             '--dataloader-inter-document-masking does not support hybrid context '
             'parallelism yet.'
         )
+    if args.cp_doc_aware:
+        assert args.dataloader_inter_document_masking, (
+            '--cp-doc-aware needs --dataloader-inter-document-masking (packed THD batches).'
+        )
+        assert args.context_parallel_size > 1, '--cp-doc-aware needs --context-parallel-size > 1.'
+        assert args.micro_batch_size == 1, '--cp-doc-aware needs --micro-batch-size 1.'
+        assert args.cp_comm_type is None or all(
+            c in ('p2p', 'a2a') for c in (
+                args.cp_comm_type if isinstance(args.cp_comm_type, list) else [args.cp_comm_type]
+            )
+        ), '--cp-doc-aware supports --cp-comm-type p2p or a2a (TE THD CP).'
+        assert not args.mtp_num_layers, '--cp-doc-aware does not support multi-token prediction.'
+        assert not args.hybrid_context_parallel, '--cp-doc-aware replaces hybrid CP.'
+
+    # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
+    # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
+    if args.attention_backend == AttnBackend.auto and (
+        args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    ):
+        args.attention_backend = AttnBackend.flash
+        if args.rank == 0:
+            print(
+                '> packed-sequence attention: selecting the flash attention backend '
+                '(cuDNN fused attention is much slower on THD-format batches). '
+                'Pass --attention-backend to override.',
+                flush=True,
+            )
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -1386,6 +1429,16 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k >= 2, \
+            f"--goldfish-k (drop frequency 1/k) must be >= 2; k=1 drops ~100%. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, \
+            f"--goldfish-h (context width) must be a positive integer. ({args.goldfish_h})"
+        if args.seq_length is not None:
+            assert args.goldfish_h < args.seq_length, \
+                f"--goldfish-h ({args.goldfish_h}) must be < --seq-length ({args.seq_length})."
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -1546,6 +1599,11 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
 
+    # --embedding-norm: with MTP on a later pipeline stage, that stage builds its own copy of the
+    # embedding (and of the norm), which nothing keeps in sync with the first stage's.
+    if getattr(args, 'embedding_norm', False) and args.mtp_num_layers and args.pipeline_model_parallel_size > 1:
+        raise AssertionError('--embedding-norm is not supported with --mtp-num-layers and pipeline parallelism.')
+
     # MDDecoupling optimizer check. The 2D hypersphere/Muon math is incompatible with the standard
     # distributed optimizer (it flattens each param shard to 1D); shard optimizer state via
     # --use-layer-wise-distributed-optimizer instead.
@@ -1590,6 +1648,48 @@ def validate_args(args, defaults={}):
             warn_rank_0(
                 "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
                 "softplus gains are positive, so the clamp only changes values below 1e-8."
+            )
+        if args.md_attention_in_gain_revive_threshold is not None:
+            assert args.md_attention_in_gain_revive_iteration is not None, (
+                "--md-attention-in-gain-revive-threshold needs --md-attention-in-gain-revive-iteration "
+                "(the checkpoint iteration after which the one-shot revive runs).")
+        assert args.md_post_norm_gain_pull_coeff >= 0, (
+            f"--md-post-norm-gain-pull-coeff must be >= 0; got {args.md_post_norm_gain_pull_coeff}.")
+        assert args.md_rowcol_gain_pull_coeff >= 0, (
+            f"--md-rowcol-gain-pull-coeff must be >= 0; got {args.md_rowcol_gain_pull_coeff}.")
+        if (args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff
+                or args.md_rowcol_gain_pull_coeff):
+            assert args.md_attention_in_gain_pull_target > 0, (
+                "--md-attention-in-gain-pull-target is the magnitude the pull moves |gain| toward "
+                f"and must be > 0; got {args.md_attention_in_gain_pull_target}.")
+        if args.md_attention_in_gain_pull_col_gain and not args.md_attention_in_gain_pull_coeff:
+            warn_rank_0(
+                "--md-attention-in-gain-pull-col-gain has no effect without "
+                "--md-attention-in-gain-pull-coeff > 0."
+            )
+        if (args.md_rowcol_gain_pull_coeff and args.md_gain_pull_scope != "all" and not (
+                args.md_attention_in_gain_pull_coeff or args.md_post_norm_gain_pull_coeff)):
+            warn_rank_0(
+                "--md-rowcol-gain-pull-coeff has no effect without --md-attention-in-gain-pull-coeff "
+                "or --md-post-norm-gain-pull-coeff > 0 (it only pulls the matrices next to a pulled "
+                "norm gamma, unless --md-gain-pull-scope all)."
+            )
+        if args.md_rowcol_gain_pull_coeff and args.hypersphere_gains_mode == "none":
+            warn_rank_0(
+                "--md-rowcol-gain-pull-coeff has no effect without gains "
+                "(--hypersphere-gains-mode none)."
+            )
+        if (args.md_gain_pull_scope == "moe-latent" and args.md_rowcol_gain_pull_coeff
+                and not (args.md_moe_mlp_in_gain_revive and args.md_attention_in_gain_pull_coeff)):
+            warn_rank_0(
+                "--md-gain-pull-scope moe-latent pulls fc1_latent_proj only when its "
+                "pre_mlp_layernorm gamma is pulled (--md-moe-mlp-in-gain-revive and "
+                "--md-attention-in-gain-pull-coeff > 0)."
+            )
+        if args.md_post_norm_gain_pull_coeff and not args.sandwich_norm:
+            warn_rank_0(
+                "--md-post-norm-gain-pull-coeff has no effect without --sandwich-norm "
+                "(no post_self_attn_layernorm / post_mlp_layernorm gammas)."
             )
         if args.hypersphere_radius_mode == "init":
             assert args.hypersphere_mode == "flat", (
@@ -1684,6 +1784,15 @@ def validate_args(args, defaults={}):
                 and not args.moe_shared_expert_overlap
             )
             if wgrad_in_graph_scope:
+                assert args.cuda_graph_impl == 'none' or args.pipeline_model_parallel_size > 1, (
+                    'CUDA graph with delay_wgrad_compute is not supported at '
+                    'pipeline-model-parallel-size 1. On graph replay the delayed wgrad of the '
+                    'modules inside the graph scope (shared experts / fc1_latent_proj) is done '
+                    'by replaying the captured wgrad graph, which never runs the Python '
+                    'grad-ready hooks, so DDP never issues the grad reduce for those params and '
+                    'finish_grad_sync() asserts on the first replayed iteration. Use '
+                    '--pipeline-model-parallel-size > 1, or disable CUDA graphs.'
+                )
                 assert is_te_min_version(
                     "2.12.0"
                 ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
@@ -1738,6 +1847,17 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
+            if getattr(args, 'pretraining_packing_strategy', None) == 'bfd':
+                # Capture takes a routing padding_mask only for MoE layers that have already
+                # routed with one, which needs at least one real forward before the graphs
+                # are recorded. With no warmup step the graphs are captured unmasked and TE
+                # silently ignores the mask passed at replay, so fail here instead.
+                assert args.cuda_graph_warmup_steps > 0, (
+                    "--cuda-graph-warmup-steps must be > 0 with --pretraining-packing-strategy "
+                    "bfd and --cuda-graph-impl transformer_engine: with 0 the CUDA graphs are "
+                    "captured before any forward and the MoE routing padding mask is silently "
+                    "dropped from every replay."
+                )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
@@ -2941,6 +3061,14 @@ def _add_training_args(parser):
                        help='Absolute LR for matrix (2D non-embedding/output) params under '
                        '--optimizer md_decoupling or muon/dist_muon (the Muon-managed matrices; '
                        'the scalar Adam/Lion group stays on --lr). Overrides muon_lr_factor * lr.')
+    group.add_argument('--router-lr', type=float, default=None,
+                       help='Absolute LR for MoE router weights under md_decoupling, on either '
+                       'the Muon or the Adam branch. When unset, Muon-branch routers use '
+                       '--matrix-lr and Adam-branch routers use the base --lr.')
+    group.add_argument('--router-weight-decay', type=float, default=None,
+                       help='Decoupled weight decay for MoE router weights under md_decoupling, '
+                       'independent of --weight-decay. Requires --hypersphere-router-mode none '
+                       '(the hypersphere projection would undo it).')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '
@@ -3027,6 +3155,82 @@ def _add_training_args(parser):
                        help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
                        'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
                        'including small or negative gains.')
+    group.add_argument('--md-attention-in-gain-revive-threshold', type=float, default=None,
+                       help='md_decoupling: ONCE, right after loading the checkpoint named by '
+                       '--md-attention-in-gain-revive-iteration, reset the pre-norm gamma and column '
+                       'gain entries whose effective value is below this magnitude to the mean of '
+                       'their gain vector, and zero their Adam moments. Only the input projections '
+                       'in scope (see --md-attention-in-gain-scope, --md-dense-mlp-in-gain-revive, '
+                       '--md-moe-mlp-in-gain-revive). '
+                       'Off when unset.')
+    group.add_argument('--md-attention-in-gain-revive-iteration', type=int, default=None,
+                       help='Checkpoint iteration the one-shot revive is tied to: it runs only when '
+                       'exactly this iteration is loaded; a resume from any later (or earlier) '
+                       'checkpoint never revives again. Required with the threshold.')
+    group.add_argument('--md-attention-in-gain-revive-mean', type=str, default='all',
+                       choices=['all', 'live'],
+                       help='Entries the revive mean averages over: the whole gain vector (all) '
+                       'or only the entries at or above the threshold (live).')
+    group.add_argument('--md-attention-in-gain-scope', type=str, default='softmax',
+                       choices=['softmax', 'all'],
+                       help='Which attention-in projections the revive and the pull touch: the fused '
+                       'linear_qkv of the global softmax attention layers only (softmax, default) or '
+                       'also the KDA/GDN in_proj (all). The pull reaches their column gains only with '
+                       '--md-attention-in-gain-pull-col-gain.')
+    group.add_argument('--md-dense-mlp-in-gain-revive', action='store_true', default=False,
+                       help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
+                       'iteration, mean, coefficient and target) to the pre-norm gamma fused in front '
+                       'of the dense MLP linear_fc1 and to its column gain (the dense layers of a '
+                       'hybrid dense/MoE stack). The pull reaches the column gain only with '
+                       '--md-attention-in-gain-pull-col-gain. MoE and shared experts are not touched.')
+    group.add_argument('--md-moe-mlp-in-gain-revive', action='store_true', default=False,
+                       help='Also apply the --md-attention-in-gain-* revive and pull (same threshold, '
+                       'iteration, mean, coefficient and target) to the MoE pre-MLP norm gamma '
+                       '(pre_mlp_layernorm). Only the gamma: the column gains of the matrices that '
+                       'read it are not touched.')
+    group.add_argument('--md-attention-in-gain-pull-coeff', type=float, default=0.0,
+                       help='md_decoupling: decoupled weight decay of the magnitude toward a target, '
+                       'x <- x - lr * coeff * (x - sign(x) * c), on the pre-norm gamma of the input '
+                       'projections in scope (and their column gains with '
+                       '--md-attention-in-gain-pull-col-gain): |x| moves toward c and the sign is kept '
+                       '(raw softplus gain pulled to softplus_inv(c)). 0 disables.')
+    group.add_argument('--md-attention-in-gain-pull-target', type=float, default=1.0,
+                       help='Target magnitude c of --md-attention-in-gain-pull-coeff and '
+                       '--md-post-norm-gain-pull-coeff, in effective-gain units.')
+    group.add_argument('--md-attention-in-gain-pull-col-gain', action='store_true', default=False,
+                       help='Also apply --md-attention-in-gain-pull-coeff to the MDDecoupling column '
+                       'gains of the input projections in scope. By default only the pre-norm gammas '
+                       'are pulled.')
+    group.add_argument('--md-post-norm-gain-pull-coeff', type=float, default=0.0,
+                       help='Coefficient of the pull of the sandwich-norm output gammas '
+                       '(post_self_attn_layernorm and post_mlp_layernorm of every layer, '
+                       '--sandwich-norm) toward --md-attention-in-gain-pull-target: '
+                       'x <- x - lr * coeff * (x - sign(x) * c), sign kept. Independent of '
+                       '--md-attention-in-gain-pull-coeff (the pre-norm pull), so the two can '
+                       'differ. Pull only, no revive. The QK-norm, KDA output-norm and final-norm '
+                       'gammas are not touched (see --md-gain-pull-scope all). 0 disables.')
+    group.add_argument('--md-rowcol-gain-pull-coeff', type=float, default=0.0,
+                       help='Coefficient of the pull of the MDDecoupling row and column gains toward '
+                       '--md-attention-in-gain-pull-target, only on the matrices next to a pulled '
+                       'norm gamma, layer by layer: the input projection (linear_qkv, KDA/GDN '
+                       'in_proj, dense linear_fc1) behind a pre-norm gamma pulled by '
+                       '--md-attention-in-gain-pull-coeff and the output projection (linear_proj, '
+                       'KDA/GDN out_proj, dense linear_fc2) in front of a post-norm gamma pulled by '
+                       '--md-post-norm-gain-pull-coeff. Pulls every gain of the matrix (row and '
+                       'column, or flat). Overrides --md-attention-in-gain-pull-col-gain on the '
+                       'column gain. MoE matrices are not touched unless --md-gain-pull-scope says '
+                       'so. Pull only, no revive. 0 disables.')
+    group.add_argument('--md-gain-pull-scope', type=str, default='default',
+                       choices=['default', 'moe-latent', 'all'],
+                       help='Which gains the pull coefficients reach. default: as in the help of '
+                       'each coefficient. moe-latent: also the MoE latent projections, paired like '
+                       'the dense MLP (fc1_latent_proj with the pre_mlp_layernorm gamma, which '
+                       'needs --md-moe-mlp-in-gain-revive; fc2_latent_proj with post_mlp_layernorm). '
+                       'all: every norm gamma (sandwich post-norms with '
+                       '--md-post-norm-gain-pull-coeff, every other one with '
+                       '--md-attention-in-gain-pull-coeff) and the gains of every MDDecoupling '
+                       'matrix (--md-rowcol-gain-pull-coeff), whatever the scope flags. The revive '
+                       'scope does not change.')
     group.add_argument('--use-orthogonal-updates',
                        action=argparse.BooleanOptionalAction, default=True,
                        help='Use Muon-style orthogonalized updates for matrix params under '
@@ -3060,6 +3264,9 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--pin-cpu-optimizer-state', action='store_true',
+                       help='Copy pageable CPU optimizer state into CUDA host storage after '
+                            'updates and loads. Each new allocation temporarily needs both copies.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
@@ -3157,6 +3364,16 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-staging', type=str, default='pinned',
+                       choices=['pinned', 'pageable', 'streamed'],
+                       help='How torch_dist saves stage GPU shards to the host. "pinned": '
+                       'all tensors are copied into pinned host memory first (torch rounds '
+                       'every block up to a power of two, so the peak is up to 2x the shard). '
+                       '"pageable": all tensors are copied into ordinary host memory first '
+                       '(peak = shard size, freed after the write). "streamed": tensors are '
+                       'copied one at a time right before they are written (peak = largest '
+                       'tensor); synchronous saves only, falls back to pageable with '
+                       '--async-save.')
     group.add_argument('--save-iters', type=str, default=None,
                        help='Comma-separated list of iterations at which to save a '
                        'checkpoint, in addition to --save-interval. Unlike '
@@ -3467,10 +3684,25 @@ def _add_data_args(parser):
                        'Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--mask-loss-token-ids', type=int, nargs='+', default=None,
+                       help='Token IDs whose next-token losses are masked during pretraining.')
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '
                        'to individual documents.')
+    group.add_argument('--cp-doc-aware', action='store_true',
+                       help='Document-aware context parallelism (needs '
+                       '--dataloader-inter-document-masking): keep documents of at '
+                       'most --cp-doc-aware-max-local-len tokens whole on one CP rank '
+                       '(no CP communication for them) and split only the long ones '
+                       'over the CP group. See megatron/core/doc_aware_cp.py.')
+    group.add_argument('--cp-doc-aware-max-local-len', type=int, default=None,
+                       help='Longest document kept on one CP rank '
+                       '(default: seq_length / context_parallel_size).')
+    group.add_argument('--cp-doc-aware-max-padding', type=float, default=0.01,
+                       help='Largest padding, as a fraction of the sample, accepted to '
+                       'balance the local documents over the CP ranks before the '
+                       'largest one is split over the CP group instead.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
@@ -3523,6 +3755,16 @@ def _add_data_args(parser):
                             'efficiency and don\'t cut the samples if < sequence_length.')
     group.add_argument('--max-docs-per-bin', type=int, default=0,
                        help='Maximum number of documents allowed per sample in bfd, 0 means no limit.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable Goldfish loss during pretraining: deterministically drop '
+                            '~1/k of tokens from the loss to mitigate verbatim memorization. '
+                            'Train split only. Special tokens declared by the (HuggingFace-backed) '
+                            'tokenizer are never dropped. Supported by pretrain_gpt.py only.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Goldfish drop factor k; drop probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,
+                       help='Goldfish context width: the h labels ending at (and including) '
+                            'a position are hashed to decide its drop.')
     return parser
 
 

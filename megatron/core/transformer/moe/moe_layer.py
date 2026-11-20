@@ -31,7 +31,9 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api
-from megatron.core.transformer.moe.moe_offload import MoEActReloadTrigger
+from megatron.core.transformer.moe.moe_offload import (
+    MoEReloadTrigger,
+)
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -170,6 +172,11 @@ class BaseMoELayer(MegatronModule, ABC):
         assert self.config.num_moe_experts % ep_size == 0
         self.num_local_experts = self.config.num_moe_experts // ep_size
         local_expert_indices_offset = ep_rank * self.num_local_experts
+
+        # Set the first time a mask is routed with. CUDA graph capture reads it to decide
+        # whether the graph takes a padding_mask input; capture runs after the warmup
+        # forwards (cuda_graph_warmup_steps > 0), so by then it reflects the real run.
+        self.routes_with_padding_mask = False
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
@@ -405,7 +412,16 @@ class MoELayer(BaseMoELayer):
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
+
+        padding_mask is [bsz, seq_length] as produced model-side, True for padding, and
+        is transposed here rather than by the caller: route() has several entry points and
+        orienting it in each is how some of them ended up dropping it instead.
         """
+        if padding_mask is not None:
+            self.routes_with_padding_mask = True
+            # -> [seq_length, bsz], so the flatten in the router walks tokens in the
+            # same order as hidden_states.reshape(-1, hidden_size).
+            padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
 
@@ -507,8 +523,14 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
+    def _preload_expert_weights(self):
+        """Start coarse expert-weight reload before the dispatch collective for MLP forward."""
+        init_and_preload = getattr(self.experts, "init_and_preload", None)
+        if init_and_preload is not None:
+            init_and_preload()
+
     def _wrap_activation_reload(self, output: torch.Tensor):
-        """Wire ``MoEActReloadTrigger`` on the combine output so the offloaded expert input
+        """Wire ``MoEReloadTrigger`` on the combine output so the offloaded expert input
         activation is reloaded during the combine-backward window.
 
         Reads the handle set by ``OffloadingExpertsMLP.forward``. Safe against VPP
@@ -518,7 +540,23 @@ class MoELayer(BaseMoELayer):
         """
         handle = getattr(self.experts, "_act_offload_handle", None)
         if handle is not None and getattr(handle, "active", False):
-            output = MoEActReloadTrigger.apply(output, handle)
+            output = MoEReloadTrigger.apply(output, handle)
+        return output
+
+    def _wrap_main_grad_reload(self, output: torch.Tensor):
+        """Wire ``MoEReloadTrigger`` on the combine output so the offloaded main grad
+        is reloaded during the combine-backward window.
+        """
+        handle = getattr(self.experts, "_main_grad_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEReloadTrigger.apply(output, handle)
+        return output
+
+    def _wrap_parameter_reload(self, output: torch.Tensor):
+        """Reload coarse FP8 weights during combine-backward communication for MLP backward."""
+        handle = getattr(self.experts, "_param_offload_handle", None)
+        if handle is not None and getattr(handle, "active", False):
+            output = MoEReloadTrigger.apply(output, handle)
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
@@ -533,10 +571,12 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def router_and_preprocess(self, hidden_states: torch.Tensor):
+    def router_and_preprocess(
+        self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
         """This method is a combined method of route and preprocess. Deprecated."""
 
-        probs, routing_map = self.route(hidden_states)
+        probs, routing_map = self.route(hidden_states, padding_mask)
         return self.preprocess(hidden_states, probs, routing_map)
 
     def forward(
@@ -555,9 +595,8 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask shaped [bsz, seq_length],
+                                                   True for PADDING tokens. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -566,10 +605,6 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
-        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
-
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
@@ -597,6 +632,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, hidden_states_sf, probs = intermediate_tensors
 
+                self._preload_expert_weights()
                 dispatched_input, _, probs = self.dispatch(hidden_states, hidden_states_sf, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
@@ -606,6 +642,8 @@ class MoELayer(BaseMoELayer):
                 # Reload the offloaded expert activations during the combine-backward
                 # window. No-op unless moe_offload_activations produced an active handle.
                 output = self._wrap_activation_reload(output)
+                output = self._wrap_main_grad_reload(output)
+                output = self._wrap_parameter_reload(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

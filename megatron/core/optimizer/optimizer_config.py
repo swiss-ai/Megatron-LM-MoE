@@ -328,6 +328,16 @@ class OptimizerConfig:
     muon/dist_muon (the Muon-managed matrices; the scalar Adam/Lion group stays on --lr).
     Overrides muon_lr_factor * lr."""
 
+    router_lr: Optional[float] = None
+    """Absolute LR for MoE router weights under md_decoupling, on either the Muon or the Adam
+    branch. When unset, Muon-branch routers use the matrix LR and Adam-branch routers use the
+    base --lr."""
+
+    router_weight_decay: Optional[float] = None
+    """Decoupled weight decay for MoE router weights under md_decoupling, independent of
+    --weight-decay. Requires a non-hypersphere router (--hypersphere-router-mode none): the
+    post-step hypersphere projection would undo it. When unset, routers use the global decay."""
+
     embedding_lr_multiplier: Optional[float] = None
     """LR multiplier for embedding (and tied LM-head) params under md_decoupling. Final
     max_lr = embedding_lr_multiplier * lr. When unset, those params use the base --lr."""
@@ -428,6 +438,91 @@ class OptimizerConfig:
     through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
     nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
 
+    md_attention_in_gain_revive_threshold: Optional[float] = None
+    """One-shot revive of collapsed input gains, applied right after loading the checkpoint named
+    by md_attention_in_gain_revive_iteration. Applies to the two per-input-channel gains in front
+    of the input projections in scope (see md_attention_in_gain_scope, md_dense_mlp_in_gain_revive
+    and md_moe_mlp_in_gain_revive): the pre-norm gamma (chained Adam) and the MDDecoupling column
+    gain phi(c). An entry whose effective gain is below this threshold in magnitude is reset to the
+    mean of its gain vector and its Adam moments are zeroed. None disables."""
+
+    md_attention_in_gain_revive_mean: str = 'all'
+    """Which entries the revive mean averages over: 'all' (the whole gain vector, including the
+    collapsed entries) or 'live' (only the entries at or above the threshold)."""
+
+    md_attention_in_gain_revive_iteration: Optional[int] = None
+    """Checkpoint iteration the one-shot revive is tied to: it runs right after loading exactly this
+    iteration and never again (a resume from any other iteration does not revive). Required with
+    the threshold."""
+
+    md_attention_in_gain_scope: str = 'softmax'
+    """Which attention-in projections the revive and the pull touch: 'softmax' = the fused
+    linear_qkv (pre-norm gamma + column gain) of the global softmax attention layers only;
+    'all' adds the KDA/GDN in_proj. The pull reaches the column gains only with
+    md_attention_in_gain_pull_col_gain."""
+
+    md_dense_mlp_in_gain_revive: bool = False
+    """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
+    coefficient and target) to the gamma fused in front of the dense MLP linear_fc1 and to that
+    matrix's column gain: the dense layers of a hybrid dense/MoE stack. The pull reaches the column
+    gain only with md_attention_in_gain_pull_col_gain. MoE experts and shared experts have no fused
+    pre-norm and are never touched."""
+
+    md_moe_mlp_in_gain_revive: bool = False
+    """Also apply the attention-in gain revive and pull (same threshold, iteration, mean, pull
+    coefficient and target) to the standalone pre-MLP norm gamma (pre_mlp_layernorm) in front of the
+    MoE block. Only the gamma: the column gains of the router, shared expert and expert / latent
+    input projections that read it are not touched."""
+
+    md_attention_in_gain_pull_coeff: float = 0.0
+    """Decoupled weight decay of the magnitude of the revive-scope gains toward a target value
+    instead of 0: x <- x - lr * coeff * (x - sign(x) * c), where lr is that parameter's scheduled LR
+    and sign(0) = +1, so |x| moves toward c and the sign is kept. For the pre-norm gamma x is the
+    effective gamma, applied right after the chained Adam step. With
+    md_attention_in_gain_pull_col_gain it also pulls the column gains of the revive-scope matrices;
+    for a softplus column gain x is the raw gain and c = softplus_inv(target) (the multiplier is
+    always positive), folded into the gains AdamW decay (on top of --gains-weight-decay).
+    0 disables."""
+
+    md_attention_in_gain_pull_target: float = 1.0
+    """Target magnitude c of the attention-in gain pull and of the post-norm gain pull
+    (md_post_norm_gain_pull_coeff), in effective-gain units."""
+
+    md_attention_in_gain_pull_col_gain: bool = False
+    """Also apply the attention-in gain pull to the MDDecoupling column gains of the revive-scope
+    matrices. By default only the pre-norm gammas are pulled and the column gains keep the plain
+    gains decay toward 0."""
+
+    md_post_norm_gain_pull_coeff: float = 0.0
+    """Pull of the sandwich-norm output gammas (post_self_attn_layernorm, post_mlp_layernorm of
+    every layer) toward the same target as the pre-norm pull (md_attention_in_gain_pull_target),
+    with its own coefficient: x <- x - lr * coeff * (x - sign(x) * c) on the effective gamma, right
+    after the chained Adam step. Independent of md_attention_in_gain_pull_coeff, so the pre-norm
+    and post-norm pulls can have different strengths (or either can be off). Pull only, no
+    revive. The QK-norm, KDA output-norm and final-norm gammas are not touched (unless
+    md_gain_pull_scope is "all"). 0 disables."""
+
+    md_rowcol_gain_pull_coeff: float = 0.0
+    """Pull of the MDDecoupling gains (row, column, or flat) toward md_attention_in_gain_pull_target,
+    with its own coefficient, on the matrices next to a pulled norm gamma: the input projection
+    behind a pre-norm gamma pulled by md_attention_in_gain_pull_coeff (linear_qkv, KDA/GDN in_proj,
+    dense linear_fc1, following its scope flags) and the output projection in front of a post-norm
+    gamma pulled by md_post_norm_gain_pull_coeff (linear_proj, KDA/GDN out_proj, dense linear_fc2),
+    layer by layer. Matrices next to an unpulled or absent gamma are not touched. Folded into the
+    gains AdamW decay like md_attention_in_gain_pull_col_gain, which it overrides on the column
+    gain. MoE matrices are not touched unless md_gain_pull_scope says so. Pull only, no revive.
+    0 disables."""
+
+    md_gain_pull_scope: str = "default"
+    """Which gains the three pull coefficients reach (the revive scope does not change):
+    "default": as documented on each coefficient.
+    "moe-latent": also the MoE latent projections, paired like the dense MLP: fc1_latent_proj
+    with the pre_mlp_layernorm gamma (in the pre-norm scope with md_moe_mlp_in_gain_revive) and
+    fc2_latent_proj with the post_mlp_layernorm gamma.
+    "all": every norm gamma (the sandwich post-norms with md_post_norm_gain_pull_coeff, every other
+    one with md_attention_in_gain_pull_coeff) and the gains of every MDDecoupling matrix
+    (md_rowcol_gain_pull_coeff), whatever the scope flags."""
+
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state
     over the data-parallel group (used by md_decoupling instead of the standard distributed
@@ -476,6 +571,13 @@ class OptimizerConfig:
 
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
+
+    pin_cpu_optimizer_state: bool = False
+    """Copy pageable CPU optimizer state into CUDA host storage after updates and loads.
+
+    New or replaced state requires a copy and temporarily uses both allocations.
+    Already-pinned state is reused on subsequent updates.
+    """
 
     ################
     # Miscellaneous

@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+import gc
+import logging
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -18,6 +20,32 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
+
+logger = logging.getLogger(__name__)
+
+
+def cat_with_oom_fallback(sub_state_dict):
+    """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
+    # Detach first: the fused-parameter shards (e.g. KDA in_proj, offloaded expert
+    # weight1/weight2) can be views created under no_grad whose base was later
+    # modified in-place in grad mode, which makes torch.cat raise "A view was created
+    # in no_grad mode ...". Merging for checkpointing is pure data movement, so drop
+    # the autograd view relationship before cat.
+    sub_state_dict = [t.detach() for t in sub_state_dict]
+    try:
+        return torch.cat(sub_state_dict)
+    except torch.cuda.OutOfMemoryError as e:
+        # Only a genuine device OOM should fall back to CPU. A non-OOM RuntimeError
+        # must surface (previously it was mislabeled as OOM and re-raised in the
+        # fallback, hiding the real error).
+        logger.warning(
+            f"CUDA OutOfMemoryError encountered during tensors merging."
+            f" Switching to CPU merge. (Error: {e})"
+        )
+        merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+        gc.collect()
+        torch.cuda.empty_cache()
+        return merged_sub_state_dict
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):

@@ -20,7 +20,7 @@ machinery, so a single class covers both the gains and no-gains cases.
 
 import logging
 import math
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import torch
 
@@ -42,7 +42,7 @@ from . import (
     get_standard_config_overrides,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .muon_logging import _gain_log_family
+from .muon_logging import _gain_log_family, _norm_log_component
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -150,6 +150,168 @@ def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") 
     if mode == "none":
         return 1.0
     return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
+
+
+def _global_rank() -> int:
+    return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+
+def _is_revived_pre_norm_gain(name: str, param: torch.Tensor, scope: str = "softmax",
+                              dense_mlp_in: bool = False, moe_mlp_in: bool = False) -> bool:
+    """The pre-norm gains the --md-attention-in-gain-* revive and pull act on: the norm gain fused
+    in front of an input projection, which multiplies the same per-input-channel axis as that
+    projection's MDDecoupling column gain (the matrices of :meth:`MDDecoupling._is_revived_matrix`).
+
+    ``scope`` selects which attention variants count: ``"softmax"`` (default) is the global softmax
+    attention only (TELayerNormColumnParallel linear_qkv); ``"all"`` adds the KDA/GDN in_proj.
+    ``dense_mlp_in`` adds the gamma fused in front of the dense MLP linear_fc1 (the dense layers of
+    a hybrid dense/MoE stack; MoE experts and shared experts have no fused norm and are excluded by
+    the ``.mlp.linear_fc1`` suffix), which collapses the same way as the attention-in gamma.
+    ``moe_mlp_in`` adds the standalone pre-MLP norm gamma (``pre_mlp_layernorm``) in front of the
+    MoE block. It is shared by the router, the shared expert and the expert / latent input
+    projections, so only the gamma is in scope, not their column gains.
+    """
+    if param.ndim != 1:
+        return False
+    if dense_mlp_in and name.endswith(".mlp.linear_fc1.layer_norm_weight"):
+        return True
+    if moe_mlp_in and name.endswith(".pre_mlp_layernorm.weight"):
+        return True
+    if ".self_attention." not in name:
+        return False
+    if name.endswith("linear_qkv.layer_norm_weight"):
+        return True
+    return scope == "all" and name.endswith("in_proj.layer_norm_weight")
+
+
+def _is_sandwich_post_norm_gain(name: str, param: torch.Tensor) -> bool:
+    """The sandwich-norm output gammas (--sandwich-norm): the standalone post_self_attn_layernorm
+    and post_mlp_layernorm of a layer. With md_post_norm_gain_pull_coeff > 0 they get the
+    decay-to-target pull with that coefficient (no revive)."""
+    return param.ndim == 1 and (name.endswith(".post_self_attn_layernorm.weight")
+                                or name.endswith(".post_mlp_layernorm.weight"))
+
+
+# (matrix suffix, suffix of the same layer's standalone norm next to it) for the row/col gain pull.
+_ROWCOL_PULL_NORM_PAIRS = (
+    (".self_attention.linear_proj.weight", ".post_self_attn_layernorm.weight"),
+    (".self_attention.out_proj.weight", ".post_self_attn_layernorm.weight"),
+    (".mlp.linear_fc2.weight", ".post_mlp_layernorm.weight"),
+)
+_MOE_LATENT_PULL_NORM_PAIRS = (
+    (".mlp.fc1_latent_proj.weight", ".pre_mlp_layernorm.weight"),
+    (".mlp.fc2_latent_proj.weight", ".post_mlp_layernorm.weight"),
+)
+
+
+def _rowcol_gain_pull_norm_name(name: str, param: torch.Tensor,
+                                moe_latent: bool = False) -> Optional[str]:
+    """Name of the norm gamma next to an MDDecoupling matrix whose gains md_rowcol_gain_pull_coeff
+    pulls when that gamma is pulled, None for every other param: the gamma fused into the input
+    projection (linear_qkv, KDA/GDN in_proj, dense linear_fc1) and the same layer's sandwich
+    post-norm in front of the output projection (linear_proj, KDA/GDN out_proj ->
+    post_self_attn_layernorm; dense linear_fc2 -> post_mlp_layernorm). With ``moe_latent`` (scope
+    "moe-latent") also the MoE latent projections (fc1_latent_proj -> pre_mlp_layernorm,
+    fc2_latent_proj -> post_mlp_layernorm). Other MoE matrices have none."""
+    if param.ndim != 2:
+        return None
+    if name.endswith((".self_attention.linear_qkv.weight", ".self_attention.in_proj.weight",
+                      ".mlp.linear_fc1.weight")):
+        return name[:-len("weight")] + "layer_norm_weight"
+    pairs = _ROWCOL_PULL_NORM_PAIRS + (_MOE_LATENT_PULL_NORM_PAIRS if moe_latent else ())
+    for suffix, norm in pairs:
+        if name.endswith(suffix):
+            return name[:-len(suffix)] + norm
+    return None
+
+
+@torch.no_grad()
+def _revive_pre_norm_gains(torch_optimizer: torch.optim.Optimizer, threshold: float,
+                           mean_mode: str = "all") -> Optional[torch.Tensor]:
+    """Reset the collapsed entries of every pre-norm gamma tagged ``md_revived_pre_norm_gain`` in
+    ``torch_optimizer`` (the chained Adam): entries whose effective gain (stored value + the
+    zero-centered offset) is below ``threshold`` in magnitude are set to the mean effective gain of
+    their vector and their Adam moments are zeroed. The gamma is replicated across TP and whole per
+    rank under the layer-wise optimizer, so the mean is local. Returns the number of entries reset
+    (a GPU scalar) or None when no tagged gamma lives in this optimizer."""
+    total = None
+    for group in torch_optimizer.param_groups:
+        for p in group["params"]:
+            if not getattr(p, "md_revived_pre_norm_gain", False):
+                continue
+            offset = float(getattr(p, "md_layernorm_gain_offset", 0.0))
+            eff = p + offset if offset else p
+            dead = eff.abs() < threshold
+            weight = torch.ones_like(eff) if mean_mode == "all" else (~dead).to(eff.dtype)
+            mean_eff = (eff * weight).sum() / weight.sum().clamp_min(1.0)
+            p.copy_(torch.where(dead, (mean_eff - offset).to(p.dtype), p))
+            opt_state = torch_optimizer.state.get(p)
+            if opt_state:
+                keep = ~dead
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in opt_state and torch.is_tensor(opt_state[key]) and opt_state[key].shape == p.shape:
+                        opt_state[key].mul_(keep.to(opt_state[key].dtype))
+            n = dead.sum()
+            total = n if total is None else total + n
+    return total
+
+
+@torch.no_grad()
+def revive_collapsed_gains(optimizer, threshold: float, mean_mode: str = "all") -> int:
+    """One-shot revive of collapsed input gains, run once right after the checkpoint is loaded
+    (see --md-attention-in-gain-revive-iteration in training.py).
+
+    Resets, on the fp32 main params that the optimizers step on, the collapsed entries of
+      - the pre-norm gammas tagged ``md_revived_pre_norm_gain`` (chained Adam), and
+      - the MDDecoupling column gains of the matrices in :meth:`MDDecoupling._is_revived_matrix`,
+    zeroes their moments, then publishes the new values to the model params: main -> model copy
+    on every wrapper, then the layer-wise all-gather so every DP rank sees the owner's values.
+    Returns the number of entries reset on this rank.
+    """
+    from .distrib_optimizer import DistributedOptimizer
+
+    wrappers = list(getattr(optimizer, "chained_optimizers", [optimizer]))
+    total = None
+    for wrapper in wrappers:
+        # The DistributedOptimizer shards 1-D params across DP ranks: a per-vector mean would be
+        # computed on a fragment. The MD path uses the layer-wise optimizer (whole params).
+        assert not isinstance(wrapper, DistributedOptimizer), (
+            "the gain revive needs whole parameters per rank (layer-wise or non-distributed "
+            "optimizer), not the DistributedOptimizer")
+        if getattr(wrapper, "is_stub_optimizer", False):
+            continue
+        inner = wrapper.optimizer
+        if isinstance(inner, MDDecoupling):
+            n = inner.revive_collapsed_col_gains(threshold, mean_mode)
+        else:
+            n = _revive_pre_norm_gains(inner, threshold, mean_mode)
+        if n is not None:
+            total = n if total is None else total + n
+    for wrapper in wrappers:
+        if not getattr(wrapper, "is_stub_optimizer", False) and hasattr(
+            wrapper, "_copy_main_params_to_model_params"
+        ):
+            wrapper._copy_main_params_to_model_params()
+    if hasattr(optimizer, "allgather_params"):
+        optimizer.allgather_params()
+    n = int(total) if total is not None else 0
+    if n:
+        # Every rank that owns a revived gain prints (under the layer-wise optimizer rank 0 may
+        # own none, and only rank 0 has INFO logging).
+        print(f"[rank {_global_rank()}] gain revive: {n} entries reset", flush=True)
+    return n
+
+
+def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
+    """Dimension along which TP shards ``p``, or None when ``p`` is not TP-sharded.
+
+    TE stamps ``partition_dim=0`` on duplicated-mode weights (e.g. the MoE latent projections)
+    that Megatron marks ``tensor_model_parallel=False``: every TP rank holds the full matrix.
+    """
+    if getattr(p, "tensor_model_parallel", None) is False:
+        return None
+    partition_dim = getattr(p, "partition_dim", None)
+    return None if partition_dim == -1 else partition_dim
 
 
 def _md_gain_retained_axes(gain_kind: str, model_ndim: int) -> tuple[int, ...]:
@@ -343,9 +505,11 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         use_nesterov: bool = True,
         split_qkv: bool = True,
         split_fc1: bool = True,
-        qkv_split_shapes: Optional[tuple[int, int, int]] = None,
+        qkv_split_shapes: Optional[Sequence[int]] = None,
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        is_kda_in_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        is_dense_fc1_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         is_kv_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         kv_up_proj_split_shapes: Optional[tuple[int, int]] = None,
         is_qkv_down_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -388,6 +552,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
         self.qkv_split_shapes = qkv_split_shapes
         self.qkv_dim = qkv_dim
+        self.is_kda_in_proj_fn = (
+            is_kda_in_proj_fn if is_kda_in_proj_fn is not None else (lambda p: False)
+        )
+        self.is_dense_fc1_fn = (
+            is_dense_fc1_fn if is_dense_fc1_fn is not None else (lambda p: False)
+        )
         self.is_kv_up_proj_fn = (
             is_kv_up_proj_fn if is_kv_up_proj_fn is not None else (lambda p: False)
         )
@@ -459,6 +629,29 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                         self._normalize(p, p, is_qkv=is_qkv, is_out_proj=is_out_proj,
                                         is_embedding=is_embedding, is_router=is_router,
                                         is_merged_offload_expert=is_merged_offload_expert)
+
+    def load_state_dict(self, state_dict):
+        """Load optimizer state, keeping this run's per-group LR bounds.
+
+        Param groups (including max_lr / min_lr) are saved in the checkpoint, and
+        torch.optim.Optimizer.load_state_dict restores the saved values, so a changed
+        --matrix-lr / --router-lr / --output-lr on resume would be silently ignored. The
+        scheduler recomputes group['lr'] from max_lr / min_lr every step, so restoring the
+        configured bounds after the load is enough. Groups are matched by position, which is
+        how torch pairs saved and current groups.
+        """
+        configured = [(g.get('max_lr'), g.get('min_lr')) for g in self.param_groups]
+        super().load_state_dict(state_dict)
+        for i, (group, (max_lr, min_lr)) in enumerate(zip(self.param_groups, configured)):
+            for key, value in (('max_lr', max_lr), ('min_lr', min_lr)):
+                if value is None:
+                    continue
+                if group.get(key) != value:
+                    logger.info(
+                        f"MDDecoupling param group {i}: {key} {group.get(key)} from checkpoint "
+                        f"-> {value} from current config"
+                    )
+                group[key] = value
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -595,6 +788,19 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 _split_qkv(x, self.qkv_split_shapes),
                 lambda parts: _merge_qkv(parts, x.shape, self.qkv_split_shapes),
             )
+        if self.split_qkv and self.is_kda_in_proj_fn(p):
+            shapes = getattr(p, "kda_split_shapes", None)
+            if shapes is None:
+                raise ValueError("KDA in_proj is missing kda_split_shapes metadata")
+            shapes = self._local_dim0_split_shapes(p, x, shapes, allow_groups=False)
+            if sum(shapes) != x.size(0):
+                raise ValueError(
+                    f"KDA split shapes {shapes} do not match tensor shape {x.shape}"
+                )
+            return (
+                list(torch.split(x, shapes, dim=0)),
+                lambda parts: torch.cat(parts, dim=0),
+            )
         glu_split_dim = getattr(p, "glu_split_dim", None)
         if self.split_fc1 and glu_split_dim is not None:
             return _split_glu_fc1(x, glu_split_dim)
@@ -643,7 +849,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         dim0 = x.size(0)
         if dim0 == total or (allow_groups and dim0 % total == 0):
             return shapes
-        if getattr(p, "partition_dim", None) != 0:
+        if _tp_partition_dim(p) != 0:
             return shapes
 
         tp_size = 1
@@ -658,12 +864,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             tp_size = total // dim0
         if tp_size <= 1:
             raise ValueError(
-                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"Cannot infer local split shapes for dim0-sharded projection parameter with "
                 f"tensor dim0 {dim0} and global split shapes {shapes}"
             )
         if any(shape % tp_size != 0 for shape in shapes):
             raise ValueError(
-                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"Cannot split dim0-sharded projection parameter with global split shapes {shapes} "
                 f"over TP size {tp_size}"
             )
 
@@ -696,9 +902,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                         else self.pg_collection.tp)
         else:
             tp_group = None
-        norm_partition_dim = getattr(p, "partition_dim", None)
-        if norm_partition_dim == -1:
-            norm_partition_dim = None
+        norm_partition_dim = _tp_partition_dim(p)
         partition_dim = None if self.tp_mode == "blockwise" else norm_partition_dim
 
         split = self._split_param_tensor(p, grad, is_qkv)
@@ -952,9 +1156,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_merged_offload_expert: bool,
     ) -> tuple[list[torch.Tensor], Optional[int]]:
         """Return logical matrix blocks and their TP partition dimension."""
-        partition_dim = getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            partition_dim = None
+        partition_dim = _tp_partition_dim(p)
         split = self._split_param_tensor(p, tensor, is_qkv)
         if split is not None:
             return split[0], self._split_partition_dim(p, partition_dim)
@@ -1076,7 +1278,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if mode is None:
             return
 
-        partition_dim = getattr(p, "partition_dim", None)
+        partition_dim = _tp_partition_dim(p)
         radius_scale = self._resolve_radius_scale(is_out_proj)
 
         is_expert_tp = getattr(p, "expert_tp", False)
@@ -1170,8 +1372,34 @@ class MDDecoupling(_MDDecouplingBase):
         # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
         gain_parametrization: Literal["direct", "softplus"] = "direct",
         gains_no_clamp_min: bool = False,
+        # Threshold / mean of the one-shot load-time revive (see revive_collapsed_col_gains);
+        # the iteration is only read by training.py.
+        attention_in_gain_revive_threshold: Optional[float] = None,
+        attention_in_gain_revive_mean: Literal["all", "live"] = "all",
+        attention_in_gain_revive_iteration: Optional[int] = None,
+        # Which attention-in projections the revive / pull touch: "softmax" = linear_qkv of the global
+        # softmax layers only (default); "all" adds the KDA/GDN in_proj (see _is_revived_matrix).
+        attention_in_gain_scope: Literal["softmax", "all"] = "softmax",
+        # Also revive the column gain of the dense MLP linear_fc1, and pull it with
+        # attention_in_gain_pull_col_gain (see _is_revived_matrix).
+        dense_mlp_in_gain: bool = False,
+        # Decoupled pull of the revived matrices' column gains toward a target, folded into the
+        # gains weight decay (see _gains_step); only with attention_in_gain_pull_col_gain.
+        attention_in_gain_pull_coeff: float = 0.0,
+        attention_in_gain_pull_target: float = 1.0,
+        # Off by default: the pull acts only on the pre-norm gammas (optimizer.py) and the column
+        # gains keep the plain decay. True also pulls the revived matrices' column gains.
+        attention_in_gain_pull_col_gain: bool = False,
         **kwargs,
     ):
+        self.attention_in_gain_revive_threshold = attention_in_gain_revive_threshold
+        self.attention_in_gain_revive_mean = attention_in_gain_revive_mean
+        self.attention_in_gain_revive_iteration = attention_in_gain_revive_iteration
+        self.attention_in_gain_scope = attention_in_gain_scope
+        self.dense_mlp_in_gain = dense_mlp_in_gain
+        self.attention_in_gain_pull_coeff = attention_in_gain_pull_coeff
+        self.attention_in_gain_pull_target = attention_in_gain_pull_target
+        self.attention_in_gain_pull_col_gain = attention_in_gain_pull_col_gain
         self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
         self.hypersphere_gains_mode_output = (
             None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
@@ -1316,7 +1544,7 @@ class MDDecoupling(_MDDecouplingBase):
         preserve = self.hypersphere_preserve_init
         # TP sharding info: the absorbed norm must be reduced across the TP group when it reduces
         # over the sharded dimension, else TP=1 and TP>1 absorb different magnitudes.
-        partition_dim = getattr(p, "partition_dim", None)
+        partition_dim = _tp_partition_dim(p)
         is_expert_tp = getattr(p, "expert_tp", False)
         layout = self._gain_layout(p)
 
@@ -1414,6 +1642,63 @@ class MDDecoupling(_MDDecouplingBase):
         return loss
 
     @torch.no_grad()
+    def revive_collapsed_col_gains(self, threshold: float, mean_mode: str = "all") -> Optional[torch.Tensor]:
+        """Load-time half of :func:`revive_collapsed_gains` for the MDDecoupling column gains.
+
+        For every matrix in :meth:`_is_revived_matrix` with a column gain, entries with
+        phi(c) < threshold are set to phi_inv(mean phi(c)) and their gain Adam moments are zeroed.
+        The stored param is the effective weight bare * phi(r) * phi(c), so the revived columns are
+        rescaled by phi(c_new) / phi(c_old) (with _preprocess_gains' clamp on the divisor) to keep
+        the bare weight unchanged; live columns are multiplied by exactly 1. With a dead pre-norm
+        gamma AND a dead column gain the bare column receives no gradient and the row-sphere
+        projection shrinks it every step, so the pair is an absorbing state; reviving the gain
+        restores the gradient into that bare column. Returns the number of entries reset (a GPU
+        scalar) or None when this optimizer holds no such matrix.
+        """
+        total = None
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not self._is_revived_matrix(p):
+                    continue
+                state = self.state.get(p)
+                col = state.get("col_gain") if state else None
+                if col is None:
+                    continue
+                old_eff = self._phi(col)
+                dead = old_eff.abs() < threshold
+                weight = torch.ones_like(old_eff) if mean_mode == "all" else (~dead).to(old_eff.dtype)
+                sums = torch.stack([(old_eff * weight).sum(), weight.sum()])
+                # The column gain is sharded only when the matrix is row-parallel (partition_dim
+                # == 1); reduce so every TP rank revives to the same global mean.
+                if self.pg_collection is not None and _tp_partition_dim(p) == 1:
+                    tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
+                    torch.distributed.all_reduce(sums, group=tp_group)
+                mean_eff = sums[0] / sums[1].clamp_min(1.0)
+                col.copy_(torch.where(dead, self._phi_inv(mean_eff).to(col.dtype), col))
+                divisor = old_eff if self.gains_no_clamp_min else old_eff.clamp_min(1e-8)
+                scale = torch.where(dead, self._phi(col) / divisor, torch.ones_like(old_eff))
+                p.mul_(scale[self._gain_layout(p)["col_bk"]].to(p.dtype))
+                keep = (~dead).to(col.dtype)
+                state["col_gain_m"].mul_(keep)
+                state["col_gain_v"].mul_(keep)
+                n = dead.sum()
+                total = n if total is None else total + n
+        return total
+
+    def _is_revived_matrix(self, p) -> bool:
+        """Matrices whose column gain the revive touches (and the pull, with
+        attention_in_gain_pull_col_gain): the fused attention input projection
+        in the configured scope (softmax linear_qkv always, KDA/GDN in_proj only under
+        attention_in_gain_scope == "all") and, with dense_mlp_in_gain, the dense MLP linear_fc1.
+        Its column gain is over the input channels like linear_qkv's and sits behind the same kind
+        of fused pre-norm gamma, so the dead-gamma / dead-column absorbing state is the same."""
+        return bool(
+            self.is_qkv_fn(p)
+            or (self.attention_in_gain_scope == "all" and self.is_kda_in_proj_fn(p))
+            or (self.dense_mlp_in_gain and self.is_dense_fc1_fn(p))
+        )
+
+    @torch.no_grad()
     def _preprocess_gains(self, p):
         state = self.state[p]
         eps = 1e-8
@@ -1464,7 +1749,7 @@ class MDDecoupling(_MDDecouplingBase):
         if self.pg_collection is not None:
             # partition_dim=0 -> column parallel sharding.
             # partition_dim=1 -> row parallel sharding.
-            partition_dim = getattr(p, "partition_dim", None)
+            partition_dim = _tp_partition_dim(p)
             if partition_dim in {0, 1}:  # Otherwise, p is not sharded so we don't need to sync it.
                 tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
                 if flat is not None:  # Flat gains always need to all-reduce to complete the decomposition.
@@ -1509,16 +1794,7 @@ class MDDecoupling(_MDDecouplingBase):
         # so gains decay gains_lr -> gains_min_lr exactly like a real param group (and honour
         # --min-lr-mode absolute, i.e. a fixed gains_min_lr floor — NOT the gains_lr * lr/max_lr
         # rescaling, which would floor at gains_lr * min_lr/max_lr and ignore min_lr).
-        if self.gains_lr is None:
-            lr = group["lr"]
-        else:
-            gmax = group.get("max_lr", group["lr"])
-            gmin = group.get("min_lr", 0.0)
-            denom = gmax - gmin
-            coeff = ((group["lr"] - gmin) / denom) if denom > 0 else 1.0
-            coeff = min(1.0, max(0.0, coeff))
-            gains_floor = self.gains_min_lr if self.gains_min_lr is not None else 0.0
-            lr = gains_floor + coeff * (self.gains_lr - gains_floor)
+        lr = self._gains_lr(group)
 
         bias_correction1 = 1.0 - beta1 ** step
         bias_correction2 = 1.0 - beta2 ** step
@@ -1535,15 +1811,49 @@ class MDDecoupling(_MDDecouplingBase):
         self._gain_bc1_buf.fill_(bias_correction1)
         self._gain_bc2_buf.fill_(bias_correction2)
 
+        # Pull of a revived matrix's column gain toward phi_inv(target), folded into the decoupled
+        # weight decay: g <- g - lr * (wd * g + coeff * (g - t)) = g - lr * (wd + coeff) * (g - t'),
+        # t' = coeff * t / (wd + coeff). The pull acts on the magnitude: under "direct" the stored
+        # gain is the multiplier and may be negative, so it is pulled toward sign(g) * t'; under
+        # "softplus" the multiplier is always positive and the raw gain is pulled toward t'.
+        # Only with attention_in_gain_pull_col_gain; otherwise the plain decay toward 0.
+        # Matrices tagged md_rowcol_gain_pull_coeff pull all their gains (row and column, or flat)
+        # the same way with that coefficient (it takes precedence for the column gain).
+        pull = {}
+        if (self.attention_in_gain_pull_coeff and self.attention_in_gain_pull_col_gain
+                and self._is_revived_matrix(p)):
+            pull["col_gain"] = self.attention_in_gain_pull_coeff
+        rowcol_coeff = getattr(p, "md_rowcol_gain_pull_coeff", 0.0)
+        if rowcol_coeff:
+            pull.update(row_gain=rowcol_coeff, col_gain=rowcol_coeff, flat_gain=rowcol_coeff)
+        if pull:
+            t = float(self._phi_inv(torch.tensor(self.attention_in_gain_pull_target, dtype=torch.float64)))
         for name, grad in gain_grads.items():
             gain = state[name]
             m = state[f"{name}_m"]
             v = state[f"{name}_v"]
+            name_wd, name_target = wd, 0.0
+            coeff = pull.get(name)
+            if coeff:
+                name_wd, name_target = wd + coeff, coeff * t / (wd + coeff)
             _fused_gain_adam(
                 gain, m, v, grad,
                 self._gain_lr_buf, self._gain_bc1_buf, self._gain_bc2_buf,
-                beta1, beta2, eps, wd,
+                beta1, beta2, eps, name_wd, name_target,
+                name_target != 0.0 and self.gain_parametrization == "direct",
             )
+
+    def _gains_lr(self, group) -> float:
+        """Gains LR of this step (see the schedule note in _gains_step)."""
+        if self.gains_lr is None:
+            return group["lr"]
+        gmax = group.get("max_lr", group["lr"])
+        gmin = group.get("min_lr", 0.0)
+        denom = gmax - gmin
+        coeff = ((group["lr"] - gmin) / denom) if denom > 0 else 1.0
+        coeff = min(1.0, max(0.0, coeff))
+        gains_floor = self.gains_min_lr if self.gains_min_lr is not None else 0.0
+        return gains_floor + coeff * (self.gains_lr - gains_floor)
 
     @torch.no_grad()
     def _apply_gains(self, p):
@@ -1577,28 +1887,39 @@ class MDDecoupling(_MDDecouplingBase):
 
 
 @torch.compile(dynamic=True)
-def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
+def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd, wd_target=0.0,
+                     wd_target_signed=False):
     """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
 
     lr / bc1 / bc2 are 0-dim tensors (they change every step, so passing them as
     tensors instead of Python floats avoids per-step recompilation); beta1, beta2,
-    eps and wd are run constants. `dynamic=True` shares one graph across the
-    differently shaped gain tensors. Equivalent to the eager update:
-        if wd: gain *= 1 - lr*wd
+    eps, wd, wd_target and wd_target_signed are run constants. `dynamic=True` shares one graph
+    across the differently shaped gain tensors. Equivalent to the eager update:
+        if wd: gain -= lr*wd * (gain - target)   (gain *= 1 - lr*wd when wd_target == 0)
+               target = sign(gain) * wd_target if wd_target_signed (sign(0) = +1) else wd_target
         m  = beta1*m + (1-beta1)*grad
         v  = beta2*v + (1-beta2)*grad^2
         gain -= (lr/bc1) * m / (v.sqrt()/bc2.sqrt() + eps)
     """
     if wd != 0.0:
-        gain.mul_(1.0 - lr * wd)
+        if wd_target == 0.0:
+            gain.mul_(1.0 - lr * wd)
+        elif wd_target_signed:
+            gain.sub_((gain - torch.where(gain < 0, -wd_target, wd_target)) * (lr * wd))
+        else:
+            gain.sub_((gain - wd_target) * (lr * wd))
     m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
     v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
     denom = (v.sqrt() / bc2.sqrt()).add_(eps)
     gain.sub_((lr / bc1) * (m / denom))
 
 
-def _split_qkv(x, shapes: tuple[int, int, int]) -> list[torch.Tensor]:
-    """Split grouped attention (Q, K, V / GQA) along the head-group dim."""
+def _split_qkv(x, shapes: Sequence[int]) -> list[torch.Tensor]:
+    """Split grouped attention along the head-group dim.
+
+    ``shapes`` is the per-query-group block layout: (Q, K, V) normally, or
+    (Q, Gate, K, V) when --attention-output-gate fuses a gate block into
+    linear_qkv. The split is layout-agnostic in the number of blocks."""
     shape = x.shape
     num_query_groups = shape[0] // sum(shapes)
     qkv = torch.split(
@@ -1609,7 +1930,7 @@ def _split_qkv(x, shapes: tuple[int, int, int]) -> list[torch.Tensor]:
     return [g.reshape(-1, shape[-1]) for g in qkv]
 
 
-def _merge_qkv(qkv, xshape: tuple[int, int], shapes: tuple[int, int, int]) -> torch.Tensor:
+def _merge_qkv(qkv, xshape: tuple[int, int], shapes: Sequence[int]) -> torch.Tensor:
     num_query_groups = xshape[0] // sum(shapes)
     qkv = [g.view(num_query_groups, -1, xshape[-1]) for g in qkv]
     return torch.cat(qkv, dim=1).view(xshape)
@@ -1721,22 +2042,44 @@ def _mddecoupling_config_overrides(
     router_override: ParamGroupOverride = {}
     if config.md_router_use_orthogonal_updates is not None:
         router_override['use_orthogonal_updates'] = config.md_router_use_orthogonal_updates
-    if router_uses_adam:
-        # Adam routers use base lr (matrix_lr is Muon-tuned; doesn't fit Adam).
-        router_override['max_lr'] = config.lr
-        router_override['min_lr'] = _group_min_lr(config, config.lr)
+    # Router LR: explicit --router-lr wins on either branch; otherwise Adam routers use base lr
+    # (matrix_lr is Muon-tuned; doesn't fit Adam) and Muon routers fall through to matrix_lr.
+    router_lr = config.router_lr if config.router_lr is not None else (
+        config.lr if router_uses_adam else None
+    )
+    router_has_own_lr = router_lr is not None
+    if router_has_own_lr:
+        router_override['max_lr'] = router_lr
+        router_override['min_lr'] = _group_min_lr(config, router_lr)
+    if config.router_weight_decay is not None:
+        router_sphere = (
+            config.hypersphere_router_mode
+            if config.hypersphere_router_mode is not None
+            else config.hypersphere_mode
+        )
+        if router_sphere not in (None, 'none'):
+            raise ValueError(
+                f"--router-weight-decay has no effect on a hypersphere-normalized router "
+                f"(router mode {router_sphere!r}): the post-step projection undoes the decay. "
+                f"Use --hypersphere-router-mode none."
+            )
+        # Constant per-group decay via the scheduler's start_wd/end_wd group override.
+        router_override['start_wd'] = config.router_weight_decay
+        router_override['end_wd'] = config.router_weight_decay
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
-    # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
-    # get base lr from the router_override above.
+    # Matrix LR for non-embedding/non-output matrix weights. Routers with their own LR are
+    # excluded — they get it from the router_override above (two different max_lr overrides on
+    # one param would be a conflict).
     # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
         name="md_non_embedding_or_output_matrix",
         fn=lambda p: (not getattr(p, "is_embedding_or_output_parameter", False)
                       and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
-                      and not (router_uses_adam and getattr(p, "is_router", False))),
+                      and not getattr(p, "is_kda_decay_parameter", False)
+                      and not (router_has_own_lr and getattr(p, "is_router", False))),
     )
     overrides[ParamKey(predicate=non_emb_2d)] = {
         'max_lr': matrix_lr,
@@ -1838,11 +2181,18 @@ def get_megatron_mddecoupling_optimizer(
         num_attention_heads = cfg.num_attention_heads
         num_query_groups = cfg.num_query_groups
         kv_channels = cfg.kv_channels
-        qkv_split_shapes = [
-            num_attention_heads // num_query_groups * kv_channels,
-            kv_channels,
-            kv_channels,
-        ]
+        q_group_dim = num_attention_heads // num_query_groups * kv_channels
+        if getattr(cfg, 'attention_output_gate', False):
+            # With --attention-output-gate the fused linear_qkv.weight carries an
+            # extra Q-sized gate block per query group, so its output layout is
+            # [Q, Gate, K, V] (see GQA get_query_key_value_tensors, where the gate
+            # slice matches the query slice). The optimizer must split on the same
+            # 4 blocks, otherwise _split_qkv's view/reshape mismatches the tensor.
+            # (attention_output_gate is mutually exclusive with MLA, so this only
+            # applies to the standard GQA qkv path.)
+            qkv_split_shapes = [q_group_dim, q_group_dim, kv_channels, kv_channels]
+        else:
+            qkv_split_shapes = [q_group_dim, kv_channels, kv_channels]
         is_mla = getattr(cfg, 'multi_latent_attention', False)
         if is_mla:
             # MLA views KV as [num_heads, qk_head_dim + v_head_dim], so these
@@ -1881,6 +2231,9 @@ def get_megatron_mddecoupling_optimizer(
                 param.merged_offload_expert = True
             if len(param.shape) == 2 and 'linear_qkv.weight' in name:
                 param.is_qkv = True
+            if len(param.shape) == 2 and name.endswith('.mlp.linear_fc1.weight'):
+                # Dense MLP only: experts / shared experts are '.experts.' / '.shared_experts.'.
+                param.is_dense_fc1 = True
             glu_split_dim = _glu_fc1_split_dim(
                 name, param, getattr(cfg, 'gated_linear_unit', False)
             )
@@ -1902,16 +2255,48 @@ def get_megatron_mddecoupling_optimizer(
                 elif not getattr(param, "is_md_embedding_parameter", False):
                     param.is_md_output_parameter = True
             is_out_proj = (
-                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name))
+                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name or name.endswith('out_proj.weight') ))
                 or (is_merged_offload_expert and 'experts.weight2' in name)
             )
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
+            if _is_revived_pre_norm_gain(name, param, config.md_attention_in_gain_scope,
+                                         config.md_dense_mlp_in_gain_revive,
+                                         config.md_moe_mlp_in_gain_revive):
+                # The gamma fused in front of the attention-in projection (and, with
+                # --md-dense-mlp-in-gain-revive, the dense MLP fc1): revived together with the
+                # projection's column gain (both are per-input-channel gains on the same input).
+                # With --md-moe-mlp-in-gain-revive also the MoE pre_mlp_layernorm gamma.
+                param.md_revived_pre_norm_gain = True
             if param.md_gain_log_family == "layernorm":
                 # This tagging is just to be able to log layernorm gain under muon_logging
                 param.md_layernorm_gain_offset = float(
                     getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
+                )
+                param.md_norm_log_component = _norm_log_component(name)
+            # Pull of the gamma's magnitude toward the target (the sign is kept), applied by the
+            # chained Adam's wrapper right after its step (see _decay_to_target in optimizer.py)
+            # on the effective gain p + offset. The pre-norm gammas use
+            # md_attention_in_gain_pull_coeff, the sandwich-norm output gammas
+            # (post_self_attn_layernorm, post_mlp_layernorm) md_post_norm_gain_pull_coeff;
+            # both share md_attention_in_gain_pull_target. Scope "all" gives every other norm
+            # gamma the pre-norm coefficient, except the --embedding-norm gain, which is left free
+            # to set the size of the embedding in the residual stream.
+            if getattr(param, "md_revived_pre_norm_gain", False):
+                pull_coeff = config.md_attention_in_gain_pull_coeff
+            elif _is_sandwich_post_norm_gain(name, param):
+                pull_coeff = config.md_post_norm_gain_pull_coeff
+            elif (config.md_gain_pull_scope == "all" and param.md_gain_log_family == "layernorm"
+                  and not name.endswith("embedding_norm.weight")):
+                pull_coeff = config.md_attention_in_gain_pull_coeff
+            else:
+                pull_coeff = 0.0
+            if pull_coeff:
+                param.md_decay_to_target = (
+                    float(pull_coeff),
+                    float(config.md_attention_in_gain_pull_target),
+                    float(getattr(param, "md_layernorm_gain_offset", 0.0)),
                 )
             module_name = name.rpartition('.')[0]
             while module_name:
@@ -1921,6 +2306,19 @@ def get_megatron_mddecoupling_optimizer(
                     param.md_gain_log_layer = int(layer_number) - 1
                     break
                 module_name = module_name.rpartition('.')[0]
+        # Row/col gain pull: the matrices whose neighbouring gamma is pulled (tagged above), or
+        # every matrix under scope "all" (a param without MDDecoupling gains ignores the tag).
+        if config.md_rowcol_gain_pull_coeff:
+            chunk_params = dict(model_chunk.named_parameters())
+            moe_latent = config.md_gain_pull_scope == "moe-latent"
+            for name, param in chunk_params.items():
+                if config.md_gain_pull_scope == "all":
+                    pulled = param.ndim >= 2
+                else:
+                    norm = chunk_params.get(_rowcol_gain_pull_norm_name(name, param, moe_latent))
+                    pulled = hasattr(norm, "md_decay_to_target")
+                if param.requires_grad and pulled:
+                    param.md_rowcol_gain_pull_coeff = float(config.md_rowcol_gain_pull_coeff)
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
     hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)
@@ -1933,7 +2331,11 @@ def get_megatron_mddecoupling_optimizer(
                 continue
             is_emb = getattr(param, 'is_embedding_or_output_parameter', False)
             is_merged_offload_expert = getattr(param, 'merged_offload_expert', False)
-            if len(param.shape) == 2 and (not is_emb or emb_in_md):
+            if (
+                len(param.shape) == 2
+                and (not is_emb or emb_in_md)
+                and not getattr(param, 'is_kda_decay_parameter', False)
+            ):
                 linear_params.append(param)
             elif len(param.shape) == 3 and is_merged_offload_expert:
                 # In OffloadingExpert with FP8, the expert weight is 3D (num_local_experts, out, in).
@@ -1966,6 +2368,8 @@ def get_megatron_mddecoupling_optimizer(
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=qkv_split_shapes,
         qkv_dim=model_chunks[0].config.kv_channels,
+        is_kda_in_proj_fn=lambda p: getattr(p, "is_kda_in_proj", False),
+        is_dense_fc1_fn=lambda p: getattr(p, "is_dense_fc1", False),
         is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
         kv_up_proj_split_shapes=kv_up_proj_split_shapes,
         is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),
@@ -1997,6 +2401,14 @@ def get_megatron_mddecoupling_optimizer(
         gains_weight_decay=config.weight_decay,
         gain_parametrization=config.gain_parametrization,
         gains_no_clamp_min=config.gains_no_clamp_min,
+        attention_in_gain_revive_threshold=config.md_attention_in_gain_revive_threshold,
+        attention_in_gain_revive_mean=config.md_attention_in_gain_revive_mean,
+        attention_in_gain_revive_iteration=config.md_attention_in_gain_revive_iteration,
+        attention_in_gain_scope=config.md_attention_in_gain_scope,
+        dense_mlp_in_gain=config.md_dense_mlp_in_gain_revive,
+        attention_in_gain_pull_coeff=config.md_attention_in_gain_pull_coeff,
+        attention_in_gain_pull_target=config.md_attention_in_gain_pull_target,
+        attention_in_gain_pull_col_gain=config.md_attention_in_gain_pull_col_gain,
     )
 
     optimizers = []

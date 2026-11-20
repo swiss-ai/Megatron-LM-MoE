@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from datetime import timedelta
+from uuid import uuid4
 
 import torch
-from torch._C._distributed_c10d import PrefixStore
-from torch.distributed import rendezvous
+from torch.distributed import PrefixStore, rendezvous
 
 import megatron.core.parallel_state as ps
 
@@ -29,12 +29,13 @@ class TestModel(torch.nn.Module):
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    # Use the global rank for collectives and the local rank for CUDA.
+    rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
     inited = False
     store = None
 
     @staticmethod
-    def initialize_distributed():
+    def initialize_distributed(store_prefix='default_pg'):
 
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_FUSED_ATTN', None)
@@ -58,7 +59,7 @@ class Utils:
 
             # Use a PrefixStore to avoid accidental overrides of keys used by
             # different systems (e.g. RPC) in case the store is multi-tenant.
-            store = PrefixStore("default_pg", store)
+            store = PrefixStore(store_prefix, store)
             Utils.store = store
 
             torch.distributed.init_process_group(
@@ -67,6 +68,30 @@ class Utils:
 
             torch.distributed.barrier()
         Utils.inited = True
+
+    @staticmethod
+    def reinitialize_distributed():
+        """Recreate the default world to release CXI queues retained after subgroup teardown."""
+        Utils.initialize_distributed()
+        Utils.destroy_model_parallel()
+        if ps.model_parallel_is_initialized():
+            raise RuntimeError('Cannot reset the distributed world before model cleanup completes')
+
+        store = Utils.store
+        if store is None:
+            raise RuntimeError('Cannot reset a distributed world not initialized by Utils')
+        world_size = torch.distributed.get_world_size()
+        if torch.distributed.get_rank() == 0:
+            store.set('next_test_world', uuid4().hex)
+        namespace = store.get('next_test_world').decode()
+        torch.distributed.destroy_process_group()
+
+        # The store survives group teardown; use fresh barrier keys for this world.
+        shutdown_key = f'test_world_shutdown/{namespace}'
+        if store.add(f'{shutdown_key}/count', 1) == world_size:
+            store.set(f'{shutdown_key}/complete', '1')
+        store.wait([f'{shutdown_key}/complete'])
+        Utils.initialize_distributed(store_prefix=f'default_pg/{namespace}')
 
     @staticmethod
     def set_world_size(world_size=None, rank=None):
@@ -78,11 +103,24 @@ class Utils:
             torch.distributed.destroy_process_group()
 
         if rank is None:
-            Utils.rank = int(os.environ['LOCAL_RANK'])
+            Utils.rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
             if Utils.rank >= Utils.world_size:
                 Utils.rank = -1
         else:
             Utils.rank = rank
+
+    @staticmethod
+    def _destroy_model_parallel_groups():
+        # Core clears NCCL handles, but Torch retains them until explicitly destroyed.
+        groups = [
+            group
+            for group in ps._global_process_group_list or []
+            if group is not None
+            and torch.distributed.get_backend(group) == torch.distributed.Backend.NCCL
+        ]
+        ps.destroy_model_parallel()
+        for group in reversed(groups):
+            torch.distributed.destroy_process_group(group)
 
     @staticmethod
     def destroy_model_parallel():
@@ -100,7 +138,7 @@ class Utils:
         except Exception:
             Utils.inited = False
             return
-        ps.destroy_model_parallel()
+        Utils._destroy_model_parallel_groups()
         Utils.inited = False
 
     @staticmethod
@@ -116,7 +154,7 @@ class Utils:
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
-        ps.destroy_model_parallel()
+        Utils._destroy_model_parallel_groups()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(
             tensor_model_parallel_size,

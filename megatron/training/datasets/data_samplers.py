@@ -99,6 +99,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -106,6 +108,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
         **extra_kwargs,
     )
 

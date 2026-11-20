@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -330,19 +332,22 @@ def test_apply_post_norm_sandwich_norm_math():
     norm = torch.nn.LayerNorm(hidden)
     norm.weight.data.normal_()
     norm.bias.data.normal_()
+    layer = SimpleNamespace(residual_output_scale=None)
 
     # Disabled (IdentityOp): the (output, bias) pair is returned unchanged.
-    out_disabled, bias_disabled = TransformerLayer._apply_post_norm((output, bias), IdentityOp())
+    out_disabled, bias_disabled = TransformerLayer._apply_post_norm(
+        layer, (output, bias), IdentityOp()
+    )
     assert out_disabled is output
     assert bias_disabled is bias
 
     # Enabled with a bias: bias is folded in, output is normalized, bias is dropped.
-    out_enabled, bias_enabled = TransformerLayer._apply_post_norm((output, bias), norm)
+    out_enabled, bias_enabled = TransformerLayer._apply_post_norm(layer, (output, bias), norm)
     assert bias_enabled is None
     torch.testing.assert_close(out_enabled, norm(output + bias))
 
     # Enabled without a bias: just normalize the output.
-    out_no_bias, bias_no_bias = TransformerLayer._apply_post_norm((output, None), norm)
+    out_no_bias, bias_no_bias = TransformerLayer._apply_post_norm(layer, (output, None), norm)
     assert bias_no_bias is None
     torch.testing.assert_close(out_no_bias, norm(output))
 

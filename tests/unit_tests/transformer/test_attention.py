@@ -243,6 +243,8 @@ class TestParallelAttention:
         )
 
     def teardown_method(self):
+        if hasattr(self, 'parallel_attention'):
+            del self.parallel_attention
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
@@ -552,10 +554,18 @@ class TestSelfAttention:
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, output_gate):
         self.output_gate = output_gate
+        self.grid = None
         Utils.destroy_model_parallel()
 
     def teardown_method(self):
-        Utils.destroy_model_parallel()
+        if hasattr(self, 'self_attention'):
+            del self.self_attention
+        try:
+            Utils.destroy_model_parallel()
+        finally:
+            if self.grid is not None:
+                self.grid.destroy()
+                self.grid = None
 
     def run_self_attention(self, pg_collection):
         tensor_model_parallel_size = torch.distributed.get_world_size(pg_collection.tp)
@@ -633,11 +643,11 @@ class TestSelfAttention:
             torch.distributed.init_process_group(backend='nccl')
 
         # Create HyperCommGrid with dimensions cp, tp (reversed from device mesh order)
-        grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])
+        self.grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])
 
         # Get TP and CP process groups from HyperCommGrid
-        tp_group = grid.create_pg("tp")
-        cp_group = grid.create_pg("cp")
+        tp_group = self.grid.create_pg("tp")
+        cp_group = self.grid.create_pg("cp")
 
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
 

@@ -34,6 +34,7 @@ class TestParallelSequentialMLP:
             gated_linear_unit=True,
             bias_activation_fusion=True,
             moe_router_load_balancing_type="sinkhorn",
+            moe_router_violation_metrics=[],
             moe_router_topk=1,
             add_bias_linear=False,
         )
@@ -84,6 +85,7 @@ class TestTEParallelSequentialMLP:
             gated_linear_unit=True,
             bias_activation_fusion=False,
             moe_router_load_balancing_type="sinkhorn",
+            moe_router_violation_metrics=[],
             moe_router_topk=1,
             params_dtype=torch.bfloat16,
             expert_model_parallel_size=2,

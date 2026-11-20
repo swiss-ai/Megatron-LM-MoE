@@ -20,6 +20,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.ssm.packed_seq_utils import (
+    assert_masking_isolates_documents,
+    assert_packed_backward_matches_dense,
+    assert_packed_matches_dense,
+    gated_backward_blocked_by_fla,
+)
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
@@ -46,7 +52,6 @@ except ImportError:
         (1, False, 1),
         (2, False, 1),
         (2, True, 1),
-        # GDN does not support CP for now. Leave it for future work.
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
@@ -145,38 +150,22 @@ class TestGatedDeltaNet:
     def test_forward_thd_correctness(self):
         """Packed (THD) forward must match running each document independently
         in dense (SBHD) mode."""
-        if self.cp_size > 1 or self.sp_size > 1:
-            pytest.skip("Packed-sequence GDN forward does not support CP/SP yet.")
-        gdn = self.gdn
+        assert_packed_matches_dense(self.gdn, self.sp_size, self.cp_size)
 
-        num_docs = 4
-        doc_len = 32
-        total_len = num_docs * doc_len
-        hidden = gdn.config.hidden_size
+    @pytest.mark.skipif(
+        gated_backward_blocked_by_fla(),
+        reason="FLA blocks the gated chunk backward on Hopper with triton <3.7.1 (#640).",
+    )
+    def test_backward_thd_matches_per_document_dense(self):
+        """Packed backward must match the per-document dense reference."""
+        assert_packed_backward_matches_dense(self.gdn, self.sp_size, self.cp_size)
 
-        torch.manual_seed(0)
-        hidden_states = torch.randn(
-            total_len, 1, hidden, device=torch.cuda.current_device(), dtype=torch.bfloat16
+    def test_forward_thd_masks_across_documents(self):
+        """Uneven documents must stay isolated from each other."""
+        assert_masking_isolates_documents(
+            self.gdn, [24, 40, 8, 56], self.sp_size, self.cp_size,
+            self.gdn.config.hidden_size,
         )
-
-        cu_seqlens = torch.arange(
-            0, total_len + doc_len, doc_len, device=torch.cuda.current_device(), dtype=torch.int32
-        )
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=doc_len,
-            max_seqlen_kv=doc_len,
-        )
-        packed_out, _ = gdn(hidden_states, attention_mask=None, packed_seq_params=packed_seq_params)
-
-        # Dense reference: each document as its own batch element.
-        dense_hidden_states = hidden_states.view(num_docs, doc_len, hidden).transpose(0, 1).contiguous()
-        dense_out, _ = gdn(dense_hidden_states, attention_mask=None)
-        dense_out_flat = dense_out.transpose(0, 1).reshape(total_len, 1, hidden)
-
-        torch.testing.assert_close(packed_out, dense_out_flat, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize(
@@ -184,10 +173,13 @@ class TestGatedDeltaNet:
     [
         (4, False, 1),  # TP w/o SP
         (4, True, 1),  # TP w/ SP
-        # CP does not support GDN for now. Add it once it is supported.
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(
+    gated_backward_blocked_by_fla(),
+    reason="FLA blocks the gated chunk backward on Hopper with triton <3.7.1 (#640).",
+)
 def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     # Constants
     seed = 123

@@ -41,6 +41,7 @@ class TestMoELayerInit:
             moe_token_dispatcher_type=moe_token_dispatcher_type,
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
+            moe_router_violation_metrics=[],
             moe_grouped_gemm=grouped_gemm,
             moe_ffn_hidden_size=128,
             add_bias_linear=False,
@@ -69,6 +70,7 @@ class TestMoELayerInit:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
+            moe_router_violation_metrics=[],
             moe_grouped_gemm=grouped_gemm,
             add_bias_linear=False,
         )
@@ -98,6 +100,7 @@ class TestMoELayerInit:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
+            moe_router_violation_metrics=[],
             add_bias_linear=False,
             moe_grouped_gemm=grouped_gemm,
             moe_token_dispatcher_type=moe_token_dispatcher_type,
@@ -147,6 +150,7 @@ class TestInterleaveTransformerBlock:
             moe_ffn_hidden_size=256,
             use_cpu_initialization=True,
             num_moe_experts=2,
+            moe_router_violation_metrics=[],
             add_bias_linear=False,
         )
         self.parallel_transformer_block = TransformerBlock(
@@ -221,6 +225,7 @@ class TestMoELayerFP16:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
+            moe_router_violation_metrics=[],
             moe_grouped_gemm=False,  # Use SequentialMLP for fp16 test
             moe_ffn_hidden_size=256,
             add_bias_linear=False,
@@ -315,6 +320,7 @@ class TestMoELayerRecompute:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
+            moe_router_violation_metrics=[],
             moe_grouped_gemm=False,
             moe_ffn_hidden_size=256,
             add_bias_linear=False,

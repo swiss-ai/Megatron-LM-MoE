@@ -19,7 +19,11 @@ from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
-from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
+from megatron.core.datasets.indexed_dataset import (
+    DType,
+    IndexedDatasetBuilder,
+    _IndexReader,
+)
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -371,7 +375,7 @@ def test_fast_builder(
         )
     )
 
-    with TempNamedDir(tmp_path_dist_ckpt / "test_fast_builder", sync=True) as temp_dir:
+    def check_datasets(temp_dir, sequences_per_dataset):
         # Created file_prefixes (tokenizer, Number of files, number of documents, path) --> returns file prefixes (list of strings)
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             file_prefixes = create_file_prefixes(
@@ -529,6 +533,12 @@ def test_fast_builder(
                     )
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_fast_builder", sync=True) as temp_dir:
+        try:
+            check_datasets(temp_dir, sequences_per_dataset)
+        finally:
+            _IndexReader.__getitem__.cache_clear()
 
 
 if __name__ == "__main__":

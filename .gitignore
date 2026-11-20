@@ -26,3 +26,6 @@ docs/apidocs
 # _research/ is a submodule (swiss-ai/pretrain @ apertus-2-pretrain-ablations);
 # its own .gitignore covers packages/ and results/ inside it.
 cache/
+
+# Secrets
+.env

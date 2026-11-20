@@ -60,6 +60,8 @@ except ImportError:
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
+    "is_kda_in_proj": False,
+    "kda_split_shapes": None,
     "is_kv_up_proj": False,
     "is_q_up_proj": False,
     "is_qkv_down_proj": False,

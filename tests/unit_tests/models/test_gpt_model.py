@@ -225,6 +225,7 @@ def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
         gated_linear_unit=gated_linear_unit,
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
+        moe_router_violation_metrics=[],
     )
     gpt_model = GPTModel(
         config=transformer_config,

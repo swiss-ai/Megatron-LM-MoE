@@ -26,6 +26,52 @@ Current production location on the HPC cluster:
 /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/text/common_pile/v01_filtered_data/
 ```
 
+## Prepare data on CSCS Alps
+
+From the repository root on a login node:
+
+```bash
+srun \
+    --account="${ACCOUNT:-csstaff}" \
+    --partition="${PARTITION:-preemptable}" \
+    --nodes=1 \
+    --ntasks=1 \
+    --cpus-per-task=72 \
+    --gpus-per-node=4 \
+    --exclusive \
+    --time="${TIME:-05:00:00}" \
+    --mpi=pmix \
+    --network=disable_rdzv_get \
+    --environment="$PWD/tests/test_utils/recipes/gh200/environment.toml" \
+    --container-mounts="$SCRATCH:$SCRATCH,$HOME:$HOME,/capstor:/capstor,/iopsstor:/iopsstor,/ritom:/ritom" \
+    bash "$PWD/tools/common_pile_dataset/prepare_gpt_ci_data.sh"
+```
+
+[`prepare_gpt_ci_data.sh`](prepare_gpt_ci_data.sh) uses the test image's packages.
+It prepares GPT data, validates the index and checksums, then moves the verified
+files into the asset directory. It does not install packages.
+
+| Setting | Default |
+| --- | --- |
+| `DATA_ROOT` | `/capstor/store/cscs/swissai/infra01/megatron-test-assets` |
+| Output | `$DATA_ROOT/text/common_pile/v01_filtered_data/` |
+| Models | GPT only (`--models gpt`) |
+| Documents | `12000000` |
+| Dataset revision | Current Hugging Face dataset commit, resolved once per build |
+| GPT-2 tokenizer revision | Current Hugging Face tokenizer commit, resolved once per build |
+| `WORK_DIR` | `$SCRATCH/tmp/megatron-gpt-data-<timestamp>-<pid>` |
+| `WORKERS` | `4` preprocessing workers |
+| `IMAGE_PYTHON` | `/usr/bin/python` inside the container |
+
+The wrapper passes the resolved commits as `--dataset-revision` and
+`--gpt2-revision`, and records them in `source.json`. It passes `WORK_DIR` as
+`--work-dir`. Normal test runs reuse the prepared assets; they do not resolve new
+source revisions.
+
+The destination must be absent. The script does not overwrite existing assets.
+It retains raw JSONL in `WORK_DIR`. Functional tests use `DATA_PATH` for the shared
+asset root; set it to match `DATA_ROOT` when using another destination.
+
 ## Quick Start (HPC)
 
 The fastest way to recreate the dataset on the NVIDIA HPC cluster:

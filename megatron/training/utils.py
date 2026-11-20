@@ -47,13 +47,27 @@ from megatron.core.transformer.module import param_is_not_shared
 
 
 def _calc_cpu_tensors_l2_norm_squared(tensors, chunk_numel=16 * 1024 * 1024):
-    """Calculate a squared L2 norm for CPU tensors without a full FP32 copy."""
-    norm_2 = torch.zeros((), dtype=torch.float64, device='cpu')
+    """Return the squared norm on CUDA, staging CPU weights in at most 32 MiB chunks.
+    """
+    if chunk_numel <= 0:
+        raise ValueError('chunk_numel must be positive')
+    norm_2 = torch.zeros((), dtype=torch.float64, device='cuda')
+    staging = None
     for tensor in tensors:
+        if tensor.device.type != 'cpu':
+            raise ValueError('Expected CPU tensors for the staged parameter norm')
         flat_tensor = tensor.detach().reshape(-1)
-        for start in range(0, flat_tensor.numel(), chunk_numel):
-            chunk = flat_tensor[start : start + chunk_numel]
-            chunk_norm = torch.linalg.vector_norm(chunk, ord=2, dtype=torch.float32)
+        if flat_tensor.numel() == 0:
+            continue
+        if staging is None:
+            staging = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=norm_2.device)
+        typed_staging = staging.view(tensor.dtype)
+        step = min(chunk_numel, typed_staging.numel())
+        for start in range(0, flat_tensor.numel(), step):
+            chunk = flat_tensor[start : start + step]
+            gpu_chunk = typed_staging[:chunk.numel()]
+            gpu_chunk.copy_(chunk, non_blocking=True)
+            chunk_norm = torch.linalg.vector_norm(gpu_chunk, ord=2, dtype=torch.float32)
             norm_2 += chunk_norm.double().square()
     return norm_2
 
@@ -89,7 +103,14 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            # EP experts can be distinct across dense TP ranks. Filter replicas
+            # within the parameter's own TP domain before collecting its norm.
+            tp_group = (
+                mpu.get_expert_tensor_parallel_group()
+                if getattr(param, 'expert_tp', False) or not getattr(param, 'allreduce', True)
+                else mpu.get_tensor_model_parallel_group()
+            )
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group)
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
@@ -319,6 +340,61 @@ def report_memory(name):
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
+def report_host_memory(name):
+    """Host memory report using torch.cuda.host_memory_stats().
+    """
+    gib = 1024.0**3
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if mpu.get_data_parallel_rank() != 0:
+        return
+
+    try:
+        host_stats = torch.cuda.host_memory_stats()
+    except (RuntimeError, AttributeError):
+        host_stats = {}
+    pinned = ""
+    if host_stats:
+        pinned = (
+            f" | pinned pool: {host_stats.get('allocated_bytes.current', 0) / gib:.2f}"
+            f" (peak {host_stats.get('allocated_bytes.peak', 0) / gib:.2f})"
+            f" | pinned blocks: {host_stats.get('allocations.current', 0)}"
+            f" | cudaHostAlloc/Free: {host_stats.get('num_host_alloc', 0)}"
+            f"/{host_stats.get('num_host_free', 0)}"
+        )
+
+    # activation cpu pool and main grad gpu pool
+    act_pool = ""
+    mgrad_pool = ""
+    try:
+        from megatron.core.transformer.moe.moe_offload import MoEOffloadMemoryPool
+
+        stats = MoEOffloadMemoryPool.get_instance().stats()
+        
+        cpu_buf_num, cpu_buf_size, cpu_free_size = stats["cpu"]
+        gpu_buf_num, gpu_buf_size, gpu_free_size = stats["gpu"]
+
+        if cpu_buf_num > 0:
+            act_pool = (
+                f" | act pool: {cpu_buf_num} buffers, "
+                f"{cpu_buf_size / gib:.2f} GB total, "
+                f"{cpu_free_size / gib:.2f} GB free"
+            )
+        if gpu_buf_num > 0:
+            mgrad_pool = (
+                f" | mgrad pool: {gpu_buf_num} buffers, "
+                f"{gpu_buf_size / gib:.2f} GB total, "
+                f"{gpu_free_size / gib:.2f} GB free"
+            )
+    except (ImportError, AttributeError):
+        pass
+
+    print(
+        f"[Rank {rank}] {name} host memory (GiB)"
+        f"{pinned}"
+        f"{act_pool}"
+        f"{mgrad_pool}",
+        flush=True,
+    )
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
@@ -552,6 +628,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
     has_cu_seqlens = args.sft or getattr(args, 'dataloader_inter_document_masking', False)
+    has_bfd_padding = getattr(args, 'pretraining_packing_strategy', None) == 'bfd'
+    broadcast_bfd_padding = has_bfd_padding and mpu.get_tensor_model_parallel_world_size() > 1
 
     def _broadcast(item):
         if item is not None:
@@ -565,6 +643,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         assert data_iterator is not None
         data = next(data_iterator)
+        num_valid_tokens = (
+            data["num_valid_tokens"].cuda(non_blocking=True) if has_bfd_padding else None
+        )
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
@@ -658,6 +739,18 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast_max_seqlen(batch['max_seqlen'])
 
+        elif has_bfd_padding:
+            # A genuine middle PP stage needs only the compact BFD metadata.
+            batch['tokens'] = None
+            batch['labels'] = None
+            batch['loss_mask'] = None
+            batch['attention_mask'] = None
+            batch['position_ids'] = None
+
+        if broadcast_bfd_padding:
+            # One int32 per sample replaces a sequence-length boolean mask.
+            _broadcast(num_valid_tokens)
+
     else:
         if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
@@ -680,6 +773,13 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             shape,
             dtype=torch.float32,
             device=torch.cuda.current_device(),
+        )
+        num_valid_tokens = (
+            torch.empty(
+                args.micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            if has_bfd_padding
+            else None
         )
         if args.create_attention_mask_in_dataloader:
             shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
@@ -782,6 +882,16 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             cu_seqlens = _broadcast_cu_seqlens()
             max_seqlen = _broadcast_max_seqlen()
 
+        elif has_bfd_padding:
+            tokens = None
+            labels = None
+            loss_mask = None
+            attention_mask = None
+            position_ids = None
+
+        if broadcast_bfd_padding:
+            _broadcast(num_valid_tokens)
+
         batch = {
             'tokens': tokens,
             'labels': labels,
@@ -792,6 +902,10 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
         }
+
+    if has_bfd_padding:
+        positions = torch.arange(args.seq_length, device=num_valid_tokens.device).unsqueeze(0)
+        batch['padding_mask'] = positions >= num_valid_tokens.unsqueeze(1)
 
     return batch
 

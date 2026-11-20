@@ -93,6 +93,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
+        # Each child may mix dense and expert parameters. Duplicate filtering
+        # must use the parameter's TP domain, independently of DP ownership.
+        for optimizer in optimizers:
+            optimizer.tp_group = self.pg_collection.tp
+            optimizer.expt_tp_group = self.pg_collection.expt_tp
+
         super().__init__(optimizers)
 
         # TODO(kunlun, deyuf): potential future perf optimization
@@ -196,10 +202,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """All-gather updated params from all ranks."""
 
         # helper function to flatten local params, all-gather,
-        # unflatten and copy to model params
-        def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+        # unflatten and copy to model params. One flat buffer (and one collective) needs a
+        # single dtype, so the params of one dtype are gathered at a time.
+        def _allgather_single_dtype(params_list, group, dtype):
+            device = next(p.device for params in params_list for p in params)
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
@@ -231,6 +237,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 updated_params = _unflatten_dense_tensors(gather_list[idx], params)
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
+
+        def _allgather_helper(params_list, group):
+            # A shard can mix dtypes (fp32 KDA decay params next to bf16 weights). params_list
+            # holds every rank's shard, so all ranks derive the same dtype order and issue
+            # the same collectives; a rank with no params of a dtype sends an empty tensor.
+            dtypes = sorted({p.dtype for params in params_list for p in params}, key=str)
+            for dtype in dtypes:
+                _allgather_single_dtype(
+                    [[p for p in params if p.dtype == dtype] for params in params_list],
+                    group,
+                    dtype,
+                )
 
         def _allgather_helper_experts_param(params_list, group):
             rank = get_pg_rank(group)
@@ -322,12 +340,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=None,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.pg_collection.tp,
+            expt_tp_group=self.pg_collection.expt_tp,
         )
 
     @torch.no_grad()
-    def step(self):  # type: ignore[no-untyped-def]
-        """step function for layer-wise optimizer."""
-        update_successful, grad_norm, num_zeros_in_grad = super().step()
+    def step_after_grad_norm(self, grad_norm):
+        """step function for layer-wise optimizer after grad norm is computed.
+
+        NOTE: ChainedOptimizer.step() routes to here, so step() is not overridden.
+        ChainedOptimizer.step() --> LayerWiseDistributedOptimizer.step_after_grad_norm() -->
+        ChainedOptimizer.step_after_grad_norm() --> allgather_params()
+        """
+        update_successful, _, num_zeros_in_grad = super().step_after_grad_norm(grad_norm)
 
         # All gather updated params. If async_allgather is True, the allgather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.

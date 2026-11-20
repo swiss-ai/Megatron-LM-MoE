@@ -1519,6 +1519,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("doc_aware")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1557,6 +1558,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        if packed_seq_params is not None and packed_seq_params.doc_aware is not None:
+            return self._doc_aware_forward(
+                query, key, value, attention_mask, attn_mask_type, attention_bias,
+                packed_seq_params.doc_aware, num_splits,
+            )
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
@@ -1647,6 +1653,49 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
+
+    def _doc_aware_forward(
+        self, query, key, value, attention_mask, attn_mask_type, attention_bias, layout, num_splits
+    ):
+        """Document-aware CP (megatron.core.doc_aware_cp): the rank's first ``local_len``
+        tokens are whole documents and attend without CP; the rest is the rank's zigzag
+        share of the long documents and goes through the CP group as usual."""
+        assert query.dim() == 3, "document-aware CP expects THD query/key/value [t, h, d]"
+        assert not (self.config.qk_clip or self.config.log_max_attention_logit), (
+            "document-aware CP does not support qk-clip / max-logit logging"
+        )
+        n = layout.local_len
+        both = layout.has_local and layout.has_long
+
+        def part(x, start, stop):
+            # TE accepts separate q/k/v buffers only at storage offset 0, so the second
+            # part of a mixed micro-batch is copied (one copy of its q, k, v per layer).
+            x = x[start:stop]
+            return x.clone() if both and x.storage_offset() != 0 else x
+
+        outputs = []
+        if layout.has_local:
+            cp = (self.cp_group, self.cp_global_ranks, self.cp_stream, self.cp_comm_type)
+            super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            try:
+                outputs.append(
+                    self.forward(
+                        part(query, 0, n), part(key, 0, n), part(value, 0, n),
+                        attention_mask, attn_mask_type, attention_bias,
+                        layout.local_params, num_splits,
+                    )
+                )
+            finally:
+                super().set_context_parallel_group(*cp)
+        if layout.has_long:
+            outputs.append(
+                self.forward(
+                    part(query, n, None), part(key, n, None), part(value, n, None),
+                    attention_mask, attn_mask_type, attention_bias,
+                    layout.long_params, num_splits,
+                )
+            )
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
     def sharded_state_dict(
         self,

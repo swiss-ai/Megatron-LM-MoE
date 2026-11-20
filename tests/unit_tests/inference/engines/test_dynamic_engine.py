@@ -6,6 +6,7 @@ import math
 import os
 import random
 import types
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
@@ -26,12 +27,17 @@ from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
     DynamicInferenceContext,
+    RequestCapacityOverflowError,
     RequestOverflowError,
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceEventType,
+    DynamicInferenceRequest,
+    Status,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -337,6 +343,11 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                # Keep the optimized transformer when the profile selects NCCL.
+                inference_disable_triton_nvls_kernels=(
+                    test_config.transformer_impl == "inference_optimized"
+                    and os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true"
+                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -429,6 +440,10 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                inference_disable_triton_nvls_kernels=(
+                    test_config.transformer_impl == "inference_optimized"
+                    and os.environ.get("UNIT_TEST_DISABLE_TRITON_NVLS") == "true"
+                ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
@@ -732,6 +747,43 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_request_larger_than_active_buffer_fails(self) -> None:
+        """A request that can never fit must not remain in the waiting queue."""
+        env = self._build_test_env(DynamicEngineTestConfig())
+        buffer_size_gb = (env.engine.context.block_size_bytes + 1) / 1024**3
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                min_prompt_length=512,
+                max_prompt_length=512,
+                num_tokens_to_generate=1,
+                context_buffer_size_gb=buffer_size_gb,
+            )
+        )
+
+        # Only engine rank 0 emits the warning; all ranks check the failure state.
+        with (
+            pytest.warns(UserWarning, match="Active buffer token capacity: 256")
+            if env.engine.rank == 0
+            else nullcontext()
+        ):
+            future = env.engine._add_request(env.requests[0])
+
+        assert future.done()
+        assert env.requests[0].status == Status.FAILED
+        assert not env.engine.waiting_request_ids
+        errors = [
+            event.payload
+            for event in env.requests[0].events
+            if event.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
+        ]
+        assert len(errors) == 1
+        assert isinstance(errors[0], RequestCapacityOverflowError)
+        assert errors[0].is_transient is False
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
@@ -901,8 +953,9 @@ class TestDynamicInferenceEngine:
             assert results == []
             assert env.engine.controller.dummy_forward.call_count > 0
 
+    # Keep the engine's cached event loop open across tests.
     @pytest.mark.internal
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="session")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -1170,7 +1223,10 @@ class TestDynamicInferenceEngine:
 
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
+        # torchrun sets ranks, but each test must initialize its process group.
+        if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not torch.distributed.is_initialized():
+            Utils.initialize_distributed()
+        if not torch.distributed.is_initialized():
             pytest.skip("Distributed not initialized")
         world_size = torch.distributed.get_world_size()
         min_world_size = tp_size * pp_size * ep_size

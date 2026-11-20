@@ -79,6 +79,12 @@ class RerunMode(str, Enum):
     VALIDATE_RESULTS = "validate_results"
     REPORT_DETERMINISM_STATS = "report_determinism_stats"
 
+class RerunStrategy(str, Enum):
+    """Enum representing the different strategies for rerunning iterations."""
+
+    RERUN_IN_PLACE = "rerun_in_place"
+    SKIP_ITERATION = "skip_iteration"
+
 
 class RerunState(Enum):
     """Enum representing the different states of the rerun state machine.
@@ -190,8 +196,10 @@ class RerunStateMachine:
         mode: RerunMode = RerunMode.DISABLED,
         error_injector: Optional["RerunErrorInjector"] = None,
         result_rejected_tracker_filename: Optional[str] = None,
+        strategy: RerunStrategy = RerunStrategy.RERUN_IN_PLACE,
     ) -> None:
         self.mode: RerunMode = mode
+        self.strategy: RerunStrategy = strategy
         self.state: RerunState = RerunState.NOT_RUNNING_YET
         # Note: current_iteration is 0-indexed internally; all messages to
         # stdout / stderr and the tracker file add 1 to display 1-indexed iterations.
@@ -236,6 +244,13 @@ class RerunStateMachine:
 
         self.large_value_counts: dict[str, int] = {}
         self.max_values: dict[str, float] = {}
+        # Resume-local baseline: max_values is not restored on a normal checkpoint load,
+        # so the reload path of is_spiky_grad_norm compares against the previous step.
+        self.prev_step_value: dict[str, float] = {}
+        self.skipped_iteration: int = 0
+        self.discarded_batches: int = 0
+        self.rerun_count: int = 0
+        self.rerun_count_this_iteration: int = 0
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
@@ -319,6 +334,8 @@ class RerunStateMachine:
             self.restart_again_requested = False
             self.continue_requested = False
             self.injected_result = None
+            self.discarded_batches = 0
+            self.rerun_count_this_iteration = 0
             self.current_iteration += 1
             self.state = RerunState.INITIAL_RUN
             return True
@@ -331,8 +348,40 @@ class RerunStateMachine:
             if not will_rerun:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
+
+            # If the strategy is to skip the iteration
+            if self.strategy == RerunStrategy.SKIP_ITERATION:
+                log_single_rank(
+                    logger, logging.WARNING,
+                    f"Iteration #{self.current_iteration + 1}: validation failed, "
+                    f"discarding this global batch and iterate to new data "
+                    f"(skipped {self.skipped_iteration + 1} iterations)",
+                )
+                self.skipped_iteration += 1
+                self.discarded_batches += 1
+
+                # advance to next batch
+                if data_iterators:
+                    for d in data_iterators:
+                        d.advance()
+                self._restore_state()
+
+                self.rerun_requested = False
+                self.checkpoint_requested = False
+                self.restart_again_requested = False
+                self.continue_requested = False
+                self.injected_result = None
+                self.validation_counts = defaultdict(int)
+                self.state = RerunState.INITIAL_RUN
+
+                # same as maybe_miscompare() 
+                self.error_injector.injected_error_type = None
+                return True
+
             if self.mode == RerunMode.VALIDATE_RESULTS and safe_get_rank() == 0:
                 logger.warning("Need to rerun step to check reproducibility of initial result")
+            self.rerun_count += 1
+            self.rerun_count_this_iteration += 1
             self.state = RerunState.RERUNNING_IN_PLACE
             self._restore_state()
             if data_iterators:
@@ -767,6 +816,49 @@ class RerunStateMachine:
 
         return value >= self.max_values[context] * threshold
 
+    def is_spiky_grad_norm(
+        self,
+        result: tuple[bool, float],
+        context: str,
+        num_samples: int = 100,
+        resample: bool = False,
+        reload: bool = False,
+        threshold: float = 5.0,
+    ):
+        found_inf_flag, value = result
+        if found_inf_flag or math.isnan(value) or math.isinf(value):
+            return True
+
+        # if load from ckpt, check based on previous step value
+        if reload:
+            prev_value = self.prev_step_value.get(context)
+            if value >= threshold or (prev_value is not None and value >= prev_value * 5):
+                # do not record a rejected value
+                return True
+            self.prev_step_value[context] = value
+            return False
+
+        if resample or context not in self.large_value_counts:
+            self.large_value_counts[context] = 0
+        if self.large_value_counts[context] < num_samples:
+            # if the context sampling is not finished
+            # check rerun condition based on previous step value
+            prev_value = self.prev_step_value.get(context)
+            if value >= 20 or (prev_value is not None and value >= prev_value * 5):
+                # do not record a rejected value
+                return True
+
+            # record the max value and count for the context, capped so a large but accepted
+            # value cannot lift the post-sampling bar and mask later spikes
+            self.prev_step_value[context] = value
+            self.large_value_counts[context] += 1
+            self.max_values[context] = min(max(self.max_values.get(context, 0.0), value), 5.0)
+            if self.large_value_counts[context] == num_samples:
+                logger.warning(f"Max value for {context}: {self.max_values[context]}")
+            return False
+
+        return value >= self.max_values[context] * 1.5
+
     def state_dict(
         self, data_iterator: DataIteratorArgType, ckpt_format: str, force: bool = False
     ) -> dict[str, Any]:
@@ -910,6 +1002,29 @@ class RerunStateMachine:
         self.large_value_counts = sharded_dict["large_value_counts"]
         self.max_values = sharded_dict["max_values"]
 
+    def register_state_save_restore_funcs(
+        self,
+        name: str,
+        extra_state_save_func,
+        extra_state_restore_func,
+    ) -> None:
+        prev_save = self.state_save_func
+        prev_restore = self.state_restore_func
+    
+        def state_save_func():
+            return {
+                'prev': prev_save() if prev_save is not None else None,
+                name: extra_state_save_func(),
+            }
+    
+        def state_restore_func(state_dict):
+            if prev_restore is not None and state_dict['prev'] is not None:
+                prev_restore(state_dict['prev'])
+            extra_state_restore_func(state=state_dict[name])
+    
+        self.state_save_func = state_save_func
+        self.state_restore_func = state_restore_func
+        
     def _sanitize_data_iterators(
         self, data_iterator: DataIteratorArgType
     ) -> list["RerunDataIterator"]:
@@ -1255,6 +1370,8 @@ class RerunErrorInjector:
         RerunDiagnostic.PERSISTENT_ERROR: "Persistent error",
     }
 
+    _RNG_SEED: int = 1234
+
     def __init__(
         self,
         error_injection_rate: int = 0,
@@ -1269,6 +1386,8 @@ class RerunErrorInjector:
         self.injected_error_type: Optional[RerunDiagnostic] = (
             None  # set to a non-None value when a result is injected
         )
+        # private RNG: _restore_state() rewinds the global one to the start of the iteration
+        self._rng: random.Random = random.Random(RerunErrorInjector._RNG_SEED)
 
     def maybe_inject(self) -> bool:
         """Method that decides whether to inject an error."""
@@ -1278,7 +1397,7 @@ class RerunErrorInjector:
         if not self.should_inject_errors or self.injected_error_type is not None:
             return False
         r: int = (
-            random.randint(0, self.error_injection_rate - 1) + safe_get_rank()
+            self._rng.randint(0, self.error_injection_rate - 1) + safe_get_rank()
         ) % self.error_injection_rate
         if r != 0:
             return False
@@ -1398,5 +1517,31 @@ def _compare_floats(a: torch.Tensor, b: torch.Tensor) -> float:
         or (math.isnan(af) and math.isinf(bf))
         or (math.isinf(af) and math.isnan(bf))
     ):
+        return COMPARISON_MISMATCH
+    return math.fabs((af - bf) / (af + bf) * 2)
+
+
+def compare_grad_norms(
+    a: Tuple[bool, Optional[float]], b: Tuple[bool, Optional[float]]
+) -> float:
+    """Compare_func for the (found_inf_flag, grad_norm) tuple of prepare_grad_norm().
+
+    The default compare_func cannot be used on that result because it is a tuple rather
+    than a 0-dim tensor, and because grad_norm is None when inf/NaN was found in the
+    gradients (in which case only the flags can be compared).
+
+    Check the validate_result() method of the RerunStateMachine class for details.
+    """
+
+    a_found_inf, a_norm = a
+    b_found_inf, b_norm = b
+    if a_found_inf or b_found_inf:
+        return COMPARISON_MATCH if a_found_inf == b_found_inf else COMPARISON_MISMATCH
+    # grad_norm is a Python float, but accept a 0-dim tensor as well.
+    af: float = float(a_norm)
+    bf: float = float(b_norm)
+    if (af == bf) or (math.isnan(af) and math.isnan(bf)):
+        return COMPARISON_MATCH
+    if (math.isnan(af) != math.isnan(bf)) or (math.isinf(af) != math.isinf(bf)):
         return COMPARISON_MISMATCH
     return math.fabs((af - bf) / (af + bf) * 2)

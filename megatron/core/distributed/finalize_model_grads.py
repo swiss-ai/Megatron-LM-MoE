@@ -23,8 +23,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from .. import parallel_state
 from ..num_microbatches_calculator import get_num_microbatches
 from ..transformer.moe.moe_utils import (
+    expert_load_entropy,
     expert_load_violation_batchwise,
     get_updated_expert_bias,
+    marin_qb_exact_update,
     recover_qb_beta_from_histogram,
     save_to_aux_losses_tracker,
 )
@@ -302,10 +304,10 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.qb_beta_count.zero_()
             if getattr(module, 'qb_histogram', None) is not None:
                 module.qb_histogram.zero_()
-            if getattr(module, 'mbs_expert_load_samples', None):
-                module.mbs_expert_load_samples.clear()
-            if getattr(module, 'seq_expert_load_samples', None):
-                module.seq_expert_load_samples.clear()
+            if getattr(module, 'qb_exact', False):
+                module._qb_exact_rows = 0
+            if getattr(module, 'expert_load_sample_count', None) is not None:
+                module.expert_load_sample_count.zero_()
 
 
 def _log_microbatch_router_metrics(
@@ -330,30 +332,42 @@ def _log_microbatch_router_metrics(
     samples = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            sample_count_tensor = getattr(module, 'expert_load_sample_count', None)
+            if sample_count_tensor is None:
+                continue
+            sample_count = int(sample_count_tensor.item())
+            if sample_count == 0:
+                continue
+
             mbs_samples = getattr(module, 'mbs_expert_load_samples', None)
             seq_samples = getattr(module, 'seq_expert_load_samples', None)
-            if (collect_mbs and mbs_samples) or (collect_seq and seq_samples):
-                module_samples = []
-                router_modules.append(module)
-                microbatch_count = len(mbs_samples) if collect_mbs else len(seq_samples)
-                if collect_mbs and collect_seq:
-                    assert len(mbs_samples) == len(seq_samples)
-                microbatch_counts.append(microbatch_count)
-                if collect_mbs:
-                    stacked_mbs_samples = torch.stack(mbs_samples)
-                    mbs_sample_sizes.append(stacked_mbs_samples.shape[0])
-                    module_samples.append(stacked_mbs_samples)
-                else:
-                    mbs_sample_sizes.append(0)
-                if collect_seq:
-                    stacked_seq_samples = torch.cat(seq_samples)
-                    seq_sample_sizes.append(stacked_seq_samples.shape[0])
-                    module_samples.append(stacked_seq_samples)
-                else:
-                    seq_sample_sizes.append(0)
-                samples.append(
-                    torch.cat(module_samples) if len(module_samples) > 1 else module_samples[0]
+            capacity = mbs_samples.shape[0]
+            if sample_count > capacity:
+                raise RuntimeError(
+                    f"Collected {sample_count} router metric samples in a buffer with capacity "
+                    f"{capacity}. The number of router forwards exceeded the configured number "
+                    "of microbatches."
                 )
+
+            module_samples = []
+            router_modules.append(module)
+            microbatch_counts.append(sample_count)
+            if collect_mbs:
+                module_mbs_samples = mbs_samples[:sample_count]
+                mbs_sample_sizes.append(sample_count)
+                module_samples.append(module_mbs_samples)
+            else:
+                mbs_sample_sizes.append(0)
+            if collect_seq:
+                assert seq_samples is not None
+                module_seq_samples = seq_samples[:sample_count].flatten(0, 1)
+                seq_sample_sizes.append(module_seq_samples.shape[0])
+                module_samples.append(module_seq_samples)
+            else:
+                seq_sample_sizes.append(0)
+            samples.append(
+                torch.cat(module_samples) if len(module_samples) > 1 else module_samples[0]
+            )
 
     if not samples:
         return
@@ -389,6 +403,8 @@ def _log_microbatch_router_metrics(
             (f"{prefix}_max_violation", violation.max(dim=-1).values),
             (f"{prefix}_min_violation", violation.min(dim=-1).values),
             (f"{prefix}_median_violation", violation.median(dim=-1).values),
+            (f"{prefix}_std_violation", violation.std(dim=-1, correction=0)),
+            (f"{prefix}_entropy", expert_load_entropy(tokens_per_expert)),
         ):
             save_to_aux_losses_tracker(
                 name,
@@ -468,10 +484,18 @@ def _log_global_router_metrics(model: List[torch.nn.Module], config: Transformer
                 total_num_tokens=total_num_tokens,
                 topk=module.topk,
             )
+            ideal_tokens_per_expert = (
+                total_num_tokens * module.topk / global_tokens_per_expert.shape[0]
+            )
+            violation_std = (
+                (global_tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
+            ).std(correction=0)
             for name, value in (
                 ("global_expert_max_violation", max_violation),
                 ("global_expert_min_violation", min_violation),
                 ("global_expert_median_violation", median_violation),
+                ("global_expert_std_violation", violation_std),
+                ("global_expert_entropy", expert_load_entropy(global_tokens_per_expert)),
             ):
                 save_to_aux_losses_tracker(
                     name,
@@ -511,6 +535,51 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
         expert_bias.copy_(updated_expert_bias)
 
 
+def _update_marin_exact_router_qb_beta(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    group: Optional[torch.distributed.ProcessGroup],
+):
+    """Run Marin's exact estimator once per layer over every margin retained this step."""
+    assert group is not None, "marin_exact QB requires a TP+DP+CP process group."
+    num_layers = config.num_layers + (getattr(config, 'mtp_num_layers', None) or 0)
+    num_microbatches = get_num_microbatches()
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if not getattr(module, 'qb_exact', False) or not module.training:
+                continue
+            beta = module.qb_beta
+            rows = module._qb_exact_rows
+            if module._qb_exact_margins is None:
+                margins = beta.new_empty((0, beta.shape[0]))
+                valid = torch.empty(0, dtype=torch.bool, device=beta.device)
+            else:
+                margins = module._qb_exact_margins[:rows]
+                valid = module._qb_exact_valid[:rows]
+            estimate, token_count, nonfinite = marin_qb_exact_update(
+                margins,
+                valid,
+                beta,
+                config.moe_router_topk,
+                config.moe_router_quantile_balancing_marin_num_bins,
+                group=group,
+            )
+            accepted = (token_count > 0) & (nonfinite == 0)
+            ema = config.moe_router_quantile_balancing_ema
+            updated = ema * beta + (1.0 - ema) * estimate
+            updated = updated - updated.mean(dim=-1, keepdim=True)  # mean center
+            # Keep the COMPLETE previous bias on an empty or non-finite step.
+            module.qb_beta.copy_(torch.where(accepted, updated, beta))
+            for name, value in (
+                ('qb_exact_nonfinite_tokens', nonfinite.float()),
+                ('qb_exact_update_skipped', (~accepted).float()),
+            ):
+                layer = module.layer_number
+                if getattr(module, 'is_mtp_layer', False):
+                    layer += config.num_layers
+                save_to_aux_losses_tracker(name, value * num_microbatches, layer, num_layers)
+
+
 def _update_router_qb_beta(
     model: List[torch.nn.Module],
     config: TransformerConfig,
@@ -518,6 +587,9 @@ def _update_router_qb_beta(
     tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Update the quantile-balancing per-expert bias once per global batch."""
+    if config.moe_router_quantile_balancing_method == 'marin_exact':
+        _update_marin_exact_router_qb_beta(model, config, tp_dp_cp_group)
+        return
     if config.moe_router_quantile_balancing_method == 'histogram':
         assert tp_dp_cp_group is not None, (
             "Histogram quantile balancing requires a TP+DP+CP process group."
@@ -735,7 +807,7 @@ def finalize_model_grads(
     config = get_model_config(model[0])
     uses_histogram_qb = (
         "quantile_balancing" in config.moe_router_load_balancing_type
-        and config.moe_router_quantile_balancing_method == 'histogram'
+        and config.moe_router_quantile_balancing_method in ('histogram', 'marin_exact')
     )
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')

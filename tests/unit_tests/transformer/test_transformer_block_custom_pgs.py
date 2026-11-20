@@ -197,6 +197,7 @@ def _gpt_te_layer_spec_with_hetro_pgs(attn_pg_collection, mlp_pg_collection):
 
 class TestTransformerBlockWithProcessGroups:
     def setup_method(self, method):
+        Utils.initialize_distributed()
         Utils.destroy_model_parallel()
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -229,8 +230,8 @@ class TestTransformerBlockWithProcessGroups:
         Test that parameters and gradients match after one forward and backward pass
         between transformer blocks using default and custom process groups.
         """
-        # Skip if world size doesn't match
-        actual_world_size = torch.cuda.device_count()
+        # Match distributed ranks, not the GPUs visible on this node.
+        actual_world_size = torch.distributed.get_world_size()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
         Utils.initialize_model_parallel(
@@ -387,7 +388,7 @@ class TestTransformerBlockWithProcessGroups:
         with different process groups for attention and mlp.
         """
 
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = torch.distributed.get_world_size()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
         # we are testing the custom pgs path, thus we call initialize_distributed intead of initialize_model_parallel
@@ -474,7 +475,7 @@ class TestTransformerBlockWithProcessGroups:
     )
     def test_fwd_bwd_pass_mix_and_match_transformer_blocks(self):
         world_size = 8
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = torch.distributed.get_world_size()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
@@ -611,7 +612,7 @@ class TestTransformerBlockWithProcessGroups:
     )
     def test_mlp_with_custom_pgs(self, world_size, tp_size, dp_size, reverse_tp_dp_order):
 
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = torch.distributed.get_world_size()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 

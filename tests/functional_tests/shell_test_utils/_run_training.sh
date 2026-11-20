@@ -46,7 +46,7 @@ TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
 set -x
 
 # Pull env vars to export
-ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
+ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
 while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -58,7 +58,7 @@ while IFS= read -r ARGUMENT; do
 done <<<"$ENV_VARS"
 
 # Run before script
-BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
+BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.BEFORE_SCRIPT')
 if [[ "$BEFORE_SCRIPT" != null ]]; then
     eval "$BEFORE_SCRIPT"
 fi
@@ -67,7 +67,7 @@ fi
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     PARAMS=()
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(/usr/local/bin/yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == true); .value = "true") | .key + "=" + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == true); .value = "true") | .key + "=" + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
@@ -94,14 +94,14 @@ else
     # If this is a second run (of checkpoint-resume), we might want to use a
     # different model configuration than during first time. So if key `MODEL_ARGS_2`
     # exists we use it, otherwise we use the same as for the first run.
-    if [[ $RUN_NUMBER -gt 1 && $(/usr/local/bin/yq 'has("MODEL_ARGS_'$RUN_NUMBER'")' "$TRAINING_PARAMS_PATH") == true ]]; then
+    if [[ $RUN_NUMBER -gt 1 && $(yq 'has("MODEL_ARGS_'$RUN_NUMBER'")' "$TRAINING_PARAMS_PATH") == true ]]; then
         export KEY="MODEL_ARGS_$RUN_NUMBER"
     else
         export KEY="MODEL_ARGS"
     fi
 
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(/usr/local/bin/yq 'explode(.) | ... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(yq 'explode(.) | ... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
@@ -113,6 +113,10 @@ else
             # Case: true
             if [[ "$value" == "true" ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="${key} "
+
+            # argparse expects separate integer arguments for hierarchical CP sizes.
+            elif [[ "$key" == "--hierarchical-context-parallel-sizes" && "$value" =~ ^[0-9]+([[:space:]]+[0-9]+)*$ ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
 
             # Case: value is wrapped in ( )
             elif echo "$value" | grep -Eq '^\([^)]+\)$'; then
@@ -150,7 +154,9 @@ PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
@@ -158,33 +164,39 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+NODE_RANK=${SLURM_PROCID:-${SLURM_NODEID:-0}}
 LAST_RANK=$((GPUS_PER_NODE - 1)) 
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE
-    --nnodes $NUM_NODES
-    --master_addr $MASTER_ADDR
-    --master_port $MASTER_PORT
-    --node_rank $NODE_RANK
-    --log-dir $LOG_DIR
+    --nproc_per_node "$GPUS_PER_NODE"
+    --nnodes "$NUM_NODES"
+    --master_addr "$MASTER_ADDR"
+    --master_port "$MASTER_PORT"
+    --node_rank "$NODE_RANK"
+    --log-dir "$LOG_DIR"
     --tee "0:3,$LAST_RANK:3"
     --redirects "3"
 )
 
+PYTHON_CMD=(uv run --no-sync python)
+if [[ -n ${PYTHON_BIN:-} ]]; then
+    PYTHON_CMD=(uv run --no-project --python "$PYTHON_BIN" python)
+fi
+
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+    "${PYTHON_CMD[@]}" -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
         --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
-        $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    "${PYTHON_CMD[@]}" -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+        --no-python bash tests/test_utils/run_python_worker.sh \
+        "$TRAINING_SCRIPT_PATH" "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
 
 # Run after script
-AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
+AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
 fi 

@@ -40,6 +40,11 @@ class TrainingConfig:
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
+    skip_reduce_check: bool = False
+    """Skip model-parallel reductions of some 1-value tensors like learning rate/update success/gradient norm. 
+    Enable only when these values are consistent across model-parallel ranks and every rank has trainable parameters.
+    """
+
     train_sync_interval: int | None = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
 
@@ -54,6 +59,15 @@ class TrainingConfig:
 
     exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
+
+    exit_on_tranche_end: bool = False
+    """Build one pass through the training data, checkpoint and exit at its last full global batch.
+    Preserves the full-run training budget and learning-rate schedule."""
+
+    tranche_start_samples: int | None = None
+    """Global consumed-sample counter at the start of this tranche. Requires exit_on_tranche_end.
+    When omitted, read tranche_end.txt from the checkpoint directory; fall back to the
+    existing phase-transition offset, or zero for the first tranche."""
 
     exit_duration_in_mins: int | None = None
     """Exit the program after this many minutes."""
@@ -124,8 +138,35 @@ class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
     # ---------------- Learning rate config. ----------------
-    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
-    """Learning rate decay function."""
+    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD", "log-bridge", "sqrt-bridge", "log", "sqrt", "air-bridge"] = "linear"
+    """Learning rate decay function. 'log-bridge': the 'linear' schedule up to
+    --lr-bridge-switch-(iters|samples), then an nGPT-log bridge into a reference log-decay tail whose
+    LR area matches a linear schedule with peak --lr-bridge-low-factor * max_lr (applied per
+    param group). See megatron.core.optimizer_param_scheduler.build_log_bridge_schedule.
+    'sqrt-bridge': the same, but the bridge is a single affine inverse-sqrt (AIR) decay from the switch to
+    min_lr at the end of the decay horizon (build_air_bridge_schedule); uses the same
+    --lr-bridge-low-factor / --lr-bridge-switch-* / --lr-bridge-budget knobs.
+    'log' / 'sqrt' / 'air-bridge': accepted aliases of 'log-bridge' / 'sqrt-bridge'."""
+
+    lr_bridge_low_factor: float | None = None
+    """log-bridge / sqrt-bridge: low peak LR as a fraction of each param group's max_lr (e.g. 0.5 for a low peak
+    at half the actual peak). Required for log-bridge / sqrt-bridge."""
+
+    lr_bridge_switch_iters: int | None = None
+    """log-bridge / sqrt-bridge: iteration at which the run leaves the original linear schedule."""
+
+    lr_bridge_switch_samples: int | None = None
+    """log-bridge / sqrt-bridge: sample count at which the run leaves the original linear schedule."""
+
+    lr_bridge_log_start: float = 0.70
+    """log-bridge: fraction of the LR decay horizon at which the bridge joins the reference log tail."""
+
+    lr_bridge_rho_ref: float = 0.05
+    """log-bridge: curvature rho of the reference nGPT log decay (smaller = sharper early drop)."""
+
+    lr_bridge_budget: Literal["remaining", "total"] = "remaining"
+    """log-bridge / sqrt-bridge: 'remaining' matches the low-LR schedule's area from the switch on; 'total'
+    matches the whole-run area (pays back the excess LR spent before the switch)."""
 
     lr_wsd_decay_style: Literal["exponential", "linear", "cosine", "minus_sqrt"] = "exponential"
     """Decay style for the annealing phase of WSD"""
@@ -220,13 +261,83 @@ class LoggerConfig:
     log_muon_per_layer: bool = False
     """If set, additionally log all Muon statistics by global layer."""
 
+    log_muon_norm_components: bool = False
+    """With log_muon_gains: also log the norm gains split by their place in the block, as
+    gains/layernorm-<component>/flat for pre-attention, pre-mlp, post-attention, post-mlp, qk,
+    mixer-output, final and other. The pooled gains/layernorm/flat is kept."""
+
     muon_log_interval: int | None = None
     """Muon logging interval. Defaults to log_interval when unset."""
+
+    router_update_log_interval: int | None = None
+    """If set, every N steps log per-layer MoE router update statistics: the per-expert relative
+    update ||dW_i|| / ||W_i||, the row rotation angle, and the row norm change. Costs one router
+    weight copy and one small all-reduce on logged steps. Disabled when unset."""
+
+    router_input_log_interval: int | None = None
+    """If set, every N steps log per-layer MoE router-input statistics (per-token input norm,
+    largest input channel and its pre-MLP RMSNorm gain, channel concentration, logsumexp
+    distribution) and the pre-MLP RMSNorm gain statistics. Disabled when unset."""
+
+    activation_norm_log_interval: int = 0
+    """Every N steps log globally pooled per-layer residual-input, attention-output,
+    and MLP-output RMS. Set 0 to disable. Requires eager execution without expert
+    parallel communication overlap; no activation tensors are retained."""
+
+    activation_spike_stats: bool = False
+    """On the --activation-norm-log-interval steps, also log per-layer min, mean, median and max
+    of |x| and the kurtosis of x for the same three activations (activation_spike/*). The median
+    comes from a log-spaced histogram (within 7.5% for |x| in [1e-12, 1e6]). On those steps the
+    logger works in 16 MiB chunks (about 80 MiB of transient workspace) and adds three small
+    all-reduces."""
+
+    output_logit_log_interval: int = 0
+    """Every N steps log primary GPT output-logit/LSE statistics, exact-zero CE loss
+    fraction, top1-top2 margin p99.9/max, and final hidden token L2 norm mean/max.
+    Set 1 for per-step logging, 0 (default) to disable. Native/unfused CE only."""
+
+    save_topk_logits_dir: str | None = None
+    """Save the top-k output logits of every token (for distillation) under this directory,
+    one file per data-parallel rank and step: <dir>/iter_<step>/rank_<dp>.npz. Every token is saved
+    (loss-masked ones too) with its position, sample id and a loss_valid flag. Needs
+    --save-topk-logits-interval and --save-topk-logits-tokens. See
+    megatron.core.transformer.topk_logit_saving. The native CE paths only (not the TE CE impl)."""
+
+    save_topk_logits_k: int = 256
+    """Number of top logits kept per token."""
+
+    save_topk_logits_interval: int = 0
+    """A saving window starts every N steps (steps 1, N+1, 2N+1, ...)."""
+
+    save_topk_logits_tokens: int = 0
+    """Tokens saved per window; rounded up to whole iterations (global batch size x sequence
+    length tokens each) and capped at the interval."""
+
+    save_topk_logits_clip: float = 16.0
+    """Logits more than this far below the top-1 logit are stored at the clip value. Values are
+    uint8 in steps of clip / 255, so every stored logit is within clip / 510 of the true one."""
+
+    router_diag_layers: list[int] | None = None
+    """0-based global layer indices to restrict router-input / RMSNorm-gain logging to (e.g. 3).
+    All layers when unset."""
 
     muon_sparsity_thresholds: list[float] = field(
         default_factory=lambda: [1e-20, 1e-10, 1e-30]
     )
     """Absolute weight thresholds used for Muon sparsity logging."""
+
+    muon_gain_near_zero_thresholds: list[float] = field(
+        default_factory=lambda: [1e-6, 1e-8, 1e-12]
+    )
+    """With log_muon_gains: for every gain family/axis (MD row/col/flat gains and the norm gains,
+    globally and per layer with log_muon_per_layer) also log abs-min, the smallest |effective
+    gain|, and for each threshold T count-abs-below-T and fraction-abs-below-T, the number and
+    fraction of gain entries with |effective gain| < T."""
+
+    log_muon_gain_abs_min: bool = False
+    """With log_muon_gains: log abs-min, the smallest |effective gain|, for every gain
+    family/axis (globally and per layer with log_muon_per_layer) even when
+    muon_gain_near_zero_thresholds is empty. abs-min is always logged when thresholds are given."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""

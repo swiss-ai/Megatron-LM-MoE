@@ -15,6 +15,9 @@ from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.tokenizer_extra_metadata import (
+    populate_tokenizer_extra_metadata_from_tokenizer,
+)
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 _GLOBAL_ARGS = None
@@ -130,7 +133,9 @@ def set_global_variables(args, build_tokenizer=True):
         args.decrease_batch_size_if_needed,
     )
     if build_tokenizer:
-        _ = _build_tokenizer(args)
+        tokenizer = _build_tokenizer(args)
+        # Extract special-token metadata before logging snapshots args.
+        populate_tokenizer_extra_metadata_from_tokenizer(args, tokenizer)
     _set_tensorboard_writer(args)
     _set_wandb_writer(args)
     _set_one_logger(args)
@@ -199,7 +204,10 @@ def _build_tokenizer(args):
 def rebuild_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
-    return _build_tokenizer(args)
+    tokenizer = _build_tokenizer(args)
+    # Refresh metadata with the tokenizer.
+    populate_tokenizer_extra_metadata_from_tokenizer(args, tokenizer)
+    return tokenizer
 
 
 def _set_tensorboard_writer(args):

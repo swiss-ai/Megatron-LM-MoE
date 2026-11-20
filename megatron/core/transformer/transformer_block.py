@@ -19,6 +19,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.cp_relayout import BlockLayout
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -802,7 +803,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                block_layout = None
+                if (
+                    self.config.linear_attention_cp_block_layout
+                    and inference_context is None
+                    and not extract_layer_indices
+                    and BlockLayout.applies(self.layers, packed_seq_params)
+                ):
+                    block_layout = BlockLayout(self.layers)
                 for l_no, layer in enumerate(self.layers):
+                    layer_padding_mask = padding_mask
+                    if block_layout is not None:
+                        hidden_states, layer_padding_mask = block_layout.before_layer(
+                            l_no, hidden_states, packed_seq_params, padding_mask
+                        )
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -832,7 +846,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
-                            padding_mask=padding_mask,
+                            padding_mask=layer_padding_mask,
                         )
 
                     if (
@@ -845,6 +859,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+                if block_layout is not None:
+                    # The restored stream is a view; a pipeline stage's output must not be
+                    # one (schedules.deallocate_output_tensor).
+                    hidden_states = make_viewless_tensor(
+                        inp=block_layout.finish(hidden_states), requires_grad=True, keep_graph=True
+                    )
 
         # Final layer norm.
         if self.final_layernorm is not None:

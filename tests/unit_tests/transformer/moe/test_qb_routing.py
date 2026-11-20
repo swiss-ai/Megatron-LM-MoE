@@ -10,8 +10,11 @@ import megatron.core.transformer.moe.router as router_module
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
+    apply_router_token_dropping,
     clear_aux_losses_tracker,
     compute_qb_histogram,
+    dropped_token_fraction,
+    get_capacity,
     get_moe_layer_wise_logging_tracker,
     qb_dual_update,
     recover_qb_beta_from_histogram,
@@ -110,6 +113,7 @@ def test_qb_only_combines_with_seq_aux_loss(load_balancing_type):
             num_moe_experts=8,
             use_cpu_initialization=True,
             moe_router_load_balancing_type=load_balancing_type,
+            moe_router_violation_metrics=[],
             moe_aux_loss_coeff=[0, 0],
         )
 
@@ -127,6 +131,7 @@ class TestQuantileBalancingRouter:
             use_cpu_initialization=True,
             moe_router_load_balancing_type="quantile_balancing",
             moe_router_quantile_balancing_method="average",
+            moe_router_violation_metrics=[],
             moe_router_score_function="softmax",
             moe_router_topk=2,
             moe_aux_loss_coeff=0,
@@ -182,6 +187,7 @@ class TestQuantileBalancingRouter:
             use_cpu_initialization=True,
             moe_router_load_balancing_type=["quantile_balancing", "seq_aux_loss"],
             moe_router_score_function="softmax",
+            moe_router_violation_metrics=[],
             moe_router_topk=2,
             moe_aux_loss_coeff=[0, 0.5],
             bf16=True,
@@ -312,7 +318,7 @@ class TestQuantileBalancingRouter:
 
         monkeypatch.setattr(router_module, "qb_dual_update", fake_qb_dual_update)
 
-        _, routing_map = router.quantile_balancing(logits.to(torch.bfloat16))
+        _, routing_map, _ = router.quantile_balancing(logits.to(torch.bfloat16))
 
         torch.testing.assert_close(captured["scores"], expected_qb_scores)
         assert torch.equal(routing_map, expected_routing_map)
@@ -341,22 +347,28 @@ class TestQuantileBalancingRouter:
             dtype=torch.bool,
             device="cuda",
         )
-        valid_scores = torch.sigmoid(
-            logits.reshape(-1, self.num_moe_experts)[~padding_mask.reshape(-1)]
-        )
+        # The router now hands down every row plus the mask, instead of compacting the
+        # padded rows away itself: the compaction was a boolean gather, which lowers to
+        # nonzero(), synchronizes the device and makes the shape data-dependent, so the
+        # router could not be CUDA-graph captured. compute_qb_histogram drops the padded
+        # rows instead, and test_routers.py pins its counts to the compacting path's.
+        all_scores = torch.sigmoid(logits.reshape(-1, self.num_moe_experts))
         expected_alpha = (
-            (valid_scores - router.qb_beta).topk(router.topk + 1, dim=1).values[:, -1]
+            (all_scores - router.qb_beta).topk(router.topk + 1, dim=1).values[:, -1]
         )
         captured = {}
         expected_histogram = torch.arange(
             self.num_moe_experts * 16, dtype=torch.int64, device="cuda"
         ).reshape(self.num_moe_experts, 16)
 
-        def fake_compute_qb_histogram(scores, alpha, beta, num_bins):
+        def fake_compute_qb_histogram(scores, alpha, beta, num_bins, padding_mask=None):
             captured["scores"] = scores.detach().clone()
             captured["alpha"] = alpha.detach().clone()
             captured["beta"] = beta.detach().clone()
             captured["num_bins"] = num_bins
+            captured["padding_mask"] = (
+                None if padding_mask is None else padding_mask.detach().clone()
+            )
             return expected_histogram
 
         def fail_all_gather(*args, **kwargs):
@@ -373,10 +385,11 @@ class TestQuantileBalancingRouter:
                 padding_mask=padding_mask.reshape(-1),
             )
 
-        torch.testing.assert_close(captured["scores"], valid_scores)
+        torch.testing.assert_close(captured["scores"], all_scores)
         torch.testing.assert_close(captured["alpha"], expected_alpha)
         torch.testing.assert_close(captured["beta"], router.qb_beta)
         assert captured["num_bins"] == 16
+        assert torch.equal(captured["padding_mask"], padding_mask.reshape(-1))
         assert torch.equal(router.qb_histogram, 2 * expected_histogram)
 
     @pytest.mark.internal
@@ -433,3 +446,275 @@ class TestQuantileBalancingRouter:
             self.router(hidden_states)
         assert self.router.qb_beta_count.item() == 2
         torch.testing.assert_close(self.router.qb_beta_accum, accum_before)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "load_balancing_type", ["quantile_balancing", ["quantile_balancing", "seq_aux_loss"]]
+)
+def test_qb_accepts_capacity_factor(load_balancing_type):
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=12,
+        num_attention_heads=4,
+        num_moe_experts=8,
+        use_cpu_initialization=True,
+        moe_router_load_balancing_type=load_balancing_type,
+        moe_router_violation_metrics=[],
+        moe_aux_loss_coeff=[0, 1e-4] if isinstance(load_balancing_type, list) else 0,
+        moe_expert_capacity_factor=1.25,
+    )
+    assert config.moe_expert_capacity_factor == 1.25
+
+
+class TestTokenDroppingWithPadding:
+    """Padding tokens only take expert capacity that valid tokens leave unused."""
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("drop_policy", ["probs", "position"])
+    @pytest.mark.parametrize("pad_to_capacity", [False, True])
+    def test_padding_dropped_before_valid_tokens(self, drop_policy, pad_to_capacity):
+        num_tokens, num_experts, topk = 16, 4, 1
+        capacity = get_capacity(num_tokens * topk, num_experts, 1.0)
+        # Every token picks expert 0; the first rows are padding with the highest probs.
+        routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
+        routing_map[:, 0] = True
+        probs = torch.linspace(1.0, 0.5, num_tokens, device="cuda").unsqueeze(1) * routing_map
+        padding_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cuda")
+        padding_mask[:3] = True
+
+        _, final_map = apply_router_token_dropping(
+            probs,
+            routing_map,
+            router_topk=topk,
+            capacity_factor=1.0,
+            drop_policy=drop_policy,
+            pad_to_capacity=pad_to_capacity,
+            padding_mask=padding_mask,
+        )
+
+        assert final_map[:, 0].sum().item() == capacity
+        assert not final_map[padding_mask, 0].any()
+        # The best valid tokens are the earliest ones for both policies here.
+        assert final_map[3 : 3 + capacity, 0].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_uses_spare_capacity(self):
+        num_tokens, num_experts, topk = 16, 4, 1
+        routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
+        routing_map[:, 0] = True
+        probs = torch.rand(num_tokens, 1, device="cuda") * routing_map
+        padding_mask = torch.ones(num_tokens, dtype=torch.bool, device="cuda")
+        padding_mask[:2] = False
+
+        _, final_map = apply_router_token_dropping(
+            probs, routing_map, router_topk=topk, capacity_factor=1.0, padding_mask=padding_mask
+        )
+
+        assert final_map[:2, 0].all()
+        assert final_map[:, 0].sum().item() == get_capacity(num_tokens, num_experts, 1.0)
+        assert not final_map[:, 1:].any()
+
+
+class TestQuantileBalancingCapacityFactor:
+    """Capacity-factor token dropping ranked by the QB selection margin."""
+
+    num_moe_experts = 8
+    topk = 2
+
+    def setup_method(self, method):
+        # Entries retain the layer count of the model that first created them.
+        get_moe_layer_wise_logging_tracker().clear()
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        self.submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=self.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        get_moe_layer_wise_logging_tracker().clear()
+
+    def _router(self, method, capacity_factor, drop_policy="probs"):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=self.num_moe_experts,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type=["quantile_balancing", "seq_aux_loss"],
+            moe_aux_loss_coeff=[0, 1e-4],
+            moe_router_quantile_balancing_method=method,
+            moe_router_quantile_balancing_num_bins=64,
+            moe_router_score_function="sigmoid",
+            moe_router_topk_scaling_factor=2.5,
+            moe_router_dtype="fp32",
+            moe_router_violation_metrics=[],
+            moe_router_topk=self.topk,
+            moe_expert_capacity_factor=capacity_factor,
+            moe_token_drop_policy=drop_policy,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        router = cast(Router, MoELayer(config, self.submodules).router).cuda()
+        router.set_layer_number(1)
+        router.train()
+        return router
+
+    def _route(self, router, logits, qb_beta, padding_mask=None):
+        with torch.no_grad():
+            router.qb_beta.copy_(qb_beta)
+        clear_aux_losses_tracker()
+        logits = logits.clone().requires_grad_()
+        return router.routing(logits, padding_mask=padding_mask)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("method", ["histogram", "average", "legacy_average"])
+    @pytest.mark.parametrize("capacity_factor", [0.5, 1.0, 1.25])
+    def test_drops_smallest_qb_margin(self, method, capacity_factor):
+        seq_length, bsz = 48, 2
+        num_tokens = seq_length * bsz
+        logits = torch.randn(seq_length, bsz, self.num_moe_experts, device="cuda")
+        # Skew the load so that capacity binds for the popular experts.
+        logits[..., :2] += 1.5
+        qb_beta = 0.05 * torch.randn(self.num_moe_experts, device="cuda")
+
+        probs, routing_map = self._route(
+            self._router(method, capacity_factor), logits, qb_beta
+        )
+        dropless_probs, dropless_map = self._route(self._router(method, None), logits, qb_beta)
+
+        flat_logits = logits.reshape(num_tokens, -1)
+        qb_scores = flat_logits if method == "legacy_average" else torch.sigmoid(flat_logits)
+        biased_scores = qb_scores - qb_beta
+        margin = biased_scores - biased_scores.topk(self.topk + 1, dim=1).values[:, -1:]
+        capacity = get_capacity(num_tokens * self.topk, self.num_moe_experts, capacity_factor)
+        expected_map = torch.zeros_like(dropless_map)
+        for expert in range(self.num_moe_experts):
+            rows = dropless_map[:, expert].nonzero().squeeze(1)
+            kept = rows[margin[rows, expert].argsort(descending=True)[:capacity]]
+            expected_map[kept, expert] = True
+
+        assert dropless_map.sum(dim=0).max().item() > capacity
+        assert torch.equal(routing_map, expected_map)
+        assert routing_map.sum(dim=0).max().item() <= capacity
+        torch.testing.assert_close(probs, dropless_probs * routing_map)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qb_histogram_counts_demand_before_dropping(self):
+        seq_length, bsz = 48, 2
+        logits = torch.randn(seq_length, bsz, self.num_moe_experts, device="cuda")
+        logits[..., :2] += 1.5
+        qb_beta = torch.zeros(self.num_moe_experts, device="cuda")
+        padding_mask = torch.zeros(seq_length, bsz, dtype=torch.bool, device="cuda")
+        padding_mask[-5:] = True
+
+        dropping = self._router("histogram", 0.5)
+        dropless = self._router("histogram", None)
+        self._route(dropping, logits, qb_beta, padding_mask.reshape(-1))
+        self._route(dropless, logits, qb_beta, padding_mask.reshape(-1))
+
+        assert dropping.qb_histogram.sum().item() > 0
+        assert torch.equal(dropping.qb_histogram, dropless.qb_histogram)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("drop_policy", ["probs", "position"])
+    def test_qb_padding_dropped_first(self, drop_policy):
+        seq_length, bsz = 32, 2
+        logits = torch.randn(seq_length, bsz, self.num_moe_experts, device="cuda")
+        logits[..., :2] += 1.5
+        qb_beta = torch.zeros(self.num_moe_experts, device="cuda")
+        padding_mask = torch.zeros(seq_length, bsz, dtype=torch.bool, device="cuda")
+        padding_mask[:8] = True
+        padding_mask = padding_mask.reshape(-1)
+
+        _, routing_map = self._route(
+            self._router("histogram", 1.0, drop_policy), logits, qb_beta, padding_mask
+        )
+        _, dropless_map = self._route(self._router("histogram", None), logits, qb_beta)
+
+        capacity = get_capacity(seq_length * bsz * self.topk, self.num_moe_experts, 1.0)
+        valid_demand = (dropless_map & ~padding_mask.unsqueeze(1)).sum(dim=0)
+        kept_valid = (routing_map & ~padding_mask.unsqueeze(1)).sum(dim=0)
+        kept_padding = (routing_map & padding_mask.unsqueeze(1)).sum(dim=0)
+        assert torch.equal(kept_valid, valid_demand.clamp(max=capacity))
+        assert torch.all(kept_padding[valid_demand >= capacity] == 0)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_capacity_covering_all_tokens_is_dropless(self):
+        seq_length, bsz = 32, 2
+        logits = torch.randn(seq_length, bsz, self.num_moe_experts, device="cuda")
+        logits[..., :2] += 1.5
+        qb_beta = 0.05 * torch.randn(self.num_moe_experts, device="cuda")
+
+        probs, routing_map = self._route(
+            self._router("histogram", self.num_moe_experts / self.topk), logits, qb_beta
+        )
+        dropless_probs, dropless_map = self._route(
+            self._router("histogram", None), logits, qb_beta
+        )
+
+        assert torch.equal(routing_map, dropless_map)
+        torch.testing.assert_close(probs, dropless_probs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("drop_policy", ["probs", "position"])
+    def test_logs_dropped_token_fraction(self, drop_policy):
+        seq_length, bsz = 32, 2
+        logits = torch.randn(seq_length, bsz, self.num_moe_experts, device="cuda")
+        logits[..., :2] += 1.5
+        qb_beta = torch.zeros(self.num_moe_experts, device="cuda")
+        padding_mask = torch.zeros(seq_length, bsz, dtype=torch.bool, device="cuda")
+        padding_mask[-4:] = True
+        padding_mask = padding_mask.reshape(-1)
+
+        def logged():
+            # The tracker is process-global; clearing zeroes its entries but keeps them.
+            entry = get_moe_layer_wise_logging_tracker().get("dropped_token_fraction")
+            return None if entry is None else entry["values"]
+
+        _, dropless_map = self._route(self._router("histogram", None), logits, qb_beta)
+        assert logged() is None or not logged().any()
+
+        router = self._router("histogram", 0.5, drop_policy)
+        _, routing_map = self._route(router, logits, qb_beta, padding_mask)
+        expected = dropped_token_fraction(dropless_map, routing_map, padding_mask)
+        assert expected.item() > 0
+        torch.testing.assert_close(logged()[0], expected)
+        assert logged()[1].item() == 0
+
+        # A second microbatch accumulates; no_grad and eval passes are not counted.
+        router.routing(logits.clone().requires_grad_(), padding_mask=padding_mask)
+        with torch.no_grad():
+            router.routing(logits, padding_mask=padding_mask)
+        router.eval()
+        router.routing(logits, padding_mask=padding_mask)
+        torch.testing.assert_close(logged()[0], 2 * expected)
+
+
+def test_dropped_token_fraction_excludes_padding():
+    routing_map = torch.tensor([[1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    dropped_map = torch.tensor([[1, 0, 0], [1, 0, 1], [0, 1, 1], [0, 1, 0]], dtype=torch.bool)
+    # 8 assignments, 2 dropped.
+    torch.testing.assert_close(dropped_token_fraction(routing_map, dropped_map), torch.tensor(0.25))
+    # Row 3 is padding: 6 valid assignments, 1 of them dropped.
+    padding_mask = torch.tensor([False, False, False, True])
+    torch.testing.assert_close(
+        dropped_token_fraction(routing_map, dropped_map, padding_mask), torch.tensor(1 / 6)
+    )
+    # All padding: no division by zero.
+    all_padding = torch.ones(4, dtype=torch.bool)
+    assert dropped_token_fraction(routing_map, dropped_map, all_padding).item() == 0
+    # pad_to_capacity can add unselected entries to the kept map; they are not drops.
+    padded_map = dropped_map | torch.tensor([[0, 0, 1]] * 4, dtype=torch.bool)
+    torch.testing.assert_close(dropped_token_fraction(routing_map, padded_map), torch.tensor(0.25))

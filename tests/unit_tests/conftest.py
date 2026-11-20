@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from datetime import timedelta
+import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,12 @@ def pytest_addoption(parser):
     )
 
 
+def pytest_sessionstart(session):
+    # Bind before collection can allocate CUDA tensors or cache capture streams.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+
+
 @pytest.fixture(autouse=True)
 def experimental(request):
     """Simple fixture setting the experimental flag [CPU | GPU]"""
@@ -39,15 +47,54 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 0
 
 
+def _trace_event(event):
+    if os.environ.get('UNIT_TEST_TRACE') == 'true':
+        memory = ''
+        if torch.cuda.is_initialized():
+            memory = (
+                f' cuda_allocated={torch.cuda.memory_allocated()}'
+                f' cuda_reserved={torch.cuda.memory_reserved()}'
+            )
+        print(
+            f"[unit-trace {datetime.now(timezone.utc).isoformat(timespec='milliseconds')}] "
+            f"rank={os.environ.get('RANK', '0')} monotonic={time.monotonic():.6f} {event}{memory}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def pytest_runtest_logstart(nodeid, location):
+    _trace_event(f"start {nodeid}")
+
+
+def pytest_runtest_logreport(report):
+    _trace_event(f"{report.when} {report.outcome} {report.nodeid}")
+    # Log failures before distributed cleanup can block the final summary.
+    if report.failed:
+        print(
+            f"\nRank {os.environ.get('RANK', '0')}: {report.nodeid} ({report.when})\n"
+            f"{report.longreprtext}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cleanup():
     yield
-    if torch.distributed.is_initialized():
+    initialized = torch.distributed.is_initialized()
+    _trace_event(f"session cleanup initialized={initialized}")
+    if initialized:
+        _trace_event("session cleanup barrier enter")
         try:
             torch.distributed.barrier(timeout=timedelta(seconds=300))
-        except Exception:
+        except Exception as error:
+            _trace_event(f"session cleanup barrier error: {type(error).__name__}: {error}")
             return
+        _trace_event("session cleanup barrier exit")
+        _trace_event("session cleanup destroy enter")
         torch.distributed.destroy_process_group()
+        _trace_event("session cleanup destroy exit")
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -70,9 +117,12 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     if Utils.rank == 0:
         with TempNamedDir(tmp_dir, sync=False):
             yield tmp_dir
+            _trace_event("shared checkpoint fixture cleanup enter")
+        _trace_event("shared checkpoint fixture cleanup exit")
 
     else:
         yield tmp_dir
+        _trace_event("shared checkpoint fixture non-owner exit")
 
 
 @pytest.fixture(scope="session", autouse=True)

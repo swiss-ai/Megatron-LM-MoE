@@ -12,6 +12,7 @@ import requests
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.tokenizers.text.libraries.megatron_hf_tokenizer import MEGATRON_CONFIG_MAP
+from tools import preprocess_data
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_data import Encoder
 from tools.preprocess_data import get_args as build_args
@@ -230,8 +231,8 @@ def test_preprocess_data_gpt_optimal_workers():
             "--max-documents",
             "1002",
         ]
-        sys.argv = ["/opt/megatron-lm/tools/preprocess_data.py"] + gpt_args
-        runpy.run_path("/opt/megatron-lm/tools/preprocess_data.py", run_name="__main__")
+        sys.argv = [preprocess_data.__file__] + gpt_args
+        runpy.run_path(preprocess_data.__file__, run_name="__main__")
 
 
 def bert_vocab(odir):

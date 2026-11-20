@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional
 
 import torch
@@ -96,7 +96,7 @@ DEEPSEEK_PROXY = MoEModelConfig(
 )
 
 
-PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
+H100_PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
     MoEPerformanceCase(
         name="mixtral_a2a_tp1ep8_fp8",
         token_dispatcher="alltoall",
@@ -200,5 +200,13 @@ PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
         model=DEEPSEEK_PROXY,
         tensor_model_parallel_size=1,
         expert_model_parallel_size=8,
+    ),
+)
+
+PERFORMANCE_CASES: Iterable[MoEPerformanceCase] = (
+    *H100_PERFORMANCE_CASES,
+    *(
+        replace(case, name=f"{case.name}_gh200", gpu_platform="GH200")
+        for case in H100_PERFORMANCE_CASES
     ),
 )

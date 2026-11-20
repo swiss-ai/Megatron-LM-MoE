@@ -138,6 +138,11 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "kda":
+        from megatron.core.ssm.kimi_delta_attention import (
+            get_kimi_delta_attention_module_spec,
+        )
+        return get_kimi_delta_attention_module_spec(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -224,6 +229,17 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    # Optional sandwich norm: normalize each sublayer's output before the residual add
+    # (x = x + Norm(Sublayer(Norm(x)))). Applied uniformly to every layer in the hybrid
+    # block -- both the experimental-attention (e.g. KDA/GDN) sublayers and the interleaved
+    # standard-attention sublayers -- matching the standard gpt_layer_specs path. When
+    # sandwich_norm is off, these slots stay IdentityOp (the TransformerLayerSubmodules
+    # default) and the post-norm code paths in TransformerLayer are inert.
+    post_layer_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+        if config.sandwich_norm
+        else IdentityOp
+    )
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -250,9 +266,11 @@ def get_transformer_block_with_experimental_attention_variant_spec(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
+                    post_self_attn_layernorm=post_layer_norm,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=mlp,
                     mlp_bda=get_bias_dropout_add,
+                    post_mlp_layernorm=post_layer_norm,
                 ),
             )
         )
@@ -284,7 +302,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "kda"]
     return experimental_attention_variant in linear_attention_variants
 
 
@@ -445,6 +463,7 @@ def _get_moe_module_spec(
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
         use_te_activation_func=config.use_te_activation_func,
+        moe_use_offloading_experts=config.moe_use_offloading_experts,
     )
     moe_spec.metainfo["fuse_pre_mlp_layernorm"] = False
     return moe_spec

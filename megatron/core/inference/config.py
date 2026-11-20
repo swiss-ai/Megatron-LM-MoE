@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -78,6 +78,66 @@ class MambaInferenceStateConfig:
         return None
 
 
+@dataclass
+class KDAInferenceStateConfig:
+    """Configuration for request-indexed KDA inference state tensors."""
+
+    kda_layer_map: Dict[int, int]
+    """Map zero-based global layer numbers to compact local KDA state indices."""
+
+    attention_layer_map: Dict[int, int]
+    """Map standard-attention layer numbers to compact local KV-cache indices."""
+
+    conv_states_shape: Tuple[int, ...]
+    """KDA convolution state shape per request."""
+
+    recurrent_states_shape: Tuple[int, ...]
+    """KDA recurrent state shape per request."""
+
+    conv_states_dtype: torch.dtype
+    """Dtype used by the KDA convolution state buffer."""
+
+    recurrent_states_dtype: torch.dtype
+    """Dtype used by the KDA recurrent state buffer."""
+
+    @classmethod
+    def from_model(cls, model: MegatronModule) -> Optional["KDAInferenceStateConfig"]:
+        """Build a KDA state configuration from an instantiated GPT decoder."""
+        from megatron.core.ssm.kimi_delta_attention import KimiDeltaAttention
+
+        decoder = get_attr_wrapped_model(model, "decoder")
+        model_config = get_attr_wrapped_model(model, "config")
+        kda_layers = []
+        attention_layer_numbers = []
+        for layer in decoder.layers:
+            self_attention = getattr(layer, "self_attention", None)
+            if self_attention is None or self_attention.layer_number is None:
+                continue
+            layer_number = self_attention.layer_number - 1
+            if isinstance(self_attention, KimiDeltaAttention):
+                kda_layers.append((layer_number, self_attention))
+            else:
+                attention_layer_numbers.append(layer_number)
+
+        if not kda_layers:
+            return None
+
+        conv_states_shape, recurrent_states_shape = kda_layers[0][
+            1
+        ].kda_state_shapes_per_request()
+
+        return cls(
+            kda_layer_map={layer_number: i for i, (layer_number, _) in enumerate(kda_layers)},
+            attention_layer_map={
+                layer_number: i for i, layer_number in enumerate(attention_layer_numbers)
+            },
+            conv_states_shape=conv_states_shape,
+            recurrent_states_shape=recurrent_states_shape,
+            conv_states_dtype=model_config.params_dtype,
+            recurrent_states_dtype=torch.float32,
+        )
+
+
 class PrefixCachingEvictionPolicy(str, Enum):
     """Eviction policy for prefix caching blocks.
 
@@ -149,6 +209,9 @@ class InferenceConfig:
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
     """The Mamba inference state config if the model is a hybrid model."""
+
+    kda_inference_state_config: Optional[KDAInferenceStateConfig] = None
+    """The KDA inference state config if the model contains KDA layers."""
 
     mamba_memory_ratio: Optional[float] = None
     """

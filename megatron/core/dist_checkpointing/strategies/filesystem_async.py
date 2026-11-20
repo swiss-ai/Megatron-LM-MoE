@@ -97,6 +97,13 @@ class FileSystemWriterAsync(FileSystemWriter):
     ):
         self.checkpoint_dir = path
         self.use_msc = use_msc
+        # How GPU tensors reach the host before being written, see
+        # TorchDistSaveShardedStrategy.staging_mode: "pinned" (non_blocking D2H into torch's
+        # caching pinned allocator), "pageable" (plain .to("cpu") of every tensor up front) or
+        # "streamed" (no preload; each tensor is copied right before it is written, so the
+        # host peak is one tensor instead of the whole shard). Streamed needs the GPU in the
+        # writing process, i.e. synchronous saves.
+        self.staging_mode = kwargs.pop("staging_mode", "pinned")
 
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
@@ -217,9 +224,15 @@ class FileSystemWriterAsync(FileSystemWriter):
         if not self.write_buckets:
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
+        if self.staging_mode == "streamed":
+            preload_fn = None  # tensors stay on the GPU; write_preloaded_data copies them one by one
+        else:
+            preload_fn = partial(
+                self.preload_tensors, self.write_buckets, self.staging_mode == "pinned"
+            )
         return (
             partial(self.write_preloaded_data_multithread, transform_list, self.use_msc),
-            partial(self.preload_tensors, self.write_buckets, True),
+            preload_fn,
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
 
@@ -410,12 +423,16 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
 
                 for write_item, tensor in tensor_data:
-                    assert tensor.is_cpu
+                    if not tensor.is_cpu:
+                        # "streamed" staging: copy this one tensor to pageable host memory and
+                        # drop it right after the write, so the host peak is a single tensor.
+                        tensor = tensor.to("cpu")
                     local_results.append(
                         _write_item(
                             *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
                         )
                     )
+                    del tensor
 
                 if use_fsync:
                     if use_msc:

@@ -312,8 +312,10 @@ Global-batch expert-load violation is always logged. Optional scopes selected wi
 `--moe-router-violation-metrics` retain local expert counts and batch their communication at the
 global-batch boundary. By default, `mbs` logs `expert_*` after pooling each microbatch across TP+CP.
 `seq` logs `seq_expert_*` over the same TP+CP domain, and `ep` additionally pools each microbatch
-across EP before logging `ep_expert_*`. Violations are computed only after these count reductions,
-avoiding nonlinear averages of rank-local violation values.
+across EP before logging `ep_expert_*`. Each scope reports maximum, minimum, median, and population
+standard deviation of normalized load violation, plus normalized expert-load entropy. These
+statistics are computed only after the count reductions, avoiding nonlinear averages of rank-local
+values.
 
 ### Token Dispatching
 
