@@ -235,13 +235,18 @@ def _filtered_common_state(source):
 
 
 def merge_checkpoint_directories(
-    sources, output, coefficients=None, merge_metadata=None, router_state="mean"
+    sources, output, coefficients=None, merge_metadata=None, router_state="mean", save_fp32=True
 ):
     """Combine model tensors using every distributed rank as an I/O worker.
 
     ``router_state`` selects how the router balancing state (``expert_bias``, ``qb_beta``) is
     merged: "mean" averages it uniformly, "method" uses ``coefficients`` like every other
     tensor, and "last" copies it from the last checkpoint.
+
+    Merged floating-point tensors are saved in fp32 (``save_fp32``, the default) or in their
+    source dtype. Keep fp32 when the output is merged again, for example as a running average,
+    because rounding it to bf16 at every update discards changes smaller than about 0.4% of a
+    weight. A bf16 model still loads an fp32 checkpoint; the loader casts to the model's dtype.
     """
     sources = list(sources)
     if len(sources) < 2:
@@ -315,10 +320,10 @@ def merge_checkpoint_directories(
     output_tensors = {}
     for key, metadata in assigned_tensors.items():
         if key in accumulators:
-            data = accumulators[key].to(metadata.dtype)
+            data = accumulators[key].to(torch.float32 if save_fp32 else metadata.dtype)
         else:
             data = static_tensors[key].to(metadata.dtype)
-        output_tensors[key] = replace(metadata, data=data, replica_id=0)
+        output_tensors[key] = replace(metadata, data=data, dtype=data.dtype, replica_id=0)
 
     loaded_objects = _load_assigned(first_source, assigned_objects)
     output_objects = {
@@ -332,6 +337,7 @@ def merge_checkpoint_directories(
         "source_checkpoints": sources,
         "coefficients": list(coefficients),
         "router_state": router_state,
+        "save_fp32": save_fp32,
     }
     for key, value in {**output_tensors, **output_objects}.items():
         if key in state_dict:
@@ -421,6 +427,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--save-fp32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save merged floating-point tensors in fp32 (default). --no-save-fp32 keeps the "
+            "source dtype, for example bf16 for a final export."
+        ),
+    )
+    parser.add_argument(
         "--ema-alpha",
         type=float,
         help="ema: weight of each newer checkpoint in the running average, in (0, 1].",
@@ -481,7 +496,12 @@ def main():
         if dist.get_rank() == 0:
             print(f"> checkpoint coefficients: {coefficients}")
         merge_checkpoint_directories(
-            sources, args.output, coefficients, metadata, router_state=args.router_state
+            sources,
+            args.output,
+            coefficients,
+            metadata,
+            router_state=args.router_state,
+            save_fp32=args.save_fp32,
         )
     finally:
         if initialized_here and dist.is_initialized():

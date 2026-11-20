@@ -88,8 +88,8 @@ def initialized_model_parallel():
     Utils.destroy_model_parallel()
 
 
-def _full(key, value):
-    return ShardedTensor.from_rank_offsets(key, torch.full((4,), value))
+def _full(key, value, dtype=torch.float32):
+    return ShardedTensor.from_rank_offsets(key, torch.full((4,), value, dtype=dtype))
 
 
 def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_ckpt):
@@ -144,4 +144,34 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
             "source_checkpoints": sources,
             "coefficients": coefficients or [0.5, 0.5],
             "router_state": router_state,
+            "save_fp32": True,
         }
+
+
+def test_save_fp32_keeps_precision(initialized_model_parallel, tmp_path_dist_ckpt):
+    # bf16 sources 1.0 and 1.0078125 (the next bf16 value): their mean 1.00390625 lies halfway
+    # between two bf16 values, so a bf16 output rounds it to 1.0, and only fp32 keeps it.
+    sources = []
+    for value, iteration in ((1.0, 100), (1.0078125, 200)):
+        source = tmp_path_dist_ckpt / "fp32" / f"iter_{iteration:07d}"
+        source.mkdir(parents=True)
+        state = {"weight": _full("weight", value, torch.bfloat16), "iteration": iteration}
+        dist_checkpointing.save(state, str(source))
+        sources.append(str(source))
+
+    for save_fp32, dtype, expected in (
+        (False, torch.bfloat16, 1.0),
+        (True, torch.float32, 1.00390625),
+    ):
+        output = tmp_path_dist_ckpt / "fp32" / f"merged_{save_fp32}"
+        checkpoint_merge.merge_checkpoint_directories(sources, output, save_fp32=save_fp32)
+        release = str(output / "release")
+        assert dist_checkpointing.load_tensors_metadata(release)["weight"].dtype == dtype
+        loaded = dist_checkpointing.load({"weight": _full("weight", 0.0)}, release)["weight"]
+        torch.testing.assert_close(loaded, torch.full((4,), expected), rtol=0, atol=0)
+
+    # A bf16 model can load the fp32 checkpoint: the loader casts to the model's dtype.
+    loaded = dist_checkpointing.load(
+        {"weight": _full("weight", 0.0, torch.bfloat16)}, str(output / "release")
+    )["weight"]
+    assert loaded.dtype == torch.bfloat16
