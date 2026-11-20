@@ -19,7 +19,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 
 
-_ALWAYS_MEAN_TENSOR_NAMES = {"expert_bias", "qb_beta"}
+# Router load-balancing state (expert bias, quantile-balancing betas); see --router-state.
+_ROUTER_STATE_TENSOR_NAMES = {"expert_bias", "qb_beta"}
 _TRAINING_PREFIXES = (
     "optimizer",
     "opt_param_scheduler",
@@ -233,13 +234,27 @@ def _filtered_common_state(source):
     return common
 
 
-def merge_checkpoint_directories(sources, output, coefficients=None, merge_metadata=None):
-    """Combine model tensors using every distributed rank as an I/O worker."""
+def merge_checkpoint_directories(
+    sources, output, coefficients=None, merge_metadata=None, router_state="mean"
+):
+    """Combine model tensors using every distributed rank as an I/O worker.
+
+    ``router_state`` selects how the router balancing state (``expert_bias``, ``qb_beta``) is
+    merged: "mean" averages it uniformly, "method" uses ``coefficients`` like every other
+    tensor, and "last" copies it from the last checkpoint.
+    """
     sources = list(sources)
     if len(sources) < 2:
         raise ValueError("Checkpoint merging requires at least two checkpoints")
     if coefficients is None:
         coefficients = mean_coefficients(len(sources))
+    router_coefficients = {
+        "mean": mean_coefficients(len(sources)),
+        "method": coefficients,
+        "last": [0.0] * (len(sources) - 1) + [1.0],
+    }.get(router_state)
+    if router_coefficients is None:
+        raise ValueError(f"router_state must be 'mean', 'method' or 'last', got {router_state!r}")
     if len(coefficients) != len(sources):
         raise ValueError("Provide exactly one coefficient per checkpoint")
     coefficient_sum = sum(coefficients)
@@ -281,11 +296,9 @@ def merge_checkpoint_directories(sources, output, coefficients=None, merge_metad
         loaded = _load_assigned(source, assigned_tensors)
         for key, tensor in loaded.items():
             if tensor.is_floating_point():
-                coefficient = (
-                    1.0 / len(sources)
-                    if key.rsplit(".", 1)[-1] in _ALWAYS_MEAN_TENSOR_NAMES
-                    else coefficients[source_index]
-                )
+                is_router_state = key.rsplit(".", 1)[-1] in _ROUTER_STATE_TENSOR_NAMES
+                weights = router_coefficients if is_router_state else coefficients
+                coefficient = weights[source_index]
                 if source_index == 0:
                     accumulators[key] = tensor.float().mul_(coefficient)
                 else:
@@ -318,6 +331,7 @@ def merge_checkpoint_directories(sources, output, coefficients=None, merge_metad
         **copy.deepcopy(merge_metadata or {}),
         "source_checkpoints": sources,
         "coefficients": list(coefficients),
+        "router_state": router_state,
     }
     for key, value in {**output_tensors, **output_objects}.items():
         if key in state_dict:
@@ -397,6 +411,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--router-state",
+        choices=("mean", "method", "last"),
+        default="mean",
+        help=(
+            "Router balancing state (expert_bias, qb_beta): mean averages it uniformly "
+            "(default); method uses the same coefficients as --method; last copies it from the "
+            "last checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--ema-alpha",
         type=float,
         help="ema: weight of each newer checkpoint in the running average, in (0, 1].",
@@ -456,7 +480,9 @@ def main():
             metadata["source_decay"] = asdict(source_decay) if source_decay else None
         if dist.get_rank() == 0:
             print(f"> checkpoint coefficients: {coefficients}")
-        merge_checkpoint_directories(sources, args.output, coefficients, metadata)
+        merge_checkpoint_directories(
+            sources, args.output, coefficients, metadata, router_state=args.router_state
+        )
     finally:
         if initialized_here and dist.is_initialized():
             dist.destroy_process_group()

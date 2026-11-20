@@ -106,15 +106,30 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
         dist_checkpointing.save(state, str(source))
         sources.append(str(source))
 
-    # The router balancing state always gets a plain mean (3.0), whatever the coefficients.
-    for method, coefficients, expected_weight in (("mean", None, 3.0), ("wsm", [0.75, 0.25], 2.0)):
-        release = tmp_path_dist_ckpt / method / "release"
+    # By default the router balancing state gets a plain mean (3.0), whatever the coefficients;
+    # with router_state="method" it follows the coefficients like the weight, and with "last" it is
+    # copied from the last checkpoint (5.0).
+    for method, coefficients, router_state, expected_weight, expected_router in (
+        ("mean", None, "mean", 3.0, 3.0),
+        ("wsm", [0.75, 0.25], "mean", 2.0, 3.0),
+        ("wsm", [0.75, 0.25], "method", 2.0, 2.0),
+        ("wsm", [0.75, 0.25], "last", 2.0, 5.0),
+    ):
+        release = tmp_path_dist_ckpt / f"{method}_{router_state}" / "release"
         checkpoint_merge.merge_checkpoint_directories(
-            sources, release.parent, coefficients, merge_metadata={"method": method}
+            sources,
+            release.parent,
+            coefficients,
+            merge_metadata={"method": method},
+            router_state=router_state,
         )
 
         loaded = dist_checkpointing.load({key: _full(key, 0.0) for key in model_keys}, str(release))
-        expected = {"weight": expected_weight, "router.expert_bias": 3.0, "router.qb_beta": 3.0}
+        expected = {
+            "weight": expected_weight,
+            "router.expert_bias": expected_router,
+            "router.qb_beta": expected_router,
+        }
         for key, value in expected.items():
             torch.testing.assert_close(loaded[key], torch.full((4,), value))
         assert set(dist_checkpointing.load_tensors_metadata(str(release))) == set(model_keys)
@@ -128,4 +143,5 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
             "method": method,
             "source_checkpoints": sources,
             "coefficients": coefficients or [0.5, 0.5],
+            "router_state": router_state,
         }
