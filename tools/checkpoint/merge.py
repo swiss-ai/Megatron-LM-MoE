@@ -1,12 +1,18 @@
 # Copyright (c) 2026, EPFL / Swiss AI Initiative.
 
-"""Merge Megatron ``torch_dist`` checkpoints with generic checkpoint workers."""
+"""Merge Megatron ``torch_dist`` checkpoints with generic checkpoint workers.
+
+Offline, ``--checkpoints`` lists every checkpoint to merge and ``--output`` receives a
+``release`` checkpoint. With ``--update``, the new checkpoints are folded into a running merge at
+``--output``, so the merge can follow a training run that deletes its old checkpoints.
+"""
 
 import argparse
 import copy
 import gc
 import math
 import os
+import shutil
 import subprocess
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -29,9 +35,12 @@ _TRAINING_PREFIXES = (
     "rerun_state_machine",
     "dataloader",
 )
+_TRACKER = "latest_checkpointed_iteration.txt"
+# Growing-window WSM keeps the running mean of all folded checkpoints next to the export.
+_WSM_RUNNING_MEAN_DIR = "wsm_running_mean"
 
 
-def resolve_sources(checkpoints, iterations=None):
+def resolve_sources(checkpoints, iterations=None, min_sources=2):
     """Resolve ``--checkpoints`` (and optional ``--iterations``) to checkpoint directories.
 
     Either pass iteration/release directories (or roots, resolved through their tracker file),
@@ -44,8 +53,8 @@ def resolve_sources(checkpoints, iterations=None):
         sources = [_resolve_checkpoint_dir(checkpoints[0], step) for step in iterations]
     else:
         sources = [_resolve_checkpoint_dir(root, None) for root in checkpoints]
-    if len(sources) < 2:
-        raise ValueError("Checkpoint merging requires at least two checkpoints")
+    if len(sources) < min_sources:
+        raise ValueError(f"Checkpoint merging requires at least {min_sources} checkpoints")
     return sources
 
 
@@ -55,6 +64,10 @@ def source_iterations(sources):
     if not all(name.startswith("iter_") for name in names):
         return None
     return [int(name.removeprefix("iter_")) for name in names]
+
+
+def _iter_name(iteration):
+    return f"iter_{iteration:07d}"
 
 
 def _resolve_checkpoint_dir(root, step):
@@ -72,7 +85,7 @@ def _resolve_checkpoint_dir(root, step):
         if value == "release":
             return str(root / "release")
         step = int(value)
-    return str(root / f"iter_{step:07d}")
+    return str(root / _iter_name(step))
 
 
 def _is_training_key(key):
@@ -132,28 +145,39 @@ class LinearDecay:
     start: int | None = None
 
 
+def _check_count(num_checkpoints):
+    if num_checkpoints < 1:
+        raise ValueError("Checkpoint merging requires at least one checkpoint")
+
+
 def mean_coefficients(num_checkpoints):
     """Uniform weights."""
-    if num_checkpoints < 2:
-        raise ValueError("Checkpoint merging requires at least two checkpoints")
+    _check_count(num_checkpoints)
     return [1.0 / num_checkpoints] * num_checkpoints
 
 
-def ema_coefficients(num_checkpoints, alpha):
+def ema_coefficients(num_checkpoints, alpha, bias_correction=False):
     """Weights of an exponential moving average over the checkpoints, oldest first.
 
     The average starts at the first checkpoint and then takes ``avg = alpha * new +
     (1 - alpha) * avg`` for each later one, so the first checkpoint keeps ``(1 - alpha)**(n - 1)``.
     The decay is per checkpoint, not per training step. This is Eq. (4) of Li et al. 2025,
     "Model Merging in Pre-training of Large Language Models" (arXiv:2505.12082).
+
+    With ``bias_correction`` the average starts at zero instead, as Adam's moments do, and is
+    divided by ``1 - (1 - alpha)**n``. Every checkpoint then gets the geometric weight
+    ``alpha * (1 - alpha)**(n - i)``, normalized, so the oldest one is not weighted up.
     """
-    if num_checkpoints < 2:
-        raise ValueError("Checkpoint merging requires at least two checkpoints")
+    _check_count(num_checkpoints)
     if not 0 < alpha <= 1:
         raise ValueError(f"EMA alpha must be in (0, 1], got {alpha}")
-    return [(1 - alpha) ** (num_checkpoints - 1)] + [
-        alpha * (1 - alpha) ** (num_checkpoints - 1 - index) for index in range(1, num_checkpoints)
+    geometric = [
+        alpha * (1 - alpha) ** (num_checkpoints - 1 - index) for index in range(num_checkpoints)
     ]
+    if bias_correction:
+        total = 1 - (1 - alpha) ** num_checkpoints
+        return [weight / total for weight in geometric]
+    return [(1 - alpha) ** (num_checkpoints - 1)] + geometric[1:]
 
 
 def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterations=None):
@@ -164,8 +188,7 @@ def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterati
     produced under ``source_decay``, that decay is divided out first; this needs the
     checkpoint ``iterations``.
     """
-    if num_checkpoints < 2:
-        raise ValueError("Checkpoint merging requires at least two checkpoints")
+    _check_count(num_checkpoints)
     desired = _linear_multipliers(
         [interval / num_checkpoints for interval in range(num_checkpoints)], decay_end
     )
@@ -175,6 +198,8 @@ def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterati
     else:
         if iterations is None:
             raise ValueError("A source decay needs the checkpoint iterations")
+        if num_checkpoints < 2:
+            raise ValueError("A source decay needs at least two checkpoints")
         iterations = list(iterations)
         if len(iterations) != num_checkpoints:
             raise ValueError("Provide exactly one iteration per checkpoint")
@@ -237,7 +262,7 @@ def _filtered_common_state(source):
 def merge_checkpoint_directories(
     sources, output, coefficients=None, merge_metadata=None, router_state="mean", save_fp32=True
 ):
-    """Combine model tensors using every distributed rank as an I/O worker.
+    """Combine model tensors into ``output/release``, using every distributed rank as a worker.
 
     ``router_state`` selects how the router balancing state (``expert_bias``, ``qb_beta``) is
     merged: "mean" averages it uniformly, "method" uses ``coefficients`` like every other
@@ -253,22 +278,45 @@ def merge_checkpoint_directories(
         raise ValueError("Checkpoint merging requires at least two checkpoints")
     if coefficients is None:
         coefficients = mean_coefficients(len(sources))
-    router_coefficients = {
-        "mean": mean_coefficients(len(sources)),
-        "method": coefficients,
-        "last": [0.0] * (len(sources) - 1) + [1.0],
-    }.get(router_state)
-    if router_coefficients is None:
-        raise ValueError(f"router_state must be 'mean', 'method' or 'last', got {router_state!r}")
-    if len(coefficients) != len(sources):
+    router_coefficients = _router_coefficients(
+        router_state, coefficients, mean_coefficients(len(sources))
+    )
+    metadata = {
+        **copy.deepcopy(merge_metadata or {}),
+        "source_checkpoints": sources,
+        "coefficients": list(coefficients),
+        "router_state": router_state,
+        "save_fp32": save_fp32,
+    }
+    output = Path(output)
+    _merge(sources, output / "release", coefficients, router_coefficients, metadata, save_fp32)
+    if dist.get_rank() == 0:
+        (output / _TRACKER).write_text("release")
+        print(f"> saved merged release checkpoint to {output}")
+    dist.barrier()
+
+
+def _router_coefficients(router_state, coefficients, mean):
+    if router_state == "mean":
+        return mean
+    if router_state == "method":
+        return coefficients
+    if router_state == "last":
+        return [0.0] * (len(coefficients) - 1) + [1.0]
+    raise ValueError(f"router_state must be 'mean', 'method' or 'last', got {router_state!r}")
+
+
+def _merge(sources, checkpoint_dir, coefficients, router_coefficients, metadata, save_fp32):
+    """Write ``sum(coefficients[i] * sources[i])`` as a new checkpoint at ``checkpoint_dir``."""
+    if not len(sources) == len(coefficients) == len(router_coefficients):
         raise ValueError("Provide exactly one coefficient per checkpoint")
-    coefficient_sum = sum(coefficients)
-    if abs(coefficient_sum - 1.0) > 1e-9:
-        raise ValueError(f"Checkpoint coefficients must sum to 1, got {coefficient_sum}")
+    for name, values in (("Checkpoint", coefficients), ("Router state", router_coefficients)):
+        if abs(sum(values) - 1.0) > 1e-9:
+            raise ValueError(f"{name} coefficients must sum to 1, got {sum(values)}")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    first_source = sources[0]
+    first_source = str(sources[0])
 
     tensor_metadata = {
         key: value
@@ -296,7 +344,7 @@ def merge_checkpoint_directories(
 
     accumulators = {}
     static_tensors = {}
-    for source_index, source in enumerate(sources):
+    for source_index, source in enumerate(map(str, sources)):
         _validate_source_metadata(source, tensor_metadata)
         loaded = _load_assigned(source, assigned_tensors)
         for key, tensor in loaded.items():
@@ -318,34 +366,27 @@ def merge_checkpoint_directories(
             print(f"> accumulated checkpoint {source_index + 1}/{len(sources)}: {source}")
 
     output_tensors = {}
-    for key, metadata in assigned_tensors.items():
+    for key, tensor_meta in assigned_tensors.items():
         if key in accumulators:
-            data = accumulators[key].to(torch.float32 if save_fp32 else metadata.dtype)
+            data = accumulators[key].to(torch.float32 if save_fp32 else tensor_meta.dtype)
         else:
-            data = static_tensors[key].to(metadata.dtype)
-        output_tensors[key] = replace(metadata, data=data, dtype=data.dtype, replica_id=0)
+            data = static_tensors[key].to(tensor_meta.dtype)
+        output_tensors[key] = replace(tensor_meta, data=data, dtype=data.dtype, replica_id=0)
 
     loaded_objects = _load_assigned(first_source, assigned_objects)
     output_objects = {
-        key: replace(metadata, data=loaded_objects[key], replica_id=0)
-        for key, metadata in assigned_objects.items()
+        key: replace(object_meta, data=loaded_objects[key], replica_id=0)
+        for key, object_meta in assigned_objects.items()
     }
 
-    state_dict = _filtered_common_state(sources[-1])
-    state_dict["checkpoint_merge_metadata"] = {
-        **copy.deepcopy(merge_metadata or {}),
-        "source_checkpoints": sources,
-        "coefficients": list(coefficients),
-        "router_state": router_state,
-        "save_fp32": save_fp32,
-    }
+    state_dict = _filtered_common_state(str(sources[-1]))
+    state_dict["checkpoint_merge_metadata"] = copy.deepcopy(metadata)
     for key, value in {**output_tensors, **output_objects}.items():
         if key in state_dict:
             raise KeyError(f"Sharded model key collides with common state: {key!r}")
         state_dict[key] = value
 
-    output = Path(output)
-    checkpoint_dir = output / "release"
+    checkpoint_dir = Path(checkpoint_dir)
     if rank == 0:
         if checkpoint_dir.exists():
             raise FileExistsError(f"Output checkpoint already exists: {checkpoint_dir}")
@@ -365,9 +406,142 @@ def merge_checkpoint_directories(
         content_metadata=content_metadata,
     )
     dist.barrier()
+
+
+def update_running_merge(
+    output,
+    sources,
+    method,
+    ema_alpha=None,
+    ema_bias_correction=False,
+    decay_end=1e-4,
+    router_state="mean",
+):
+    """Fold ``sources`` (``iter_*`` directories, oldest first) into the running merge at ``output``.
+
+    ``output`` is an ordinary checkpoint root: its tracker names ``iter_N``, the merged model up to
+    the newest folded checkpoint, saved in fp32. The first call creates it. Each call checks that
+    the settings match the stored ones, skips checkpoints that were already folded, and refuses
+    older ones. The tracker is replaced only after the new merge is complete, so an interrupted
+    update leaves the previous merge in place and can simply be run again.
+
+    mean, ema (with or without bias correction) and wsm are supported. wsm uses a window that grows
+    from the first folded checkpoint; it keeps the running mean in ``output/wsm_running_mean``
+    and exports ``(1 - e)(N - 1)/N * mean(M_1..M_{N-1}) + (1 - (1 - e)(N - 1)/N) * M_N``.
+    """
+    if method not in ("mean", "ema", "wsm"):
+        raise ValueError(f"Unknown merge method: {method!r}")
+    settings = {
+        "method": method,
+        "ema_alpha": ema_alpha if method == "ema" else None,
+        "ema_bias_correction": bool(ema_bias_correction) if method == "ema" else False,
+        "decay_end": decay_end if method == "wsm" else None,
+        "router_state": router_state,
+    }
+    if method == "ema" and ema_alpha is None:
+        raise ValueError("EMA needs an alpha")
+    sources = [str(source) for source in sources]
+    iterations = source_iterations(sources)
+    if iterations is None:
+        raise ValueError("Updating a running merge needs iteration checkpoints (iter_*)")
+    for source, iteration in zip(sources, iterations):
+        _fold_checkpoint(Path(output), source, iteration, settings)
+
+
+def _fold_checkpoint(output, source, iteration, settings):
+    rank = dist.get_rank()
+    tracker = output / _TRACKER
+    mean_root = output / _WSM_RUNNING_MEAN_DIR
+    is_wsm = settings["method"] == "wsm"
+
+    previous, state = None, None
+    if tracker.is_file():
+        value = tracker.read_text().strip()
+        if not value.isdigit():
+            raise ValueError(f"{output} is not a running merge (its tracker names {value!r})")
+        previous = int(value)
+        common = dist_checkpointing.load_common_state_dict(str(output / _iter_name(previous)))
+        state = common.get("checkpoint_merge_metadata", {})
+        if not state.get("update"):
+            raise ValueError(f"{output} holds a checkpoint that was not created by --update")
+        stored = {key: state.get(key) for key in settings}
+        if stored != settings:
+            raise ValueError(
+                f"Settings differ from the running merge at {output}: stored {stored}, "
+                f"requested {settings}"
+            )
+        if iteration <= previous:
+            if source in state["source_checkpoints"]:
+                if rank == 0:
+                    print(f"> skipping {source}: already folded into {output}")
+                return
+            raise ValueError(f"{source} is not newer than the running merge (iteration {previous})")
+    elif output.exists():
+        # Only leftovers of an interrupted first update may be here.
+        allowed = {_iter_name(iteration), _WSM_RUNNING_MEAN_DIR, _TRACKER + ".tmp"}
+        unexpected = sorted(path.name for path in output.iterdir() if path.name not in allowed)
+        if unexpected:
+            raise FileExistsError(f"{output} has no running-merge tracker but holds {unexpected}")
+
+    num_merged = 0 if state is None else state["num_checkpoints"]
+    total = num_merged + 1
+    alpha = settings["ema_alpha"]
+    running_mean = [num_merged / total, 1 / total]
+    if settings["method"] == "mean":
+        pair = running_mean
+        effective = mean_coefficients(total)
+    elif settings["method"] == "ema":
+        if settings["ema_bias_correction"]:
+            z_old = 1 - (1 - alpha) ** num_merged
+            z_new = 1 - (1 - alpha) ** total
+            pair = [(1 - alpha) * z_old / z_new, alpha / z_new]
+        else:
+            pair = [1 - alpha, alpha]
+        effective = ema_coefficients(total, alpha, settings["ema_bias_correction"])
+    else:
+        keep = (1 - settings["decay_end"]) * num_merged / total
+        pair = [keep, 1 - keep]
+        effective = wsm_coefficients(total, settings["decay_end"])
+    router_pair = _router_coefficients(settings["router_state"], pair, running_mean)
+
+    # The running state is the previous merge, except for wsm, whose state is the running mean.
+    if state is None:
+        inputs, pair, router_pair, running_mean = [source], [1.0], [1.0], [1.0]
+    else:
+        state_root = mean_root if is_wsm else output
+        inputs = [str(state_root / _iter_name(previous)), source]
+    folded = {
+        "update": True,
+        "save_fp32": True,
+        "num_checkpoints": total,
+        "source_checkpoints": [*(state or {}).get("source_checkpoints", []), source],
+        "iterations": [*(state or {}).get("iterations", []), iteration],
+    }
+    merged_metadata = {**settings, **folded, "coefficients": effective}
+    targets = [(output / _iter_name(iteration), pair, router_pair, merged_metadata)]
+    if is_wsm:
+        mean_settings = {**settings, "method": "mean", "decay_end": None, "router_state": "mean"}
+        mean_metadata = {**mean_settings, **folded, "coefficients": mean_coefficients(total)}
+        targets.append(
+            (mean_root / _iter_name(iteration), running_mean, running_mean, mean_metadata)
+        )
+
+    for target, coefficients, router_coefficients, metadata in targets:
+        if rank == 0 and target.exists():
+            shutil.rmtree(target)  # left by an interrupted update; the tracker never named it
+        dist.barrier()
+        _merge(inputs, target, coefficients, router_coefficients, metadata, save_fp32=True)
+
     if rank == 0:
-        (output / "latest_checkpointed_iteration.txt").write_text("release")
-        print(f"> saved merged release checkpoint to {output}")
+        temporary = output / (_TRACKER + ".tmp")
+        temporary.write_text(str(iteration))
+        os.replace(temporary, tracker)
+        # Keep only the merge the tracker names, including leftovers of an interrupted cleanup.
+        for root in (output, mean_root) if is_wsm else (output,):
+            for path in root.glob("iter_*"):
+                if path.name != _iter_name(iteration):
+                    shutil.rmtree(path)
+        print(f"> folded {source} into {output} ({total} checkpoints, coefficients {pair})")
     dist.barrier()
 
 
@@ -408,6 +582,15 @@ def main():
     )
     parser.add_argument("--output", required=True, help="Output checkpoint root.")
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "Fold --checkpoints into the running merge at --output (created on first use) instead "
+            "of merging them from scratch. Supports mean, ema and wsm (a window that grows from "
+            "the first folded checkpoint); the merge is always saved in fp32."
+        ),
+    )
+    parser.add_argument(
         "--method",
         choices=("mean", "ema", "wsm"),
         default="mean",
@@ -440,6 +623,14 @@ def main():
         type=float,
         help="ema: weight of each newer checkpoint in the running average, in (0, 1].",
     )
+    parser.add_argument(
+        "--ema-bias-correction",
+        action="store_true",
+        help=(
+            "ema: start the average at zero and divide by 1 - (1 - alpha)**n, so the oldest "
+            "checkpoint is not weighted up."
+        ),
+    )
     wsm = parser.add_argument_group("wsm")
     wsm.add_argument(
         "--decay-end", type=float, help="Final LR multiplier of the emulated decay (default: 1e-4)."
@@ -465,6 +656,8 @@ def main():
 
     if (args.ema_alpha is None) == (args.method == "ema"):
         parser.error("--ema-alpha is required with, and only valid with, --method ema")
+    if args.ema_bias_correction and args.method != "ema":
+        parser.error("--ema-bias-correction needs --method ema")
     source_flags = (args.source_decay_steps, args.source_decay_end, args.source_decay_start)
     if args.method != "wsm" and any(flag is not None for flag in (args.decay_end, *source_flags)):
         parser.error("--decay-end and --source-decay-* flags need --method wsm")
@@ -478,17 +671,33 @@ def main():
         )
     else:
         source_decay = None
+    if args.update and source_decay is not None:
+        parser.error("--source-decay-* cannot be used with --update")
+    if args.update and not args.save_fp32:
+        parser.error("--update always saves fp32; --no-save-fp32 is not supported with it")
 
     initialized_here = _initialize_distributed(args.backend)
     try:
+        if args.update:
+            update_running_merge(
+                args.output,
+                resolve_sources(args.checkpoints, args.iterations, min_sources=1),
+                args.method,
+                ema_alpha=args.ema_alpha,
+                ema_bias_correction=args.ema_bias_correction,
+                decay_end=args.decay_end,
+                router_state=args.router_state,
+            )
+            return
         sources = resolve_sources(args.checkpoints, args.iterations)
         iterations = source_iterations(sources)
         metadata = {"method": args.method, "iterations": iterations}
         if args.method == "mean":
             coefficients = mean_coefficients(len(sources))
         elif args.method == "ema":
-            coefficients = ema_coefficients(len(sources), args.ema_alpha)
+            coefficients = ema_coefficients(len(sources), args.ema_alpha, args.ema_bias_correction)
             metadata["ema_alpha"] = args.ema_alpha
+            metadata["ema_bias_correction"] = args.ema_bias_correction
         else:
             coefficients = wsm_coefficients(len(sources), args.decay_end, source_decay, iterations)
             metadata["decay_end"] = args.decay_end
