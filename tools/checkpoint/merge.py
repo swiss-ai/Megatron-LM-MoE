@@ -8,14 +8,14 @@ import gc
 import math
 import os
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 
 
@@ -30,25 +30,30 @@ _TRAINING_PREFIXES = (
 )
 
 
-def resolve_sources(checkpoint_roots, checkpoint_steps=None):
-    """Resolve roots and optional iterations to concrete checkpoint directories."""
-    checkpoint_roots = list(checkpoint_roots)
-    checkpoint_steps = list(checkpoint_steps or [])
-    if checkpoint_steps:
-        if len(checkpoint_roots) == 1:
-            checkpoint_roots *= len(checkpoint_steps)
-        elif len(checkpoint_roots) != len(checkpoint_steps):
-            raise ValueError("Provide one checkpoint root or one root per checkpoint step")
-    else:
-        checkpoint_steps = [None] * len(checkpoint_roots)
+def resolve_sources(checkpoints, iterations=None):
+    """Resolve ``--checkpoints`` (and optional ``--iterations``) to checkpoint directories.
 
-    sources = [
-        _resolve_checkpoint_dir(root, step)
-        for root, step in zip(checkpoint_roots, checkpoint_steps)
-    ]
+    Either pass iteration/release directories (or roots, resolved through their tracker file),
+    or pass exactly one root together with the iterations to take from it.
+    """
+    checkpoints = list(checkpoints)
+    if iterations:
+        if len(checkpoints) != 1:
+            raise ValueError("--iterations needs exactly one checkpoint root")
+        sources = [_resolve_checkpoint_dir(checkpoints[0], step) for step in iterations]
+    else:
+        sources = [_resolve_checkpoint_dir(root, None) for root in checkpoints]
     if len(sources) < 2:
         raise ValueError("Checkpoint merging requires at least two checkpoints")
     return sources
+
+
+def source_iterations(sources):
+    """Return the iteration of each ``iter_*`` source, or None if any source is not one."""
+    names = [Path(source).name for source in sources]
+    if not all(name.startswith("iter_") for name in names):
+        return None
+    return [int(name.removeprefix("iter_")) for name in names]
 
 
 def _resolve_checkpoint_dir(root, step):
@@ -105,9 +110,7 @@ def _linear_interval_mean(left, right, decay_start, decay_steps, end_multiplier)
     linear_last = min(right - 1, decay_start + decay_steps)
     linear_count = max(linear_last - linear_first + 1, 0)
     if linear_count:
-        position_sum = (
-            (linear_first + linear_last) * linear_count / 2 - decay_start * linear_count
-        )
+        position_sum = (linear_first + linear_last) * linear_count / 2 - decay_start * linear_count
         total += linear_count - (1.0 - end_multiplier) * position_sum / decay_steps
 
     post_decay_count = max(right - max(left, decay_start + decay_steps + 1), 0)
@@ -115,75 +118,61 @@ def _linear_interval_mean(left, right, decay_start, decay_steps, end_multiplier)
     return total / count
 
 
-def merge_coefficients(
-    num_checkpoints,
-    method="mean",
-    original_schedule="stable",
-    original_end_multiplier=None,
-    target_end_multiplier=1e-4,
-    checkpoint_steps=None,
-    original_decay_steps=None,
-    original_decay_start_step=None,
-):
-    """Derive checkpoint coefficients, including WSM decay correction."""
+@dataclass(frozen=True)
+class LinearDecay:
+    """A linear LR decay from multiplier 1 to ``end`` over ``steps`` training steps.
+
+    ``start`` is the last step at multiplier 1. None means the decay starts at the synthetic
+    checkpoint one interval before the first merged checkpoint.
+    """
+
+    steps: int
+    end: float
+    start: int | None = None
+
+
+def mean_coefficients(num_checkpoints):
+    """Uniform weights."""
     if num_checkpoints < 2:
         raise ValueError("Checkpoint merging requires at least two checkpoints")
-    if method == "mean":
-        return [1.0 / num_checkpoints] * num_checkpoints
-    if method != "linear-decay":
-        raise ValueError(f"Unknown merge method: {method}")
+    return [1.0 / num_checkpoints] * num_checkpoints
 
-    steps_were_provided = checkpoint_steps is not None
-    if checkpoint_steps is None:
-        checkpoint_steps = list(range(num_checkpoints))
-    else:
-        checkpoint_steps = list(checkpoint_steps)
-    if len(checkpoint_steps) != num_checkpoints:
-        raise ValueError("Provide exactly one step per checkpoint")
-    if any(left >= right for left, right in zip(checkpoint_steps, checkpoint_steps[1:])):
-        raise ValueError("Checkpoint steps must be strictly increasing")
 
-    num_intervals = num_checkpoints
+def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterations=None):
+    """WSM weights that emulate a linear decay to ``decay_end`` over the merged checkpoints.
+
+    Each checkpoint is the endpoint of one coarse update. A synthetic checkpoint one interval
+    before the first gets weight zero, so it is never loaded. If the checkpoints were already
+    produced under ``source_decay``, that decay is divided out first; this needs the
+    checkpoint ``iterations``.
+    """
+    if num_checkpoints < 2:
+        raise ValueError("Checkpoint merging requires at least two checkpoints")
     desired = _linear_multipliers(
-        [interval / num_intervals for interval in range(num_intervals)],
-        target_end_multiplier,
+        [interval / num_checkpoints for interval in range(num_checkpoints)], decay_end
     )
-    # Treat each selected checkpoint as the endpoint of a coarse update. The preceding
-    # synthetic checkpoint has zero final coefficient and does not need to be loaded.
-    synthetic_step = checkpoint_steps[0] - (checkpoint_steps[1] - checkpoint_steps[0])
-    interval_starts = [synthetic_step, *checkpoint_steps[:-1]]
-    if original_schedule == "stable":
-        original = [1.0] * num_intervals
-    elif original_schedule == "linear-decay":
-        if not steps_were_provided:
-            raise ValueError("Original linear decay requires checkpoint iteration steps")
-        if original_end_multiplier is None or original_decay_steps is None:
-            raise ValueError(
-                "Original linear decay requires --original-end-multiplier and "
-                "--original-decay-steps"
-            )
-        if original_decay_steps <= 0:
-            raise ValueError("Original decay steps must be positive")
-        decay_start = (
-            synthetic_step if original_decay_start_step is None else original_decay_start_step
-        )
-        original = [
-            _linear_interval_mean(
-                left,
-                right,
-                decay_start,
-                original_decay_steps,
-                original_end_multiplier,
-            )
-            for left, right in zip(interval_starts, checkpoint_steps)
-        ]
-        if original[0] == 0:
-            raise ValueError("Cannot rebase an original decay whose multiplier reaches zero")
-        original = [multiplier / original[0] for multiplier in original]
-        if any(multiplier == 0 for multiplier in original):
-            raise ValueError("Cannot cancel an original decay whose multiplier reaches zero")
+
+    if source_decay is None:
+        original = [1.0] * num_checkpoints
     else:
-        raise ValueError(f"Unknown original schedule: {original_schedule}")
+        if iterations is None:
+            raise ValueError("A source decay needs the checkpoint iterations")
+        iterations = list(iterations)
+        if len(iterations) != num_checkpoints:
+            raise ValueError("Provide exactly one iteration per checkpoint")
+        if any(left >= right for left, right in zip(iterations, iterations[1:])):
+            raise ValueError("Checkpoint iterations must be strictly increasing")
+        if source_decay.steps <= 0:
+            raise ValueError("Source decay steps must be positive")
+        synthetic_step = iterations[0] - (iterations[1] - iterations[0])
+        decay_start = synthetic_step if source_decay.start is None else source_decay.start
+        original = [
+            _linear_interval_mean(left, right, decay_start, source_decay.steps, source_decay.end)
+            for left, right in zip([synthetic_step, *iterations[:-1]], iterations)
+        ]
+        if any(multiplier == 0 for multiplier in original):
+            raise ValueError("Cannot cancel a source decay whose multiplier reaches zero")
+        original = [multiplier / original[0] for multiplier in original]
 
     ratios = [target / source for target, source in zip(desired, original)]
     coefficients = [left - right for left, right in zip(ratios, ratios[1:])]
@@ -222,11 +211,7 @@ def _filtered_common_state(source):
 
     checkpoint_args = common.get("args")
     if checkpoint_args is not None:
-        for name, value in (
-            ("no_save_optim", True),
-            ("no_save_rng", True),
-            ("finetune", True),
-        ):
+        for name, value in (("no_save_optim", True), ("no_save_rng", True), ("finetune", True)):
             setattr(checkpoint_args, name, value)
     return common
 
@@ -236,9 +221,8 @@ def merge_checkpoint_directories(sources, output, coefficients=None, merge_metad
     sources = list(sources)
     if len(sources) < 2:
         raise ValueError("Checkpoint merging requires at least two checkpoints")
-    inferred_method = "mean" if coefficients is None else "custom"
     if coefficients is None:
-        coefficients = merge_coefficients(len(sources))
+        coefficients = mean_coefficients(len(sources))
     if len(coefficients) != len(sources):
         raise ValueError("Provide exactly one coefficient per checkpoint")
     coefficient_sum = sum(coefficients)
@@ -314,10 +298,9 @@ def merge_checkpoint_directories(sources, output, coefficients=None, merge_metad
 
     state_dict = _filtered_common_state(sources[-1])
     state_dict["checkpoint_merge_metadata"] = {
-        "method": inferred_method,
+        **copy.deepcopy(merge_metadata or {}),
         "source_checkpoints": sources,
         "coefficients": list(coefficients),
-        **(copy.deepcopy(merge_metadata) if merge_metadata is not None else {}),
     }
     for key, value in {**output_tensors, **output_objects}.items():
         if key in state_dict:
@@ -360,10 +343,9 @@ def _initialize_distributed(backend):
         os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
         if "MASTER_ADDR" not in os.environ:
             node_list = os.environ.get("SLURM_STEP_NODELIST", os.environ["SLURM_JOB_NODELIST"])
-            os.environ["MASTER_ADDR"] = (
-                subprocess.check_output(["scontrol", "show", "hostnames", node_list], text=True)
-                .splitlines()[0]
-            )
+            os.environ["MASTER_ADDR"] = subprocess.check_output(
+                ["scontrol", "show", "hostnames", node_list], text=True
+            ).splitlines()[0]
         if "MASTER_PORT" not in os.environ:
             job_id = int(os.environ["SLURM_JOB_ID"].split("_")[0])
             step_id = int(os.environ.get("SLURM_STEP_ID", "0"))
@@ -379,55 +361,38 @@ def main():
         nargs="+",
         required=True,
         help=(
-            "Checkpoint roots or direct iteration/release directories in chronological order; "
-            "the final checkpoint supplies progress metadata."
+            "Checkpoints in chronological order: iteration/release directories or roots "
+            "(resolved through their tracker), or one root together with --iterations. "
+            "The last checkpoint supplies the progress metadata."
         ),
     )
     parser.add_argument(
-        "--checkpoint-steps",
-        nargs="+",
-        type=int,
-        default=None,
-        help=(
-            "Strictly increasing iterations to merge. One root applies to every listed iteration."
-        ),
+        "--iterations", nargs="+", type=int, help="Iterations to take from the single root."
     )
     parser.add_argument("--output", required=True, help="Output checkpoint root.")
     parser.add_argument(
-        "--merge-method",
-        choices=("mean", "linear-decay"),
+        "--method",
+        choices=("mean", "wsm"),
         default="mean",
-        help="Checkpoint combination method. linear-decay uses the WSM formula.",
+        help="mean: uniform average. wsm: weights that emulate a linear LR decay.",
     )
-    parser.add_argument(
-        "--original-schedule",
-        choices=("stable", "linear-decay"),
-        default="stable",
-        help="LR schedule used while producing the selected checkpoints.",
-    )
-    parser.add_argument(
-        "--original-end-multiplier",
-        type=float,
-        default=None,
-        help="Final LR multiplier of an original linear decay.",
-    )
-    parser.add_argument(
-        "--original-decay-steps",
-        type=int,
-        default=None,
-        help="Total number of steps in the original linear decay.",
-    )
-    parser.add_argument(
-        "--original-decay-start-step",
-        type=int,
-        default=None,
-        help="Original decay start; defaults to the synthetic preceding checkpoint step.",
-    )
-    parser.add_argument(
-        "--target-end-multiplier",
+    wsm = parser.add_argument_group("wsm")
+    wsm.add_argument(
+        "--decay-end",
         type=float,
         default=1e-4,
-        help="Desired final LR multiplier for linear-decay merging (default: 1e-4).",
+        help="Final LR multiplier of the emulated decay (default: 1e-4).",
+    )
+    wsm.add_argument(
+        "--source-decay-steps",
+        type=int,
+        help="Set if the checkpoints come from inside a linear decay: its total length.",
+    )
+    wsm.add_argument("--source-decay-end", type=float, help="Final multiplier of that decay.")
+    wsm.add_argument(
+        "--source-decay-start",
+        type=int,
+        help="Last step before that decay (default: one interval before the first checkpoint).",
     )
     parser.add_argument(
         "--backend",
@@ -437,41 +402,32 @@ def main():
     )
     args = parser.parse_args()
 
+    source_flags = (args.source_decay_steps, args.source_decay_end, args.source_decay_start)
+    if any(flag is not None for flag in source_flags):
+        if args.method != "wsm":
+            parser.error("--source-decay-* flags need --method wsm")
+        if args.source_decay_steps is None or args.source_decay_end is None:
+            parser.error("--source-decay-steps and --source-decay-end must be set together")
+        source_decay = LinearDecay(
+            args.source_decay_steps, args.source_decay_end, args.source_decay_start
+        )
+    else:
+        source_decay = None
+
     initialized_here = _initialize_distributed(args.backend)
     try:
-        sources = resolve_sources(args.checkpoints, args.checkpoint_steps)
-        names = [Path(source).name for source in sources]
-        checkpoint_steps = (
-            [int(name.removeprefix("iter_")) for name in names]
-            if all(name.startswith("iter_") for name in names)
-            else None
-        )
-        coefficients = merge_coefficients(
-            num_checkpoints=len(sources),
-            method=args.merge_method,
-            original_schedule=args.original_schedule,
-            original_end_multiplier=args.original_end_multiplier,
-            target_end_multiplier=args.target_end_multiplier,
-            checkpoint_steps=checkpoint_steps,
-            original_decay_steps=args.original_decay_steps,
-            original_decay_start_step=args.original_decay_start_step,
-        )
+        sources = resolve_sources(args.checkpoints, args.iterations)
+        iterations = source_iterations(sources)
+        metadata = {"method": args.method, "iterations": iterations}
+        if args.method == "mean":
+            coefficients = mean_coefficients(len(sources))
+        else:
+            coefficients = wsm_coefficients(len(sources), args.decay_end, source_decay, iterations)
+            metadata["decay_end"] = args.decay_end
+            metadata["source_decay"] = asdict(source_decay) if source_decay else None
         if dist.get_rank() == 0:
             print(f"> checkpoint coefficients: {coefficients}")
-        merge_checkpoint_directories(
-            sources,
-            args.output,
-            coefficients,
-            merge_metadata={
-                "method": args.merge_method,
-                "checkpoint_steps": checkpoint_steps,
-                "original_schedule": args.original_schedule,
-                "original_end_multiplier": args.original_end_multiplier,
-                "original_decay_steps": args.original_decay_steps,
-                "original_decay_start_step": args.original_decay_start_step,
-                "target_end_multiplier": args.target_end_multiplier,
-            },
-        )
+        merge_checkpoint_directories(sources, args.output, coefficients, metadata)
     finally:
         if initialized_here and dist.is_initialized():
             dist.destroy_process_group()
