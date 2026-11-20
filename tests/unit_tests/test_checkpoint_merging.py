@@ -9,7 +9,12 @@ import tools.checkpoint.merge as checkpoint_merge
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from tests.unit_tests.test_utilities import Utils
-from tools.checkpoint.merge import LinearDecay, mean_coefficients, wsm_coefficients
+from tools.checkpoint.merge import (
+    LinearDecay,
+    ema_coefficients,
+    mean_coefficients,
+    wsm_coefficients,
+)
 
 
 def test_resolve_sources():
@@ -25,6 +30,9 @@ def test_resolve_sources():
     "coefficients, expected",
     [
         (mean_coefficients(4), [0.25] * 4),
+        # avg = 1; avg = 0.5 * 2 + 0.5 * avg; avg = 0.5 * 3 + 0.5 * avg.
+        (ema_coefficients(3, alpha=0.5), [0.25, 0.25, 0.5]),
+        (ema_coefficients(3, alpha=1.0), [0.0, 0.0, 1.0]),
         # Stable source: a linear decay to 0.2 over five intervals.
         (wsm_coefficients(5, decay_end=0.2), [0.16, 0.16, 0.16, 0.16, 0.36]),
         # Decayed source: the decay is rebased at the synthetic interval [0, 20) ...
@@ -41,6 +49,11 @@ def test_resolve_sources():
 )
 def test_coefficients(coefficients, expected):
     assert coefficients == pytest.approx(expected)
+
+
+def test_ema_rejects_invalid_alpha():
+    with pytest.raises(ValueError, match="EMA alpha"):
+        ema_coefficients(3, alpha=0.0)
 
 
 @pytest.mark.parametrize(

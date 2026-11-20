@@ -138,6 +138,23 @@ def mean_coefficients(num_checkpoints):
     return [1.0 / num_checkpoints] * num_checkpoints
 
 
+def ema_coefficients(num_checkpoints, alpha):
+    """Weights of an exponential moving average over the checkpoints, oldest first.
+
+    The average starts at the first checkpoint and then takes ``avg = alpha * new +
+    (1 - alpha) * avg`` for each later one, so the first checkpoint keeps ``(1 - alpha)**(n - 1)``.
+    The decay is per checkpoint, not per training step. This is Eq. (4) of Li et al. 2025,
+    "Model Merging in Pre-training of Large Language Models" (arXiv:2505.12082).
+    """
+    if num_checkpoints < 2:
+        raise ValueError("Checkpoint merging requires at least two checkpoints")
+    if not 0 < alpha <= 1:
+        raise ValueError(f"EMA alpha must be in (0, 1], got {alpha}")
+    return [(1 - alpha) ** (num_checkpoints - 1)] + [
+        alpha * (1 - alpha) ** (num_checkpoints - 1 - index) for index in range(1, num_checkpoints)
+    ]
+
+
 def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterations=None):
     """WSM weights that emulate a linear decay to ``decay_end`` over the merged checkpoints.
 
@@ -372,16 +389,21 @@ def main():
     parser.add_argument("--output", required=True, help="Output checkpoint root.")
     parser.add_argument(
         "--method",
-        choices=("mean", "wsm"),
+        choices=("mean", "ema", "wsm"),
         default="mean",
-        help="mean: uniform average. wsm: weights that emulate a linear LR decay.",
+        help=(
+            "mean: uniform average. ema: exponential moving average. "
+            "wsm: weights that emulate a linear LR decay."
+        ),
+    )
+    parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        help="ema: weight of each newer checkpoint in the running average, in (0, 1].",
     )
     wsm = parser.add_argument_group("wsm")
     wsm.add_argument(
-        "--decay-end",
-        type=float,
-        default=1e-4,
-        help="Final LR multiplier of the emulated decay (default: 1e-4).",
+        "--decay-end", type=float, help="Final LR multiplier of the emulated decay (default: 1e-4)."
     )
     wsm.add_argument(
         "--source-decay-steps",
@@ -402,10 +424,14 @@ def main():
     )
     args = parser.parse_args()
 
+    if (args.ema_alpha is None) == (args.method == "ema"):
+        parser.error("--ema-alpha is required with, and only valid with, --method ema")
     source_flags = (args.source_decay_steps, args.source_decay_end, args.source_decay_start)
+    if args.method != "wsm" and any(flag is not None for flag in (args.decay_end, *source_flags)):
+        parser.error("--decay-end and --source-decay-* flags need --method wsm")
+    if args.decay_end is None:
+        args.decay_end = 1e-4
     if any(flag is not None for flag in source_flags):
-        if args.method != "wsm":
-            parser.error("--source-decay-* flags need --method wsm")
         if args.source_decay_steps is None or args.source_decay_end is None:
             parser.error("--source-decay-steps and --source-decay-end must be set together")
         source_decay = LinearDecay(
@@ -421,6 +447,9 @@ def main():
         metadata = {"method": args.method, "iterations": iterations}
         if args.method == "mean":
             coefficients = mean_coefficients(len(sources))
+        elif args.method == "ema":
+            coefficients = ema_coefficients(len(sources), args.ema_alpha)
+            metadata["ema_alpha"] = args.ema_alpha
         else:
             coefficients = wsm_coefficients(len(sources), args.decay_end, source_decay, iterations)
             metadata["decay_end"] = args.decay_end
