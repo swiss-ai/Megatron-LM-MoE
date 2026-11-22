@@ -349,10 +349,22 @@ class ApertusSFTDataset(MegatronDataset):
         if self.config.loss_mask_token_ids:
             for token_id in self.config.loss_mask_token_ids:
                 loss_mask[labels == token_id] = 0.0
-        if len(boundaries) == 1:
+        # Kernels consume the entire physical tensor, including its final padding.
+        pad_segment = int(os.environ.get("APERTUS_SFT_PAD_SEGMENT", "0"))
+        if pad_segment > 0:
+            # Experiment (KISTI scale tests, 2026-11-22): give the padding tail its own segments of at most
+            # pad_segment tokens instead of merging it into the last document, so a nearly empty pack no longer
+            # carries one ~110k-token segment (max_seqlen) next to its 256 short documents. Every boundary stays a
+            # multiple of the CP alignment as long as pad_segment is one (cursor and target already are).
+            position = boundaries[-1]
+            while target - position > pad_segment:
+                position += pad_segment
+                boundaries.append(position)
+            if boundaries[-1] != target:
+                boundaries.append(target)
+        elif len(boundaries) == 1:
             boundaries.append(target)
         else:
-            # Kernels consume the entire physical tensor, including its final padding.
             boundaries[-1] = target
         # Fixed size for the default collator; flattening drops the repeated end offsets.
         cu = np.full(target + 1, target, dtype=np.int32)
