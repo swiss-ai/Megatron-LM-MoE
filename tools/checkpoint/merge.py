@@ -23,6 +23,7 @@ import torch.distributed as dist
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
+from megatron.core.dist_checkpointing.strategies.torch import _get_filesystem_reader
 
 
 # Router load-balancing state (expert bias, quantile-balancing betas); see --router-state.
@@ -94,7 +95,39 @@ def _is_training_key(key):
 
 
 def _tensor_nbytes(metadata):
-    return math.prod(metadata.global_shape) * metadata.dtype.itemsize
+    return math.prod(metadata.local_shape) * metadata.dtype.itemsize
+
+
+def _source_chunks(tensor_metadata, source):
+    """Split every tensor into the chunks that ``source`` stored.
+
+    A reader loads each stored chunk whole before it takes its slice. With one chunk per tensor,
+    every rank that needs a slice (for example one EP rank's experts) reads the whole tensor, so
+    the merge keeps the source layout. A layout that is not a regular grid stays one chunk.
+    """
+    storage = _get_filesystem_reader(source).read_metadata().state_dict_metadata
+    chunks = {}
+    for key, meta in tensor_metadata.items():
+        shape = tuple(meta.global_shape)
+        layout = [(tuple(c.offsets), tuple(c.sizes)) for c in storage[key].chunks]
+        sizes = layout[0][1]
+        regular = (
+            all(chunk_sizes == sizes for _, chunk_sizes in layout)
+            and all(size > 0 and length % size == 0 for size, length in zip(sizes, shape))
+            and len({offsets for offsets, _ in layout}) == len(layout)
+            and len(layout) == math.prod(length // size for size, length in zip(sizes, shape))
+            and all(o % size == 0 for offsets, _ in layout for o, size in zip(offsets, sizes))
+        )
+        if not regular:
+            layout = [((0,) * len(shape), shape)]
+        for index, (offsets, sizes) in enumerate(layout):
+            chunks[(key, index)] = replace(
+                meta,
+                local_shape=sizes,
+                global_offset=offsets,
+                axis_fragmentations=tuple(length // size for size, length in zip(sizes, shape)),
+            )
+    return chunks
 
 
 def _owner_map(items, world_size, size_fn):
@@ -333,10 +366,13 @@ def _merge(sources, checkpoint_dir, coefficients, router_coefficients, metadata,
         if isinstance(value, ShardedObject) and not _is_training_key(value.key)
     }
 
-    tensor_owners = _owner_map(list(tensor_metadata.items()), world_size, _tensor_nbytes)
+    # Work on the chunks of the last source, the newest training checkpoint, and save the merge
+    # with the same chunks, so it reads like that checkpoint.
+    chunk_metadata = _source_chunks(tensor_metadata, str(sources[-1]))
+    tensor_owners = _owner_map(list(chunk_metadata.items()), world_size, _tensor_nbytes)
     object_owners = _owner_map(list(object_metadata.items()), world_size, lambda _: 1)
     assigned_tensors = {
-        key: value for key, value in tensor_metadata.items() if tensor_owners[key] == rank
+        key: value for key, value in chunk_metadata.items() if tensor_owners[key] == rank
     }
     assigned_objects = {
         key: value for key, value in object_metadata.items() if object_owners[key] == rank
@@ -349,7 +385,7 @@ def _merge(sources, checkpoint_dir, coefficients, router_coefficients, metadata,
         loaded = _load_assigned(source, assigned_tensors)
         for key, tensor in loaded.items():
             if tensor.is_floating_point():
-                is_router_state = key.rsplit(".", 1)[-1] in _ROUTER_STATE_TENSOR_NAMES
+                is_router_state = key[0].rsplit(".", 1)[-1] in _ROUTER_STATE_TENSOR_NAMES
                 weights = router_coefficients if is_router_state else coefficients
                 coefficient = weights[source_index]
                 if source_index == 0:
@@ -359,7 +395,7 @@ def _merge(sources, checkpoint_dir, coefficients, router_coefficients, metadata,
             elif source_index == 0:
                 static_tensors[key] = tensor.cpu().clone()
             elif not torch.equal(static_tensors[key], tensor.cpu()):
-                raise ValueError(f"Non-floating model tensor {key!r} differs in {source}")
+                raise ValueError(f"Non-floating model tensor {key[0]!r} differs in {source}")
         del loaded
         gc.collect()
         if rank == 0:

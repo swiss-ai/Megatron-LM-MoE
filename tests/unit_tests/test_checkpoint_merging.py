@@ -1,6 +1,7 @@
 # Copyright (c) 2026, EPFL / Swiss AI Initiative.
 
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +9,7 @@ import torch
 import tools.checkpoint.merge as checkpoint_merge
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.strategies.torch import _get_filesystem_reader
 from tests.unit_tests.test_utilities import Utils
 from tools.checkpoint.merge import (
     LinearDecay,
@@ -148,6 +150,72 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
         }
 
 
+def _stored_chunks(checkpoint, key):
+    storage = _get_filesystem_reader(checkpoint).read_metadata().state_dict_metadata[key]
+    return sorted((tuple(chunk.offsets), tuple(chunk.sizes)) for chunk in storage.chunks)
+
+
+def _chunked(key, tensor, *fragmentations):
+    # One shard per grid cell, all saved by the main replica on rank 0.
+    rank = torch.distributed.get_rank()
+    sizes = [length // parts for length, parts in zip(tensor.shape, fragmentations)]
+    cells = [[]]
+    for axis, parts in enumerate(fragmentations):
+        cells = [cell + [(axis, index, parts)] for cell in cells for index in range(parts)]
+    shards = []
+    for cell in cells:
+        index = tuple(slice(i * size, (i + 1) * size) for (_, i, _), size in zip(cell, sizes))
+        shards.append(
+            ShardedTensor.from_rank_offsets(key, tensor[index].clone(), *cell, replica_id=rank)
+        )
+    return shards
+
+
+def test_merge_keeps_source_chunks(initialized_model_parallel, tmp_path_dist_ckpt):
+    # A reader loads each stored chunk whole, so the merge stores the chunks of the last source:
+    # experts split per expert (like EP), a dense weight split on both axes. The first source
+    # stores whole tensors, so reading it into the last source's chunks also works.
+    base = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    sources = []
+    for value, iteration, chunked in ((1.0, 100, False), (3.0, 200, True)):
+        source = tmp_path_dist_ckpt / "chunks" / f"iter_{iteration:07d}"
+        if torch.distributed.get_rank() == 0:
+            source.mkdir(parents=True)
+        torch.distributed.barrier()
+        experts, dense = (base + value).to(torch.bfloat16), base * value
+        state = {
+            "experts": _chunked("experts", experts, *((4, 1) if chunked else (1, 1))),
+            "dense": _chunked("dense", dense, *((2, 3) if chunked else (1, 1))),
+            "iteration": iteration,
+        }
+        dist_checkpointing.save(state, str(source))
+        sources.append(str(source))
+
+    output = tmp_path_dist_ckpt / "chunks" / "merged"
+    checkpoint_merge.merge_checkpoint_directories(sources, output)
+    release = str(output / "release")
+    for key in ("experts", "dense"):
+        assert _stored_chunks(release, key) == _stored_chunks(sources[-1], key)
+    rank = torch.distributed.get_rank()
+    templates = {
+        key: ShardedTensor.from_rank_offsets(key, torch.zeros(4, 6), replica_id=rank)
+        for key in ("experts", "dense")
+    }
+    loaded = dist_checkpointing.load(templates, release)
+    torch.testing.assert_close(loaded["experts"], base + 2.0)
+    torch.testing.assert_close(loaded["dense"], base * 2.0)
+
+
+def test_irregular_source_chunks_stay_one_chunk(monkeypatch):
+    chunks = [SimpleNamespace(offsets=(0,), sizes=(3,)), SimpleNamespace(offsets=(3,), sizes=(5,))]
+    storage = {"weight": SimpleNamespace(chunks=chunks)}
+    reader = SimpleNamespace(read_metadata=lambda: SimpleNamespace(state_dict_metadata=storage))
+    monkeypatch.setattr(checkpoint_merge, "_get_filesystem_reader", lambda source: reader)
+    meta = ShardedTensor.from_rank_offsets("weight", torch.empty(8, device="meta")).without_data()
+    (chunk,) = checkpoint_merge._source_chunks({"weight": meta}, "source").values()
+    assert (chunk.global_offset, chunk.local_shape) == ((0,), (8,))
+
+
 def test_save_fp32_keeps_precision(initialized_model_parallel, tmp_path_dist_ckpt):
     # bf16 sources 1.0 and 1.0078125 (the next bf16 value): their mean 1.00390625 lies halfway
     # between two bf16 values, so a bf16 output rounds it to 1.0, and only fp32 keeps it.
@@ -183,7 +251,8 @@ def _save_update_source(root, iteration):
     source = root / f"iter_{iteration:07d}"
     source.mkdir(parents=True)
     state = {
-        "weight": ShardedTensor.from_rank_offsets("weight", weight),
+        # Two chunks, so the running merge must keep the source layout.
+        "weight": _chunked("weight", weight, 2),
         "router.expert_bias": ShardedTensor.from_rank_offsets("router.expert_bias", weight * 2),
         "iteration": iteration,
         "args": Namespace(iteration=iteration),
@@ -249,8 +318,11 @@ def test_update_matches_offline_merge(
     assert metadata["source_checkpoints"] == list(sources)
     assert metadata["iterations"] == [100, 200, 300, 400]
     assert metadata["coefficients"] == pytest.approx(coefficients)
+    assert _stored_chunks(merged, "weight") == _stored_chunks(sources[-1], "weight")
     if method == "wsm":
         assert [p.name for p in (output / "wsm_running_mean").glob("iter_*")] == ["iter_0000400"]
+        mean = str(output / "wsm_running_mean" / "iter_0000400")
+        assert _stored_chunks(mean, "weight") == _stored_chunks(sources[-1], "weight")
 
     # Folding the same checkpoint again changes nothing; older or mismatched input is refused.
     update(sources[3])
