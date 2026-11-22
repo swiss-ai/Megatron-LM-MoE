@@ -427,12 +427,17 @@ class MoELayer(BaseMoELayer):
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
-        dispatcher.
+        dispatcher. padding_mask is the batch-first mask given to route(); it only reaches the
+        dispatcher with moe_dispatch_exclude_padding, which then does not dispatch padding.
         """
         # Project the hidden_states from hidden dimension down to latent dimenion.
         if self.config.moe_latent_size:
@@ -440,9 +445,14 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
+        if self.config.moe_dispatch_exclude_padding and padding_mask is not None:
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs, padding_mask=padding_mask
+            )
+        else:
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                hidden_states, routing_map, probs
+            )
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, hidden_states_sf: Optional[torch.Tensor], probs: torch.Tensor):
@@ -577,7 +587,7 @@ class MoELayer(BaseMoELayer):
         """This method is a combined method of route and preprocess. Deprecated."""
 
         probs, routing_map = self.route(hidden_states, padding_mask)
-        return self.preprocess(hidden_states, probs, routing_map)
+        return self.preprocess(hidden_states, probs, routing_map, padding_mask=padding_mask)
 
     def forward(
         self,
@@ -611,7 +621,9 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    hidden_states, probs = self.preprocess(
+                        hidden_states, probs, routing_map, padding_mask=padding_mask
+                    )
                     # FP8 dispatch (the only user of a scale factor) requires EP comm overlap
                     # and runs via the schedule plan, not this path, so sf is always None here.
                     # It is still threaded through dispatch's sf slot for signature uniformity.

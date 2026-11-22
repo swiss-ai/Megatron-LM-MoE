@@ -556,7 +556,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
                 local_tokens, probs = layer.mlp.preprocess(
-                    pre_mlp_layernorm_output, probs, routing_map
+                    pre_mlp_layernorm_output, probs, routing_map, padding_mask=padding_mask
                 )
                 # NOTE: sf slot is always None as the FP8 cast lives in the moe_pre_dispatch node.
                 return hidden_states, local_tokens, None, probs, shared_expert_output

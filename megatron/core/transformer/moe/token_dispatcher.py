@@ -1288,7 +1288,12 @@ class _DeepepManager(_DispatchManager):
             )
         set_deepep_num_sms(config.moe_deepep_num_sms)
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+    def setup_metadata(
+        self,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         num_tokens = routing_map.shape[0]
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
@@ -1299,6 +1304,16 @@ class _DeepepManager(_DispatchManager):
         if self.capacity_factor is not None:
             mask = self.token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
+        if padding_mask is not None:
+            # padding_mask is batch-first [b, s]; token rows are flattened from [s, b].
+            # topk still returns real expert ids for a padding row, so -1 is what makes
+            # DeepEP skip it; combine then returns zeros for the row.
+            padding_rows = padding_mask.transpose(0, 1).reshape(-1, 1)
+            assert padding_rows.shape[0] == num_tokens, (
+                f"padding_mask has {padding_rows.shape[0]} tokens, routing_map has {num_tokens}"
+            )
+            self.token_indices = self.token_indices.masked_fill(padding_rows, -1)
+            self.token_probs = self.token_probs.masked_fill(padding_rows, 0)
 
     def dispatch(
         self,
@@ -1595,7 +1610,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     @jit_fuser
     def dispatch_preprocess(
-        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
@@ -1607,6 +1626,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Input hidden states to be processed
             routing_map (torch.Tensor): Map indicating which expert each token should be routed to
             probs (torch.Tensor): Routing probabilities for each token-expert pair
+            padding_mask (torch.Tensor, optional): Batch-first [b, s] bool mask, True for
+                padding. Given only with moe_dispatch_exclude_padding (deepep backend); those
+                rows are not dispatched and get a zero routed-expert output.
 
         Returns:
             A tuple of reshaped hidden states and token probabilities.
@@ -1617,7 +1639,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
-        self._comm_manager.setup_metadata(routing_map, probs)
+        if padding_mask is not None:
+            self._comm_manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)
+        else:
+            self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
 
     def token_dispatch(

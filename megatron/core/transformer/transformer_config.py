@@ -1193,6 +1193,11 @@ class TransformerConfig(ModelParallelConfig):
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports
     the MNNVL case."""
 
+    moe_dispatch_exclude_padding: bool = False
+    """Do not dispatch padding tokens (padding_mask True) to routed experts. Their routed-expert
+    output is zero; the shared expert still runs on them. Router outputs and statistics are
+    unchanged. Requires the flex dispatcher with the deepep backend and no CUDA graphs."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE auxiliary loss, z loss, and inference router violation
     metrics."""
@@ -1929,6 +1934,18 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_dispatch_exclude_padding:
+            if not (
+                self.moe_token_dispatcher_type == "flex"
+                and self.moe_flex_dispatcher_backend == "deepep"
+            ):
+                raise ValueError(
+                    "moe_dispatch_exclude_padding requires the flex dispatcher with the "
+                    "deepep backend."
+                )
+            if self.enable_cuda_graph or self.cuda_graph_impl != "none":
+                raise ValueError("moe_dispatch_exclude_padding does not support CUDA graphs.")
 
         if self.moe_use_fp8_dispatch:
             # FP8 dispatch is implemented only via the asymmetric-FP8 ScheduleNodes
