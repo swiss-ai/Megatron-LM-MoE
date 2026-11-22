@@ -1151,8 +1151,14 @@ def validate_args(args, defaults={}):
             'parallelism yet.'
         )
     if args.cp_doc_aware:
-        assert args.dataloader_inter_document_masking, (
-            '--cp-doc-aware needs --dataloader-inter-document-masking (packed THD batches).'
+        assert args.dataloader_inter_document_masking or args.ap_sft, (
+            '--cp-doc-aware needs packed THD batches: --dataloader-inter-document-masking or --ap-sft.'
+        )
+        if args.pipeline_model_parallel_size > 1:
+            # The plan pads each rank to its largest local load, so the per-rank length varies per micro-batch.
+            args.variable_seq_lengths = True
+        assert args.cuda_graph_impl == 'none', (
+            '--cp-doc-aware varies the per-rank sequence length; CUDA graphs need fixed shapes.'
         )
         assert args.context_parallel_size > 1, '--cp-doc-aware needs --context-parallel-size > 1.'
         assert args.micro_batch_size == 1, '--cp-doc-aware needs --micro-batch-size 1.'
