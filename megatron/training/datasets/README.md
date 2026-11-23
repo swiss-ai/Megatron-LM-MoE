@@ -1,5 +1,10 @@
 # Data Pipeline
 
+## Apertus-2 SFT
+
+See [Apertus-2 SFT](../../../docs/apertus_sft.md) for indexed token/weight pairs,
+output-only runtime masking, packing, and training flags.
+
 ## FIM dataset
 
 `GPTFIMDataset` extends Megatron-Core’s `GPTDataset` to support **Fill-in-the-Middle (FIM)** data augmentation.
