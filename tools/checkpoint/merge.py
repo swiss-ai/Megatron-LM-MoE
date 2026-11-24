@@ -430,6 +430,11 @@ def checkpoint_lr_schedule(checkpoint_args):
         scheduler.num_steps = iteration * args.global_batch_size
         return scheduler.get_lr(group or {})
 
+    def weight_decay(iteration):
+        scheduler.num_steps = iteration * args.global_batch_size
+        return scheduler.get_wd()
+
+    lr.weight_decay = weight_decay
     return lr
 
 
@@ -461,14 +466,41 @@ def _lr_group(key, ndim, checkpoint_args):
     return max_lr, _group_min_lr(args, max_lr)
 
 
+def _saved_param_groups(value):
+    """Yield every optimizer param group (with ``lr``, ``max_lr`` and ``min_lr``) in ``value``."""
+    if isinstance(value, dict):
+        for group in value.get("param_groups", ()):
+            if isinstance(group, dict) and {"lr", "max_lr", "min_lr"} <= group.keys():
+                yield group
+        children = value.values()
+    else:
+        children = value if isinstance(value, (list, tuple)) else ()
+    for child in children:
+        yield from _saved_param_groups(child)
+
+
 def wsm_group_coefficients(sources, iterations, decay_end):
     """WSM weights per LR group, with the run's own schedule divided out of each group.
 
     Returns the weights of the ``--lr`` group, and a map from every tensor key to the weights of
-    its group (:func:`_lr_group`). Gains take the group of the matrix they scale.
+    its group (:func:`_lr_group`). Gains take the group of the matrix they scale. Refuses a
+    window in which the weight decay changes (its term then has another shape than the LR), and
+    a schedule that does not give the LR every source saved for each of its param groups.
     """
-    args = dist_checkpointing.load_common_state_dict(str(sources[-1]))["args"]
+    common_states = [dist_checkpointing.load_common_state_dict(str(s)) for s in sources]
+    args = common_states[-1]["args"]
     lr = checkpoint_lr_schedule(args)
+    start = 2 * iterations[0] - iterations[1]  # the synthetic checkpoint one interval before
+    if lr.weight_decay(start) != lr.weight_decay(iterations[-1]):
+        raise ValueError("--source-decay-from-args needs a constant weight decay in the window")
+    for state, iteration in zip(common_states, iterations):
+        for group in _saved_param_groups(state.get("optimizer", {})):
+            rebuilt = lr(iteration, group)
+            if abs(rebuilt - float(group["lr"])) > 1e-6 * abs(float(group["lr"])):
+                raise ValueError(
+                    f"The rebuilt schedule gives LR {rebuilt} at iteration {iteration}, but the "
+                    f"checkpoint saved {float(group['lr'])} (max_lr {group['max_lr']})"
+                )
     groups = {}
     for key, meta in dist_checkpointing.load_tensors_metadata(str(sources[-1])).items():
         if key.startswith((f"{_GAIN_STATE}row_gain.", f"{_GAIN_STATE}col_gain.")):
@@ -579,6 +611,11 @@ def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterati
     ratios = [target / source for target, source in zip(desired, original)]
     coefficients = [left - right for left, right in zip(ratios, ratios[1:])]
     coefficients.append(ratios[-1])
+    if min(coefficients) < 0:
+        raise ValueError(
+            f"The source decays faster than the target, so the weights {coefficients} would "
+            "extrapolate (a negative weight); use a steeper target (smaller --decay-end)"
+        )
     return coefficients
 
 

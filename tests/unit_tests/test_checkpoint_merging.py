@@ -65,35 +65,83 @@ def test_wsm_source_schedule_matches_linear_decay():
     )
 
 
+def _bridge_args(**changes):
+    # Saved training args of an iteration-based sqrt-bridge run.
+    return Namespace(
+        **{
+            **dict(
+                train_iters=1000,
+                train_samples=None,
+                lr_decay_iters=None,
+                lr_warmup_iters=50,
+                lr_warmup_fraction=None,
+                lr_wsd_decay_iters=None,
+                lr_wsd_decay_style=None,
+                global_batch_size=8,
+                rampup_batch_size=None,
+                lr=1e-2,
+                min_lr=1e-4,
+                lr_warmup_init=0.0,
+                lr_decay_style="sqrt-bridge",
+                lr_bridge_low_factor=0.5,
+                lr_bridge_switch_iters=600,
+                lr_bridge_switch_samples=None,
+                lr_bridge_log_start=None,
+                lr_bridge_rho_ref=None,
+                lr_bridge_budget="remaining",
+                start_weight_decay=0.1,
+                end_weight_decay=0.1,
+                weight_decay_incr_style="constant",
+                use_checkpoint_opt_param_scheduler=False,
+                override_opt_param_scheduler=False,
+            ),
+            **changes,
+        }
+    )
+
+
+def test_wsm_rejects_extrapolating_weights():
+    # A source that decays to 0.1 under a target that only decays to 0.9 needs negative weights.
+    with pytest.raises(ValueError, match="extrapolate"):
+        wsm_coefficients(3, 0.9, LinearDecay(steps=40, end=0.1, start=0), [20, 40, 60])
+
+
+@pytest.mark.parametrize(
+    "changes, saved_lr, match",
+    [
+        # The weight decay still grows inside the window [400, 700].
+        (dict(start_weight_decay=0.0, weight_decay_incr_style="linear"), None, "weight decay"),
+        # The run used another schedule than its saved args give (for example after a resume).
+        ({}, 1e-3, "rebuilt schedule"),
+    ],
+)
+def test_wsm_group_coefficients_guards(monkeypatch, changes, saved_lr, match):
+    args = _bridge_args(**changes)
+    lr = checkpoint_merge.checkpoint_lr_schedule(args)
+    iterations = [500, 600, 700]
+
+    def common_state(path):
+        iteration = int(path.rsplit("_", 1)[1])
+        group = {"lr": saved_lr or lr(iteration), "max_lr": args.lr, "min_lr": args.min_lr}
+        return {"args": args, "optimizer": {"param_groups": [group]}}
+
+    monkeypatch.setattr(checkpoint_merge.dist_checkpointing, "load_common_state_dict", common_state)
+    monkeypatch.setattr(checkpoint_merge.dist_checkpointing, "load_tensors_metadata", lambda _: {})
+    sources = [f"run/iter_{iteration}" for iteration in iterations]
+    with pytest.raises(ValueError, match=match):
+        checkpoint_merge.wsm_group_coefficients(sources, iterations, 1e-4)
+    # The same run passes when the guard does not apply.
+    if saved_lr is None:
+        args.start_weight_decay = 0.1
+    else:
+        saved_lr = None
+    checkpoint_merge.wsm_group_coefficients(sources, iterations, 1e-4)
+
+
 def test_checkpoint_lr_schedule_rebuilds_sqrt_bridge():
     from megatron.core.optimizer_param_scheduler import build_air_bridge_schedule
 
-    args = Namespace(
-        train_iters=1000,
-        train_samples=None,
-        lr_decay_iters=None,
-        lr_warmup_iters=50,
-        lr_warmup_fraction=None,
-        lr_wsd_decay_iters=None,
-        lr_wsd_decay_style=None,
-        global_batch_size=8,
-        rampup_batch_size=None,
-        lr=1e-2,
-        min_lr=1e-4,
-        lr_warmup_init=0.0,
-        lr_decay_style="sqrt-bridge",
-        lr_bridge_low_factor=0.5,
-        lr_bridge_switch_iters=600,
-        lr_bridge_switch_samples=None,
-        lr_bridge_log_start=None,
-        lr_bridge_rho_ref=None,
-        lr_bridge_budget="remaining",
-        start_weight_decay=0.1,
-        end_weight_decay=0.1,
-        weight_decay_incr_style="constant",
-        use_checkpoint_opt_param_scheduler=False,
-        override_opt_param_scheduler=False,
-    )
+    args = _bridge_args()
     lr = checkpoint_merge.checkpoint_lr_schedule(args)
     expected = build_air_bridge_schedule(
         high_lr=1e-2,
