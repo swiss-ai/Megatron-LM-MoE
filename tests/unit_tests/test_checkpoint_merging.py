@@ -755,3 +755,89 @@ def test_update_matches_offline_merge(
         update(older)
     with pytest.raises(ValueError, match="Settings differ"):
         update(sources[3], router_state="last" if router_state != "last" else "mean")
+
+
+@pytest.mark.parametrize(
+    "method, kwargs, effective",
+    [
+        ("mean", {}, lambda n: mean_coefficients(n)),
+        ("ema", dict(ema_alpha=0.3), lambda n: ema_coefficients(n, 0.3)),
+        ("wsm", dict(decay_end=0.1), lambda n: wsm_coefficients(n, 0.1)),
+    ],
+)
+def test_update_sphere_merge_matches_offline(
+    initialized_model_parallel, tmp_path_dist_ckpt, method, kwargs, effective
+):
+    # Folding row-sphere checkpoints one at a time with --sphere-merge equals the offline
+    # --sphere-merge of all of them: each running merge keeps its gains and row shrinkage.
+    phi = torch.nn.functional.softplus
+    generator = torch.Generator().manual_seed(0)
+    rank = torch.distributed.get_rank()
+    root = tmp_path_dist_ckpt / f"update_sphere_{method}"
+    args = Namespace(
+        gain_parametrization="softplus",
+        hypersphere_mode="row",
+        hypersphere_router_mode=None,
+        hypersphere_embedding_mode="row",
+    )
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=generator)
+
+    shapes = {"dense": (4, 6), "experts": (2, 3, 4), "embedding.word_embeddings.weight": (5, 6)}
+    shapes["norm"] = (6,)
+    sources = []
+    for iteration in (100, 200, 300, 400):
+        gains = {
+            "row_gain.dense": randn(4),
+            "col_gain.dense": randn(6),
+            "row_gain.experts": randn(2, 4),
+            "col_gain.experts": randn(2, 3),
+        }
+        fused = {
+            "dense": _unit(randn(4, 6))
+            * phi(gains["row_gain.dense"])[:, None]
+            * phi(gains["col_gain.dense"])[None, :],
+            "experts": _unit(randn(2, 3, 4))
+            * phi(gains["row_gain.experts"])[:, None, :]
+            * phi(gains["col_gain.experts"])[:, :, None],
+            "embedding.word_embeddings.weight": 2 * _unit(randn(5, 6)),
+            "norm": randn(6),
+        }
+        source = root / "run" / f"iter_{iteration:07d}"
+        if rank == 0:
+            source.mkdir(parents=True)
+        torch.distributed.barrier()
+        # Rows split over two groups and two chunks each, so row state spans several workers.
+        fragmentation = {"dense": (2, 2), "experts": (2, 1, 1)}
+        state = {
+            key: _chunked(key, tensor, *fragmentation.get(key, [1] * tensor.ndim))
+            for key, tensor in fused.items()
+        }
+        for name, gain in gains.items():
+            key = f"optimizer.state.{name}"
+            state[key] = _chunked(key, gain, *([1] * gain.ndim))
+        state["args"] = args
+        state["iteration"] = iteration
+        dist_checkpointing.save(state, str(source))
+        sources.append(str(source))
+
+    output = root / "merged"
+    for source in sources:
+        checkpoint_merge.update_running_merge(output, [source], method, sphere_merge=True, **kwargs)
+    offline = root / "offline"
+    checkpoint_merge.merge_checkpoint_directories(sources, offline, effective(4), sphere_merge=True)
+
+    def load(checkpoint):
+        templates = {
+            key: ShardedTensor.from_rank_offsets(key, torch.zeros(shape), replica_id=rank)
+            for key, shape in shapes.items()
+        }
+        return dist_checkpointing.load(templates, str(checkpoint))
+
+    running, expected = load(output / "iter_0000400"), load(offline / "release")
+    for key in shapes:
+        torch.testing.assert_close(running[key], expected[key], rtol=1e-5, atol=1e-6, msg=key)
+    # A plain --update cannot continue a sphere running merge.
+    with pytest.raises(ValueError, match="Settings differ"):
+        checkpoint_merge.update_running_merge(output, [sources[-1]], method, **kwargs)

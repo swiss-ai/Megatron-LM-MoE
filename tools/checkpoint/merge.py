@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 from megatron.core.dist_checkpointing.strategies.torch import _get_filesystem_reader
 
@@ -41,6 +41,9 @@ _TRACKER = "latest_checkpointed_iteration.txt"
 _WSM_RUNNING_MEAN_DIR = "wsm_running_mean"
 # MDDecoupling keeps its learnable gains in the optimizer state; see --sphere-merge.
 _GAIN_STATE = "optimizer.state."
+# A --sphere-merge running merge also saves how much each row of its bare direction shrank, so
+# the next --update can undo the rescaling.
+_SHRINK_STATE = "optimizer.state.sphere_shrink."
 # Axes of a weight chunk that each gain covers. 2D weights are [out, in]; merged experts are
 # saved as [experts, in, out], with row gains [experts, out] and column gains [experts, in].
 _GAIN_AXES = {("row", 2): (0,), ("col", 2): (1,), ("row", 3): (0, 2), ("col", 3): (0, 1)}
@@ -307,6 +310,22 @@ def _gain_function(checkpoint_args):
     raise ValueError(
         f"--sphere-merge needs args.gain_parametrization in the checkpoint, got {mode!r}"
     )
+
+
+def _gain_inverse(checkpoint_args):
+    """Return the inverse of :func:`_gain_function`."""
+    if checkpoint_args.gain_parametrization == "softplus":
+        return lambda value: value + torch.log(-torch.expm1(-value))  # stable for value > 0
+    return lambda value: value
+
+
+def _row_tensor(key, data, chunk_meta):
+    """Shard ``data``, one value per row of the row group of ``chunk_meta``, like a row gain."""
+    axes = _GAIN_AXES[("row", len(chunk_meta.global_offset))]
+    offsets = chunk_meta.global_offset
+    sizes, shape = chunk_meta.local_shape, chunk_meta.global_shape
+    rank_offsets = [(i, offsets[a] // sizes[a], shape[a] // sizes[a]) for i, a in enumerate(axes)]
+    return ShardedTensor.from_rank_offsets(key, data.contiguous(), *rank_offsets, replica_id=0)
 
 
 def _gain_slice(gain, kind, offsets, sizes):
@@ -630,6 +649,7 @@ def _validate_source_metadata(source, canonical_tensors):
                 f"Global shape mismatch for {key!r} in {source}: "
                 f"{actual.global_shape} != {expected.global_shape}"
             )
+    return source_tensors
 
 
 def _load_assigned(source, templates):
@@ -685,8 +705,9 @@ def merge_checkpoint_directories(
     gains in the optimizer state. Averaging these weights directly shortens ``bare`` wherever
     the checkpoints point in different directions. With ``sphere_merge``, every matrix on a
     sphere is split into ``bare`` and its effective gains ``phi(g)``. These are averaged
-    separately, every sphere slice of the averaged ``bare`` is scaled back to its average source
-    length, and the gains are applied again; a matrix without gains, such as the embedding, is
+    separately, every sphere slice of the averaged ``bare`` is scaled back to its source length
+    (the last checkpoint's; all are on the same sphere), and the gains are applied again; a
+    matrix without gains, such as the embedding, is
     only scaled back. A slice is a row in row mode, and in flat mode the whole matrix or each
     piece MDDecoupling normalizes on its own (an expert, a GLU half, Q, K or V). All other
     tensors are averaged directly. Which matrices are on a sphere, and in which mode, comes from
@@ -746,11 +767,17 @@ def _merge(
     save_fp32,
     sphere_merge=False,
     tensor_coefficients=None,
+    keep_sphere_state=False,
 ):
     """Write ``sum(coefficients[i] * sources[i])`` as a new checkpoint at ``checkpoint_dir``.
 
     With ``sphere_merge``, matrices on a sphere are merged as described in
     ``merge_checkpoint_directories``. A tensor in ``tensor_coefficients`` uses its own weights.
+
+    ``keep_sphere_state`` (for ``--update``) also saves the merged gains and how much each row
+    of the merged bare direction shrank before it was scaled back. Read as a source, such a
+    checkpoint gives back the unscaled merged bare direction and the merged gains, so folding
+    one more checkpoint into it equals merging them all at once.
     """
     tensor_coefficients = tensor_coefficients or {}
     checks = [("Checkpoint", coefficients), ("Router state", router_coefficients)]
@@ -813,6 +840,8 @@ def _merge(
                     f"expected {expected} for {key!r} {shape}"
                 )
         sphere_tensors[key] = (mode, gain_keys)
+    if keep_sphere_state and any(mode != "row" for mode, _ in sphere_tensors.values()):
+        raise ValueError("--sphere-merge with --update supports row spheres only")
     phi = None
     if any(key for _, keys in sphere_tensors.values() for key in keys):
         phi = _gain_function(checkpoint_args)
@@ -844,16 +873,19 @@ def _merge(
     accumulators = {}
     static_tensors = {}
     gain_sums = {}  # merged effective gains phi(g), per gain key
-    norm_sums = {}  # merged source lengths of the sphere slices of bare, per group
+    targets = {}  # slice lengths of the last source, a training checkpoint, per group
     for source_index, source in enumerate(map(str, sources)):
-        _validate_source_metadata(source, tensor_metadata)
+        source_tensors = _validate_source_metadata(source, tensor_metadata)
         loaded = _load_assigned(source, assigned_tensors)
         if sphere_merge:
-            # Every rank joins this collective load, including ranks with no gains to load.
+            # Every rank joins these collective loads, including ranks with nothing to load.
             gains = {
                 key: phi(value)
                 for key, value in _load_whole(source, gain_keys_to_load, all_metadata).items()
             }
+            shrink_keys = [f"{_SHRINK_STATE}{group[0]}" for group in sphere_groups]
+            shrink_keys = sorted({key for key in shrink_keys if key in source_tensors})
+            shrinks = _load_whole(source, shrink_keys, source_tensors)
             for key, gain in gains.items():
                 coefficient = weights_of(key)[source_index]
                 if source_index == 0:
@@ -869,22 +901,24 @@ def _merge(
                     # A zero gain leaves a zero weight; dividing it by inf keeps bare at zero.
                     divisor = scale.masked_fill(scale == 0, float("inf"))
                     bare[key] = loaded.pop(key).float() / divisor
-                norms = _slice_norms(
-                    mode,
-                    group[0],
-                    list(bare.values()),
-                    [chunk_metadata[key] for key in keys],
-                    checkpoint_args,
-                )
+                    shrink = shrinks.get(f"{_SHRINK_STATE}{group[0]}")
+                    if shrink is not None:  # a running merge: undo its rescaling
+                        meta = chunk_metadata[key]
+                        bare[key].mul_(
+                            _gain_slice(shrink, "row", meta.global_offset, meta.local_shape)
+                        )
+                if source_index == len(sources) - 1:
+                    # Every training checkpoint is on the same sphere; the last one is never a
+                    # running merge, so its slice lengths are the target.
+                    metas = [chunk_metadata[key] for key in keys]
+                    targets[group] = _slice_norms(
+                        mode, group[0], list(bare.values()), metas, checkpoint_args
+                    )
                 for key in keys:
                     if source_index == 0:
                         accumulators[key] = bare[key].mul_(coefficient)
                     else:
                         accumulators[key].add_(bare[key], alpha=coefficient)
-                if source_index == 0:
-                    norm_sums[group] = norms * coefficient
-                else:
-                    norm_sums[group].add_(norms, alpha=coefficient)
                 del bare
         for key, tensor in loaded.items():
             if tensor.is_floating_point():
@@ -904,18 +938,32 @@ def _merge(
         if rank == 0:
             print(f"> accumulated checkpoint {source_index + 1}/{len(sources)}: {source}")
 
-    # Scale each sphere slice of the merged bare direction back to its merged source length, as
+    # Scale each sphere slice of the merged bare direction back to its source length, as
     # MDDecoupling projects it, then apply the merged gains again.
+    sphere_state = {}
     for group, (mode, gain_keys) in sphere_groups.items():
         keys = groups[group]
         parts = [accumulators[key] for key in keys]
         metas = [chunk_metadata[key] for key in keys]
         current = _slice_norms(mode, group[0], parts, metas, checkpoint_args)
-        target = norm_sums.pop(group)
+        target = targets.pop(group)
         factors = torch.where(current > 0, target / current, torch.zeros_like(current))
         _rescale_slices(mode, group[0], parts, metas, factors, checkpoint_args)
         for key, meta in zip(keys, metas):
             accumulators[key].mul_(_gain_scale(meta, gain_sums, gain_keys))
+        if keep_sphere_state:
+            shrink = torch.where(factors > 0, 1 / factors, torch.zeros_like(factors))
+            key = f"{_SHRINK_STATE}{group[0]}"
+            sphere_state[(key, group[1])] = _row_tensor(key, shrink, metas[0])
+    if keep_sphere_state:
+        # Several ranks hold the same merged gain; the lowest of them saves it, whole.
+        held = [None] * world_size
+        dist.all_gather_object(held, sorted(gain_sums))
+        inverse = _gain_inverse(checkpoint_args) if gain_sums else None
+        for key in gain_sums:
+            if rank == min(owner for owner, keys in enumerate(held) if key in keys):
+                gain = inverse(gain_sums[key])
+                sphere_state[key] = ShardedTensor.from_rank_offsets(key, gain, replica_id=0)
     if sphere_merge:
         _report_sphere_merge(sphere_groups)
 
@@ -935,7 +983,7 @@ def _merge(
 
     state_dict = common_state
     state_dict["checkpoint_merge_metadata"] = copy.deepcopy(metadata)
-    for key, value in {**output_tensors, **output_objects}.items():
+    for key, value in {**output_tensors, **output_objects, **sphere_state}.items():
         if key in state_dict:
             raise KeyError(f"Sharded model key collides with common state: {key!r}")
         state_dict[key] = value
@@ -970,6 +1018,7 @@ def update_running_merge(
     ema_bias_correction=False,
     decay_end=1e-4,
     router_state="mean",
+    sphere_merge=False,
 ):
     """Fold ``sources`` (``iter_*`` directories, oldest first) into the running merge at ``output``.
 
@@ -982,6 +1031,9 @@ def update_running_merge(
     mean, ema (with or without bias correction) and wsm are supported. wsm uses a window that grows
     from the first folded checkpoint; it keeps the running mean in ``output/wsm_running_mean``
     and exports ``(1 - e)(N - 1)/N * mean(M_1..M_{N-1}) + (1 - (1 - e)(N - 1)/N) * M_N``.
+
+    With ``sphere_merge`` (row spheres only), each merge also keeps its merged gains and the
+    shrinkage of every row (see ``_merge``), so the running merge equals the offline one.
     """
     if method not in ("mean", "ema", "wsm"):
         raise ValueError(f"Unknown merge method: {method!r}")
@@ -991,6 +1043,7 @@ def update_running_merge(
         "ema_bias_correction": bool(ema_bias_correction) if method == "ema" else False,
         "decay_end": decay_end if method == "wsm" else None,
         "router_state": router_state,
+        "sphere_merge": bool(sphere_merge),
     }
     if method == "ema" and ema_alpha is None:
         raise ValueError("EMA needs an alpha")
@@ -1018,7 +1071,8 @@ def _fold_checkpoint(output, source, iteration, settings):
         state = common.get("checkpoint_merge_metadata", {})
         if not state.get("update"):
             raise ValueError(f"{output} holds a checkpoint that was not created by --update")
-        stored = {key: state.get(key) for key in settings}
+        # Running merges from before --sphere-merge support have no sphere_merge setting.
+        stored = {key: state.get(key, False if key == "sphere_merge" else None) for key in settings}
         if stored != settings:
             raise ValueError(
                 f"Settings differ from the running merge at {output}: stored {stored}, "
@@ -1084,7 +1138,17 @@ def _fold_checkpoint(output, source, iteration, settings):
         if rank == 0 and target.exists():
             shutil.rmtree(target)  # left by an interrupted update; the tracker never named it
         dist.barrier()
-        _merge(inputs, target, coefficients, router_coefficients, metadata, save_fp32=True)
+        sphere = settings["sphere_merge"]
+        _merge(
+            inputs,
+            target,
+            coefficients,
+            router_coefficients,
+            metadata,
+            save_fp32=True,
+            sphere_merge=sphere,
+            keep_sphere_state=sphere,
+        )
 
     if rank == 0:
         temporary = output / (_TRACKER + ".tmp")
@@ -1177,10 +1241,11 @@ def main():
         action="store_true",
         help=(
             "For MDDecoupling (hypersphere) checkpoints: average each sphere matrix's direction "
-            "and its effective gains separately, scale the direction back to its average source "
+            "and its effective gains separately, scale the direction back to its source "
             "length as MDDecoupling projects it (per row, or per flat piece), then apply the "
             "gains again. The sphere modes come from the checkpoint args; row and flat are "
-            "supported. Other tensors are averaged directly. Not supported with --update."
+            "supported (row only with --update, whose merges then also keep the merged gains "
+            "and row shrinkage). Other tensors are averaged directly."
         ),
     )
     parser.add_argument(
@@ -1254,9 +1319,6 @@ def main():
         parser.error("--source-decay-* cannot be used with --update")
     if args.update and not args.save_fp32:
         parser.error("--update always saves fp32; --no-save-fp32 is not supported with it")
-    if args.update and args.sphere_merge:
-        parser.error("--sphere-merge is not supported with --update")
-
     initialized_here = _initialize_distributed(args.backend)
     try:
         if args.update:
@@ -1268,6 +1330,7 @@ def main():
                 ema_bias_correction=args.ema_bias_correction,
                 decay_end=args.decay_end,
                 router_state=args.router_state,
+                sphere_merge=args.sphere_merge,
             )
             return
         sources = resolve_sources(args.checkpoints, args.iterations)
