@@ -147,6 +147,7 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
             "coefficients": coefficients or [0.5, 0.5],
             "router_state": router_state,
             "save_fp32": True,
+            "sphere_merge": False,
         }
 
 
@@ -206,6 +207,267 @@ def test_merge_keeps_source_chunks(initialized_model_parallel, tmp_path_dist_ckp
     torch.testing.assert_close(loaded["dense"], base * 2.0)
 
 
+def _unit(tensor):
+    # Rows on the unit sphere: every slice along the input axis 1 has length 1.
+    return tensor / tensor.norm(dim=1, keepdim=True)
+
+
+def test_sphere_merge(initialized_model_parallel, tmp_path_dist_ckpt):
+    # MDDecoupling saves W = bare * phi(row)[:, None] * phi(col)[None, :] with unit rows of bare;
+    # merged experts are [experts, in, out] with row gains [experts, out], col gains [experts, in].
+    phi = torch.nn.functional.softplus
+    generator = torch.Generator().manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=generator)
+
+    rank = torch.distributed.get_rank()
+    coefficients = [0.25, 0.75]
+    root = tmp_path_dist_ckpt / "sphere"
+    sources, values = [], []
+    for iteration in (100, 200):
+        v = {
+            "dense": _unit(randn(4, 6)),
+            "dense.row": randn(4),
+            "dense.col": randn(6),
+            "experts": _unit(randn(2, 3, 4)),
+            "experts.row": randn(2, 4),
+            "experts.col": randn(2, 3),
+            # A piece of a split weight: its own row gain, the column gain of the whole weight.
+            "qkv.weight.query": _unit(randn(4, 6)),
+            "qkv.weight.query.row": randn(4),
+            "qkv.weight.col": randn(6),
+            # No gains, rows of length 2: the merged rows go back to the source length.
+            "embedding": 2 * _unit(randn(5, 6)),
+            "norm": randn(6),
+        }
+        values.append(v)
+        fused = {
+            "dense": v["dense"] * phi(v["dense.row"])[:, None] * phi(v["dense.col"])[None, :],
+            "experts": v["experts"]
+            * phi(v["experts.row"])[:, None, :]
+            * phi(v["experts.col"])[:, :, None],
+            "qkv.weight.query": v["qkv.weight.query"]
+            * phi(v["qkv.weight.query.row"])[:, None]
+            * phi(v["qkv.weight.col"])[None, :],
+            "embedding": v["embedding"],
+            "norm": v["norm"],
+        }
+        gains = {
+            "row_gain.dense": v["dense.row"],
+            "col_gain.dense": v["dense.col"],
+            "row_gain.experts": v["experts.row"],
+            "col_gain.experts": v["experts.col"],
+            "row_gain.qkv.weight.query": v["qkv.weight.query.row"],
+            "col_gain.qkv.weight": v["qkv.weight.col"],
+        }
+        source = root / f"iter_{iteration:07d}"
+        if rank == 0:
+            source.mkdir(parents=True)
+        torch.distributed.barrier()
+        state = {key: _chunked(key, tensor, *([1] * tensor.ndim)) for key, tensor in fused.items()}
+        # The dense rows span two chunks on the input axis, as with row-parallel TP.
+        state["dense"] = _chunked("dense", fused["dense"], 1, 2)
+        state["experts"] = _chunked("experts", fused["experts"], 2, 1, 1)
+        for name, gain in gains.items():
+            key = f"optimizer.state.{name}"
+            state[key] = _chunked(key, gain, *([1] * gain.ndim))
+        state["args"] = Namespace(
+            gain_parametrization="softplus",
+            hypersphere_mode="row",
+            hypersphere_router_mode=None,
+            hypersphere_embedding_mode="row",
+        )
+        state["iteration"] = iteration
+        dist_checkpointing.save(state, str(source))
+        sources.append(str(source))
+
+    output = root / "merged"
+    checkpoint_merge.merge_checkpoint_directories(
+        sources, output, coefficients, merge_metadata={"method": "wsm"}, sphere_merge=True
+    )
+    release = str(output / "release")
+    assert _stored_chunks(release, "dense") == _stored_chunks(sources[-1], "dense")
+    assert dist_checkpointing.load_common_state_dict(release)["checkpoint_merge_metadata"][
+        "sphere_merge"
+    ]
+
+    def mean(name, fn=lambda x: x):
+        return sum(c * fn(v[name]) for c, v in zip(coefficients, values))
+
+    # Rows are scaled back to their source length: 1 for the matrices with gains, 2 for the
+    # embedding.
+    expected = {
+        "dense": _unit(mean("dense"))
+        * mean("dense.row", phi)[:, None]
+        * mean("dense.col", phi)[None, :],
+        "experts": _unit(mean("experts"))
+        * mean("experts.row", phi)[:, None, :]
+        * mean("experts.col", phi)[:, :, None],
+        "qkv.weight.query": _unit(mean("qkv.weight.query"))
+        * mean("qkv.weight.query.row", phi)[:, None]
+        * mean("qkv.weight.col", phi)[None, :],
+        "embedding": 2 * _unit(mean("embedding")),
+        "norm": mean("norm"),
+    }
+    templates = {
+        key: ShardedTensor.from_rank_offsets(key, torch.zeros_like(value), replica_id=rank)
+        for key, value in expected.items()
+    }
+    loaded = dist_checkpointing.load(templates, release)
+    for key, value in expected.items():
+        torch.testing.assert_close(loaded[key], value, rtol=1e-5, atol=1e-6, msg=key)
+
+
+def test_sphere_merge_flat(initialized_model_parallel, tmp_path_dist_ckpt):
+    # In flat mode MDDecoupling normalizes each piece on its own: Q, K and V of every query group
+    # together, each GLU half, each expert (and each GLU half of an expert).
+    phi = torch.nn.functional.softplus
+    generator = torch.Generator().manual_seed(0)
+    rank = torch.distributed.get_rank()
+    radius = 2.0
+    prefix = "decoder.layers.0."
+    # 2 query groups of [Q (2 heads x 2 channels), K (2), V (2)] rows.
+    qkv_rows = [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 12, 13], [6, 7, 14, 15]]
+    layout = {
+        # key: (shape, pieces as indices, chunk fragmentation)
+        "self_attention.linear_qkv.weight": (
+            (16, 6),
+            [(torch.tensor(rows),) for rows in qkv_rows],
+            (1, 1),
+        ),
+        # GLU halves of 3 rows, stored in chunks of 2 rows that do not line up with them.
+        "mlp.linear_fc1.weight": ((6, 6), [(slice(0, 3),), (slice(3, 6),)], (3, 2)),
+        "mlp.linear_fc2.weight": ((6, 3), [(slice(None),)], (1, 1)),
+        # Merged experts [experts, in, out]: GLU halves of each expert's output.
+        "mlp.experts.experts.weight1": (
+            (2, 3, 4),
+            [(e, slice(None), half) for e in range(2) for half in (slice(0, 2), slice(2, 4))],
+            (2, 1, 1),
+        ),
+        "mlp.experts.experts.weight2": ((2, 2, 3), [(e,) for e in range(2)], (2, 1, 1)),
+    }
+    args = Namespace(
+        gain_parametrization="softplus",
+        hypersphere_mode="flat",
+        hypersphere_router_mode=None,
+        hypersphere_embedding_mode=None,  # the embedding is not on a sphere: averaged directly
+        muon_split_qkv=True,
+        muon_split_fc1=True,
+        num_attention_heads=4,
+        num_query_groups=2,
+        group_query_attention=True,
+        kv_channels=2,
+        hidden_size=6,
+        attention_output_gate=False,
+        ffn_hidden_size=3,
+        moe_ffn_hidden_size=2,
+    )
+
+    def gain_shapes(shape):
+        return ((shape[0],), (shape[1],)) if len(shape) == 2 else ((shape[0], shape[2]), shape[:2])
+
+    def apply(bare, row, col):
+        if bare.ndim == 2:
+            return bare * phi(row)[:, None] * phi(col)[None, :]
+        return bare * phi(row)[:, None, :] * phi(col)[:, :, None]
+
+    def on_pieces(tensor, pieces):
+        tensor = tensor.clone()
+        for piece in pieces:
+            tensor[piece] = tensor[piece] * (radius / tensor[piece].norm())
+        return tensor
+
+    coefficients = [0.25, 0.75]
+    sources, values = [], []
+    for iteration in (100, 200):
+        v = {}
+        state = {"args": args, "iteration": iteration}
+        for name, (shape, pieces, fragmentation) in layout.items():
+            key = prefix + name
+            bare = on_pieces(torch.randn(*shape, generator=generator), pieces)
+            row_shape, col_shape = gain_shapes(shape)
+            row = torch.randn(*row_shape, generator=generator)
+            col = torch.randn(*col_shape, generator=generator)
+            v[key] = (bare, row, col)
+            state[key] = _chunked(key, apply(bare, row, col), *fragmentation)
+            for kind, gain in (("row", row), ("col", col)):
+                gain_key = f"optimizer.state.{kind}_gain.{key}"
+                state[gain_key] = _chunked(gain_key, gain, *([1] * gain.ndim))
+        embedding = torch.randn(5, 6, generator=generator)
+        v["embedding.word_embeddings.weight"] = embedding
+        state["embedding.word_embeddings.weight"] = _chunked(
+            "embedding.word_embeddings.weight", embedding, 1, 1
+        )
+        values.append(v)
+        source = tmp_path_dist_ckpt / "sphere_flat" / f"iter_{iteration:07d}"
+        if rank == 0:
+            source.mkdir(parents=True)
+        torch.distributed.barrier()
+        dist_checkpointing.save(state, str(source))
+        sources.append(str(source))
+
+    output = tmp_path_dist_ckpt / "sphere_flat" / "merged"
+    checkpoint_merge.merge_checkpoint_directories(sources, output, coefficients, sphere_merge=True)
+    release = str(output / "release")
+    key = prefix + "mlp.linear_fc1.weight"
+    assert _stored_chunks(release, key) == _stored_chunks(sources[-1], key)
+
+    expected = {
+        "embedding.word_embeddings.weight": sum(
+            c * v["embedding.word_embeddings.weight"] for c, v in zip(coefficients, values)
+        )
+    }
+    for name, (_, pieces, _) in layout.items():
+        key = prefix + name
+        bare = on_pieces(sum(c * v[key][0] for c, v in zip(coefficients, values)), pieces)
+        row = sum(c * phi(v[key][1]) for c, v in zip(coefficients, values))
+        col = sum(c * phi(v[key][2]) for c, v in zip(coefficients, values))
+        # The gains are merged after phi, so apply them without phi again.
+        if bare.ndim == 2:
+            expected[key] = bare * row[:, None] * col[None, :]
+        else:
+            expected[key] = bare * row[:, None, :] * col[:, :, None]
+    templates = {
+        key: ShardedTensor.from_rank_offsets(key, torch.zeros_like(value), replica_id=rank)
+        for key, value in expected.items()
+    }
+    loaded = dist_checkpointing.load(templates, release)
+    for key, value in expected.items():
+        torch.testing.assert_close(loaded[key], value, rtol=1e-5, atol=1e-6, msg=key)
+
+
+@pytest.mark.parametrize(
+    "key, modes, expected",
+    [
+        ("decoder.layers.0.mlp.linear_fc1.weight", dict(hypersphere_mode="row"), "row"),
+        ("decoder.layers.0.mlp.linear_fc1.weight", dict(hypersphere_mode="none"), None),
+        # The router and the embedding/output layer have their own modes, as in MDDecoupling.
+        (
+            "decoder.layers.0.mlp.router.weight",
+            dict(hypersphere_mode="none", hypersphere_router_mode="row"),
+            "row",
+        ),
+        (
+            "embedding.word_embeddings.weight",
+            dict(hypersphere_mode="row", hypersphere_embedding_mode="external"),
+            None,
+        ),
+        ("output_layer.weight", dict(hypersphere_mode="row"), None),
+        ("decoder.layers.0.mlp.linear_fc1.weight", dict(hypersphere_mode="flat"), "flat"),
+        ("decoder.layers.0.mlp.linear_fc1.weight", dict(hypersphere_mode="col"), ValueError),
+        ("embedding.word_embeddings.weight", dict(hypersphere_embedding_mode="embed"), ValueError),
+    ],
+)
+def test_sphere_mode(key, modes, expected):
+    args = Namespace(**{"hypersphere_mode": None, **modes})
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="row and flat spheres only"):
+            checkpoint_merge._sphere_mode(key, args)
+    else:
+        assert checkpoint_merge._sphere_mode(key, args) == expected
+
+
 def test_irregular_source_chunks_stay_one_chunk(monkeypatch):
     chunks = [SimpleNamespace(offsets=(0,), sizes=(3,)), SimpleNamespace(offsets=(3,), sizes=(5,))]
     storage = {"weight": SimpleNamespace(chunks=chunks)}
@@ -249,11 +511,16 @@ def _save_update_source(root, iteration):
     # Values that are not exact sums of each other, stored in bf16 like a training checkpoint.
     weight = (torch.linspace(-1, 1, 8) * (1 + iteration / 1000) + iteration / 7).to(torch.bfloat16)
     source = root / f"iter_{iteration:07d}"
-    source.mkdir(parents=True)
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        source.mkdir(parents=True)
+    torch.distributed.barrier()
     state = {
         # Two chunks, so the running merge must keep the source layout.
         "weight": _chunked("weight", weight, 2),
-        "router.expert_bias": ShardedTensor.from_rank_offsets("router.expert_bias", weight * 2),
+        "router.expert_bias": ShardedTensor.from_rank_offsets(
+            "router.expert_bias", weight * 2, replica_id=rank
+        ),
         "iteration": iteration,
         "args": Namespace(iteration=iteration),
     }
@@ -305,9 +572,12 @@ def test_update_matches_offline_merge(
     router_coefficients = checkpoint_merge._router_coefficients(
         router_state, coefficients, mean_coefficients(4)
     )
-    loaded = dist_checkpointing.load(
-        {key: _full(key, 0.0, size=8) for key in ("weight", "router.expert_bias")}, merged
-    )
+    rank = torch.distributed.get_rank()
+    templates = {
+        key: ShardedTensor.from_rank_offsets(key, torch.zeros(8), replica_id=rank)
+        for key in ("weight", "router.expert_bias")
+    }
+    loaded = dist_checkpointing.load(templates, merged)
     expected = sum(c * w for c, w in zip(coefficients, weights))
     expected_router = sum(c * w * 2 for c, w in zip(router_coefficients, weights))
     # Streaming rounds to fp32 after every update, the offline sum once: allow a few fp32 ulps.
