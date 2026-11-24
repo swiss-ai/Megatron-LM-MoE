@@ -53,6 +53,109 @@ def test_coefficients(coefficients, expected):
     assert coefficients == pytest.approx(expected)
 
 
+def test_wsm_source_schedule_matches_linear_decay():
+    # A per-iteration LR that follows LinearDecay(steps=100, end=0.5, start=0) gives its weights.
+    decay = LinearDecay(steps=100, end=0.5, start=0)
+
+    def lr(step):
+        return 1.0 - 0.5 * min(max(step, 0), 100) / 100
+
+    assert wsm_coefficients(3, 0.5, lr, [20, 40, 60]) == pytest.approx(
+        wsm_coefficients(3, 0.5, decay, [20, 40, 60])
+    )
+
+
+def test_checkpoint_lr_schedule_rebuilds_sqrt_bridge():
+    from megatron.core.optimizer_param_scheduler import build_air_bridge_schedule
+
+    args = Namespace(
+        train_iters=1000,
+        train_samples=None,
+        lr_decay_iters=None,
+        lr_warmup_iters=50,
+        lr_warmup_fraction=None,
+        lr_wsd_decay_iters=None,
+        lr_wsd_decay_style=None,
+        global_batch_size=8,
+        rampup_batch_size=None,
+        lr=1e-2,
+        min_lr=1e-4,
+        lr_warmup_init=0.0,
+        lr_decay_style="sqrt-bridge",
+        lr_bridge_low_factor=0.5,
+        lr_bridge_switch_iters=600,
+        lr_bridge_switch_samples=None,
+        lr_bridge_log_start=None,
+        lr_bridge_rho_ref=None,
+        lr_bridge_budget="remaining",
+        start_weight_decay=0.1,
+        end_weight_decay=0.1,
+        weight_decay_incr_style="constant",
+        use_checkpoint_opt_param_scheduler=False,
+        override_opt_param_scheduler=False,
+    )
+    lr = checkpoint_merge.checkpoint_lr_schedule(args)
+    expected = build_air_bridge_schedule(
+        high_lr=1e-2,
+        low_lr=5e-3,
+        final_lr=1e-4,
+        total_steps=8000,
+        warmup_steps=400,
+        switch_step=4800,
+        budget="remaining",
+    )
+    for iteration in (0, 10, 50, 300, 599, 600, 601, 800, 1000):
+        assert lr(iteration) == pytest.approx(expected(iteration * 8))
+    assert args.lr_decay_iters is None  # the saved args are not modified
+
+    # Sample-based runs save train_iters as training filled it in; the samples settings must win.
+    samples = Namespace(
+        **{
+            **vars(args),
+            "train_iters": 1000,
+            "train_samples": 8000,
+            "lr_decay_samples": 8000,
+            "lr_warmup_iters": 0,
+            "lr_warmup_samples": 400,
+            "lr_wsd_decay_samples": None,
+        }
+    )
+    lr = checkpoint_merge.checkpoint_lr_schedule(samples)
+    for iteration in (0, 10, 50, 300, 600, 800, 1000):
+        assert lr(iteration) == pytest.approx(expected(iteration * 8))
+
+
+@pytest.mark.parametrize(
+    "key, ndim, expected",
+    [
+        ("decoder.layers.0.mlp.router.weight", 2, (2e-3, 1e-4)),
+        ("decoder.layers.0.mlp.experts.experts.weight1", 3, (2.74e-2, 1e-4)),
+        ("decoder.layers.0.self_attention.linear_qkv.weight", 2, (2.74e-2, 1e-4)),
+        ("decoder.layers.0.self_attention.in_proj.weight.query", 2, (2.74e-2, 1e-4)),
+        ("embedding.word_embeddings.weight", 2, (5.5e-3, 1e-4)),
+        ("output_layer.weight", 2, (5.5e-3, 1e-4)),
+        ("decoder.layers.0.self_attention.conv1d.weight", 3, (5.5e-3, 1e-4)),
+        ("decoder.final_layernorm.weight", 1, (5.5e-3, 1e-4)),
+    ],
+)
+def test_lr_group(key, ndim, expected):
+    # The megachonk routing: --matrix-lr, --router-lr and --lr, all floored at --min-lr.
+    args = Namespace(
+        lr=5.5e-3,
+        min_lr=1e-4,
+        min_lr_mode="absolute",
+        matrix_lr=2.74e-2,
+        router_lr=2e-3,
+        use_orthogonal_updates=True,
+        md_router_use_orthogonal_updates=None,
+    )
+    assert checkpoint_merge._lr_group(key, ndim, args) == pytest.approx(expected)
+    # With relative min LRs every group decays by the same fraction.
+    relative = Namespace(**{**vars(args), "min_lr_mode": "relative"})
+    max_lr, min_lr = checkpoint_merge._lr_group(key, ndim, relative)
+    assert min_lr == pytest.approx(max_lr * 1e-4 / 5.5e-3)
+
+
 def test_ema_rejects_invalid_alpha():
     with pytest.raises(ValueError, match="EMA alpha"):
         ema_coefficients(3, alpha=0.0)
@@ -110,20 +213,22 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
 
     # By default the router balancing state gets a plain mean (3.0), whatever the coefficients;
     # with router_state="method" it follows the coefficients like the weight, and with "last" it is
-    # copied from the last checkpoint (5.0).
-    for method, coefficients, router_state, expected_weight, expected_router in (
-        ("mean", None, "mean", 3.0, 3.0),
-        ("wsm", [0.75, 0.25], "mean", 2.0, 3.0),
-        ("wsm", [0.75, 0.25], "method", 2.0, 2.0),
-        ("wsm", [0.75, 0.25], "last", 2.0, 5.0),
+    # copied from the last checkpoint (5.0). A tensor with its own weights (its LR group) uses them.
+    for name, method, coefficients, router_state, own, expected_weight, expected_router in (
+        ("mean", "mean", None, "mean", None, 3.0, 3.0),
+        ("wsm_mean", "wsm", [0.75, 0.25], "mean", None, 2.0, 3.0),
+        ("wsm_method", "wsm", [0.75, 0.25], "method", None, 2.0, 2.0),
+        ("wsm_last", "wsm", [0.75, 0.25], "last", None, 2.0, 5.0),
+        ("wsm_group", "wsm", [0.75, 0.25], "method", {"weight": [0.25, 0.75]}, 4.0, 2.0),
     ):
-        release = tmp_path_dist_ckpt / f"{method}_{router_state}" / "release"
+        release = tmp_path_dist_ckpt / name / "release"
         checkpoint_merge.merge_checkpoint_directories(
             sources,
             release.parent,
             coefficients,
             merge_metadata={"method": method},
             router_state=router_state,
+            tensor_coefficients=own,
         )
 
         loaded = dist_checkpointing.load({key: _full(key, 0.0) for key in model_keys}, str(release))

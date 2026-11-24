@@ -398,6 +398,100 @@ class LinearDecay:
     start: int | None = None
 
 
+def checkpoint_lr_schedule(checkpoint_args):
+    """Return ``lr(iteration, group=None)``, the LR of the update that starts at ``iteration``.
+
+    The schedule is rebuilt from the saved training ``args`` with Megatron's own scheduler, so
+    every ``--lr-decay-style`` is supported (for example ``sqrt-bridge``). ``group`` holds the
+    ``max_lr`` and ``min_lr`` of a param group (default: ``args.lr`` and ``args.min_lr``). The
+    scheduler steps after ``optimizer.step()``, so the update from ``iteration`` to
+    ``iteration + 1`` uses the LR at ``iteration * global_batch_size`` samples.
+    """
+    from types import SimpleNamespace
+
+    from megatron.training import global_vars
+    from megatron.training.training import get_optimizer_param_scheduler
+
+    args = copy.deepcopy(checkpoint_args)
+    if getattr(args, "train_samples", None):
+        # Sample-based training fills in train_iters only after it builds the scheduler. Clear it,
+        # or the scheduler is rebuilt from the iteration settings (lr_warmup_iters, not samples).
+        args.train_iters = None
+    if getattr(args, "rampup_batch_size", None) is not None:
+        raise ValueError("--source-decay-from-args does not support --rampup-batch-size")
+    previous = global_vars._GLOBAL_ARGS
+    global_vars.set_args(args)
+    try:
+        scheduler = get_optimizer_param_scheduler(SimpleNamespace(param_groups=[{}]))
+    finally:
+        global_vars.set_args(previous)
+
+    def lr(iteration, group=None):
+        scheduler.num_steps = iteration * args.global_batch_size
+        return scheduler.get_lr(group or {})
+
+    return lr
+
+
+def _lr_group(key, ndim, checkpoint_args):
+    """The param group ``(max_lr, min_lr)`` of a tensor, as MDDecoupling routes it.
+
+    As in ``_mddecoupling_config_overrides``: the router takes ``--router-lr`` (``--lr`` for an
+    Adam router without it), other matrices and merged experts ``--matrix-lr``, and everything
+    else, the embedding and output layer included, ``--lr``.
+    """
+    from megatron.core.optimizer.md_decoupling import _group_min_lr
+
+    args = checkpoint_args
+    if getattr(args, "embedding_lr_multiplier", None) or getattr(args, "output_lr", None):
+        raise ValueError("--source-decay-from-args does not support embedding or output LRs")
+    router_lr, router_branch = getattr(args, "router_lr", None), getattr(
+        args, "md_router_use_orthogonal_updates", None
+    )
+    router_adam = router_branch is False or (
+        router_branch is None and not getattr(args, "use_orthogonal_updates", False)
+    )
+    max_lr = args.lr
+    if key.endswith(("embedding.word_embeddings.weight", "output_layer.weight")):
+        pass
+    elif key.endswith("mlp.router.weight") and (router_lr is not None or router_adam):
+        max_lr = router_lr or args.lr
+    elif ndim == 2 or (ndim == 3 and ".experts.experts.weight" in key):
+        max_lr = getattr(args, "matrix_lr", None) or getattr(args, "muon_lr_factor", 1.0) * args.lr
+    return max_lr, _group_min_lr(args, max_lr)
+
+
+def wsm_group_coefficients(sources, iterations, decay_end):
+    """WSM weights per LR group, with the run's own schedule divided out of each group.
+
+    Returns the weights of the ``--lr`` group, and a map from every tensor key to the weights of
+    its group (:func:`_lr_group`). Gains take the group of the matrix they scale.
+    """
+    args = dist_checkpointing.load_common_state_dict(str(sources[-1]))["args"]
+    lr = checkpoint_lr_schedule(args)
+    groups = {}
+    for key, meta in dist_checkpointing.load_tensors_metadata(str(sources[-1])).items():
+        if key.startswith((f"{_GAIN_STATE}row_gain.", f"{_GAIN_STATE}col_gain.")):
+            groups[key] = _lr_group(key.split(".", 3)[3], 2, args)
+        elif not _is_training_key(key):
+            groups[key] = _lr_group(key, len(meta.global_shape), args)
+    weights = {
+        group: wsm_coefficients(
+            len(sources),
+            decay_end,
+            lambda step, group=group: lr(step, {"max_lr": group[0], "min_lr": group[1]}),
+            iterations,
+        )
+        for group in set(groups.values())
+    }
+    info = {
+        "from_args": args.lr_decay_style,
+        "groups": {f"max_lr={g[0]:g} min_lr={g[1]:g}": w for g, w in weights.items()},
+    }
+    default = wsm_coefficients(len(sources), decay_end, lr, iterations)
+    return default, {key: weights[group] for key, group in groups.items()}, info
+
+
 def _check_count(num_checkpoints):
     if num_checkpoints < 1:
         raise ValueError("Checkpoint merging requires at least one checkpoint")
@@ -439,7 +533,8 @@ def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterati
     Each checkpoint is the endpoint of one coarse update. A synthetic checkpoint one interval
     before the first gets weight zero, so it is never loaded. If the checkpoints were already
     produced under ``source_decay``, that decay is divided out first; this needs the
-    checkpoint ``iterations``.
+    checkpoint ``iterations``. ``source_decay`` is a :class:`LinearDecay`, or ``lr(iteration)``
+    from :func:`checkpoint_lr_schedule`; each interval then uses the mean LR of its updates.
     """
     _check_count(num_checkpoints)
     desired = _linear_multipliers(
@@ -458,14 +553,25 @@ def wsm_coefficients(num_checkpoints, decay_end=1e-4, source_decay=None, iterati
             raise ValueError("Provide exactly one iteration per checkpoint")
         if any(left >= right for left, right in zip(iterations, iterations[1:])):
             raise ValueError("Checkpoint iterations must be strictly increasing")
-        if source_decay.steps <= 0:
-            raise ValueError("Source decay steps must be positive")
         synthetic_step = iterations[0] - (iterations[1] - iterations[0])
-        decay_start = synthetic_step if source_decay.start is None else source_decay.start
-        original = [
-            _linear_interval_mean(left, right, decay_start, source_decay.steps, source_decay.end)
-            for left, right in zip([synthetic_step, *iterations[:-1]], iterations)
-        ]
+        intervals = list(zip([synthetic_step, *iterations[:-1]], iterations))
+        if callable(source_decay):
+            if synthetic_step < 0:
+                raise ValueError("The first checkpoint interval starts before iteration 0")
+            original = [
+                sum(map(source_decay, range(left, right))) / (right - left)
+                for left, right in intervals
+            ]
+        else:
+            if source_decay.steps <= 0:
+                raise ValueError("Source decay steps must be positive")
+            decay_start = synthetic_step if source_decay.start is None else source_decay.start
+            original = [
+                _linear_interval_mean(
+                    left, right, decay_start, source_decay.steps, source_decay.end
+                )
+                for left, right in intervals
+            ]
         if any(multiplier == 0 for multiplier in original):
             raise ValueError("Cannot cancel a source decay whose multiplier reaches zero")
         original = [multiplier / original[0] for multiplier in original]
@@ -520,8 +626,13 @@ def merge_checkpoint_directories(
     router_state="mean",
     save_fp32=True,
     sphere_merge=False,
+    tensor_coefficients=None,
 ):
     """Combine model tensors into ``output/release``, using every distributed rank as a worker.
+
+    ``tensor_coefficients`` maps a tensor key (a model tensor, or a gain with ``sphere_merge``)
+    to its own weights, for example those of its LR group (:func:`wsm_group_coefficients`);
+    every other tensor uses ``coefficients``.
 
     ``router_state`` selects how the router balancing state (``expert_bias``, ``qb_beta``) is
     merged: "mean" averages it uniformly, "method" uses ``coefficients`` like every other
@@ -571,6 +682,7 @@ def merge_checkpoint_directories(
         metadata,
         save_fp32,
         sphere_merge=sphere_merge,
+        tensor_coefficients=tensor_coefficients,
     )
     if dist.get_rank() == 0:
         (output / _TRACKER).write_text("release")
@@ -596,17 +708,24 @@ def _merge(
     metadata,
     save_fp32,
     sphere_merge=False,
+    tensor_coefficients=None,
 ):
     """Write ``sum(coefficients[i] * sources[i])`` as a new checkpoint at ``checkpoint_dir``.
 
     With ``sphere_merge``, matrices on a sphere are merged as described in
-    ``merge_checkpoint_directories``.
+    ``merge_checkpoint_directories``. A tensor in ``tensor_coefficients`` uses its own weights.
     """
-    if not len(sources) == len(coefficients) == len(router_coefficients):
-        raise ValueError("Provide exactly one coefficient per checkpoint")
-    for name, values in (("Checkpoint", coefficients), ("Router state", router_coefficients)):
+    tensor_coefficients = tensor_coefficients or {}
+    checks = [("Checkpoint", coefficients), ("Router state", router_coefficients)]
+    checks += [(f"{key!r}", values) for key, values in tensor_coefficients.items()]
+    for name, values in checks:
+        if len(values) != len(sources):
+            raise ValueError(f"{name}: provide exactly one coefficient per checkpoint")
         if abs(sum(values) - 1.0) > 1e-9:
             raise ValueError(f"{name} coefficients must sum to 1, got {sum(values)}")
+
+    def weights_of(key):
+        return tensor_coefficients.get(key, coefficients)
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -692,7 +811,6 @@ def _merge(
     for source_index, source in enumerate(map(str, sources)):
         _validate_source_metadata(source, tensor_metadata)
         loaded = _load_assigned(source, assigned_tensors)
-        coefficient = coefficients[source_index]
         if sphere_merge:
             # Every rank joins this collective load, including ranks with no gains to load.
             gains = {
@@ -700,12 +818,14 @@ def _merge(
                 for key, value in _load_whole(source, gain_keys_to_load, all_metadata).items()
             }
             for key, gain in gains.items():
+                coefficient = weights_of(key)[source_index]
                 if source_index == 0:
                     gain_sums[key] = gain * coefficient
                 else:
                     gain_sums[key].add_(gain, alpha=coefficient)
             for group, (mode, gain_keys) in sphere_groups.items():
                 keys = groups[group]
+                coefficient = weights_of(group[0])[source_index]
                 bare = {}
                 for key in keys:
                     scale = _gain_scale(chunk_metadata[key], gains, gain_keys)
@@ -732,7 +852,7 @@ def _merge(
         for key, tensor in loaded.items():
             if tensor.is_floating_point():
                 is_router_state = key[0].rsplit(".", 1)[-1] in _ROUTER_STATE_TENSOR_NAMES
-                weights = router_coefficients if is_router_state else coefficients
+                weights = router_coefficients if is_router_state else weights_of(key[0])
                 weight = weights[source_index]
                 if source_index == 0:
                     accumulators[key] = tensor.float().mul_(weight)
@@ -1054,6 +1174,15 @@ def main():
         type=int,
         help="Last step before that decay (default: one interval before the first checkpoint).",
     )
+    wsm.add_argument(
+        "--source-decay-from-args",
+        action="store_true",
+        help=(
+            "Divide out the LR schedule the checkpoints were trained with, rebuilt from the saved "
+            "args of the newest checkpoint with Megatron's scheduler. Any --lr-decay-style works, "
+            "for example sqrt-bridge."
+        ),
+    )
     parser.add_argument(
         "--backend",
         choices=("gloo", "nccl"),
@@ -1067,8 +1196,13 @@ def main():
     if args.ema_bias_correction and args.method != "ema":
         parser.error("--ema-bias-correction needs --method ema")
     source_flags = (args.source_decay_steps, args.source_decay_end, args.source_decay_start)
-    if args.method != "wsm" and any(flag is not None for flag in (args.decay_end, *source_flags)):
+    if args.method != "wsm" and (
+        args.source_decay_from_args
+        or any(flag is not None for flag in (args.decay_end, *source_flags))
+    ):
         parser.error("--decay-end and --source-decay-* flags need --method wsm")
+    if args.source_decay_from_args and any(flag is not None for flag in source_flags):
+        parser.error("--source-decay-from-args replaces --source-decay-steps/end/start")
     if args.decay_end is None:
         args.decay_end = 1e-4
     if any(flag is not None for flag in source_flags):
@@ -1079,7 +1213,7 @@ def main():
         )
     else:
         source_decay = None
-    if args.update and source_decay is not None:
+    if args.update and (source_decay is not None or args.source_decay_from_args):
         parser.error("--source-decay-* cannot be used with --update")
     if args.update and not args.save_fp32:
         parser.error("--update always saves fp32; --no-save-fp32 is not supported with it")
@@ -1102,6 +1236,7 @@ def main():
         sources = resolve_sources(args.checkpoints, args.iterations)
         iterations = source_iterations(sources)
         metadata = {"method": args.method, "iterations": iterations}
+        tensor_coefficients = None
         if args.method == "mean":
             coefficients = mean_coefficients(len(sources))
         elif args.method == "ema":
@@ -1109,11 +1244,20 @@ def main():
             metadata["ema_alpha"] = args.ema_alpha
             metadata["ema_bias_correction"] = args.ema_bias_correction
         else:
-            coefficients = wsm_coefficients(len(sources), args.decay_end, source_decay, iterations)
+            if args.source_decay_from_args:
+                coefficients, tensor_coefficients, metadata["source_decay"] = (
+                    wsm_group_coefficients(sources, iterations, args.decay_end)
+                )
+            else:
+                coefficients = wsm_coefficients(
+                    len(sources), args.decay_end, source_decay, iterations
+                )
+                metadata["source_decay"] = asdict(source_decay) if source_decay else None
             metadata["decay_end"] = args.decay_end
-            metadata["source_decay"] = asdict(source_decay) if source_decay else None
         if dist.get_rank() == 0:
             print(f"> checkpoint coefficients: {coefficients}")
+            for name, values in (metadata.get("source_decay") or {}).get("groups", {}).items():
+                print(f">   {name}: {values}")
         merge_checkpoint_directories(
             sources,
             args.output,
@@ -1122,6 +1266,7 @@ def main():
             router_state=args.router_state,
             save_fp32=args.save_fp32,
             sphere_merge=args.sphere_merge,
+            tensor_coefficients=tensor_coefficients,
         )
     finally:
         if initialized_here and dist.is_initialized():
