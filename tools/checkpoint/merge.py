@@ -23,7 +23,10 @@ import torch.distributed as dist
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
-from megatron.core.dist_checkpointing.strategies.torch import _get_filesystem_reader
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistSaveShardedStrategy,
+    _get_filesystem_reader,
+)
 
 
 # Router load-balancing state (expert bias, quantile-balancing betas); see --router-state.
@@ -44,6 +47,8 @@ _GAIN_STATE = "optimizer.state."
 # A --sphere-merge running merge also saves how much each row of its bare direction shrank, so
 # the next --update can undo the rescaling.
 _SHRINK_STATE = "optimizer.state.sphere_shrink."
+# Merged tensors live on the GPU when there is one, so host memory holds only what is loading.
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Axes of a weight chunk that each gain covers. 2D weights are [out, in]; merged experts are
 # saved as [experts, in, out], with row gains [experts, out] and column gains [experts, in].
 _GAIN_AXES = {("row", 2): (0,), ("col", 2): (1,), ("row", 3): (0, 2), ("col", 3): (0, 1)}
@@ -166,7 +171,9 @@ def _assemble(parts, metas):
         max(meta.global_offset[axis] + meta.local_shape[axis] for meta in metas)
         for axis in range(ndim)
     )
-    whole = torch.empty([b - a for a, b in zip(start, stop)], dtype=torch.float32)
+    whole = torch.empty(
+        [b - a for a, b in zip(start, stop)], dtype=torch.float32, device=parts[0].device
+    )
     for part, meta in zip(parts, metas):
         whole[_chunk_index(meta, start)] = part
     return whole, start
@@ -366,7 +373,7 @@ def _load_whole(source, keys, metadata):
     """Load whole tensors (the small gain vectors). Several ranks may load the same tensor."""
     templates = {key: metadata[key].without_data() for key in keys}
     loaded = dist_checkpointing.load(templates, source, validate_access_integrity=False)
-    return {key: loaded[key].float() for key in keys}
+    return {key: loaded[key].to(_DEVICE).float() for key in keys}
 
 
 def _owner_map(items, world_size, size_fn):
@@ -900,7 +907,7 @@ def _merge(
                     scale = _gain_scale(chunk_metadata[key], gains, gain_keys)
                     # A zero gain leaves a zero weight; dividing it by inf keeps bare at zero.
                     divisor = scale.masked_fill(scale == 0, float("inf"))
-                    bare[key] = loaded.pop(key).float() / divisor
+                    bare[key] = loaded.pop(key).to(_DEVICE).float().div_(divisor)
                     shrink = shrinks.get(f"{_SHRINK_STATE}{group[0]}")
                     if shrink is not None:  # a running merge: undo its rescaling
                         meta = chunk_metadata[key]
@@ -926,9 +933,9 @@ def _merge(
                 weights = router_coefficients if is_router_state else weights_of(key[0])
                 weight = weights[source_index]
                 if source_index == 0:
-                    accumulators[key] = tensor.float().mul_(weight)
+                    accumulators[key] = tensor.to(_DEVICE).float().mul_(weight)
                 else:
-                    accumulators[key].add_(tensor, alpha=weight)
+                    accumulators[key].add_(tensor.to(_DEVICE), alpha=weight)
             elif source_index == 0:
                 static_tensors[key] = tensor.cpu().clone()
             elif not torch.equal(static_tensors[key], tensor.cpu()):
@@ -1001,9 +1008,13 @@ def _merge(
         for key, value in content_metadata.items()
         if not str(key).startswith("distrib_optim")
     }
+    # Copy each GPU tensor to the host only right before it is written.
+    strategy = TorchDistSaveShardedStrategy()
+    strategy.staging_mode = "streamed"
     dist_checkpointing.save(
         state_dict,
         str(checkpoint_dir),
+        sharded_strategy=strategy,
         validate_access_integrity=True,
         content_metadata=content_metadata,
     )
@@ -1179,6 +1190,8 @@ def _initialize_distributed(backend):
             job_id = int(os.environ["SLURM_JOB_ID"].split("_")[0])
             step_id = int(os.environ.get("SLURM_STEP_ID", "0"))
             os.environ["MASTER_PORT"] = str(20000 + (job_id + step_id) % 40000)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group(backend=backend)
     return True
 
