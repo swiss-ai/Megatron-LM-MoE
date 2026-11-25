@@ -1,0 +1,54 @@
+From 3be848d2436df05b9ac1f6061161818c467cdecb Mon Sep 17 00:00:00 2001
+From: davmels <davmelous@gmail.com>
+Date: Fri, 20 Nov 2026 12:52:54 +0100
+Subject: [PATCH] apertus2: embedding_norm (Megatron --embedding-norm) in the
+ provider, the HF config and the mapping
+
+Megachonk from iteration 90,000 on has an RMSNorm with a learnable gain on the embedding output, after
+the sqrt(hidden) scale. The HF config field embedding_norm switches it on in the provider; the weight
+maps embedding.embedding_norm.weight <-> model.embedding_norm.weight (first pipeline stage).
+---
+ src/megatron/bridge/models/apertus2/apertus2_bridge.py  | 4 ++++
+ src/megatron/bridge/models/apertus2/apertus2_mapping.py | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/src/megatron/bridge/models/apertus2/apertus2_bridge.py b/src/megatron/bridge/models/apertus2/apertus2_bridge.py
+index 23a0bb02..85e34bdb 100644
+--- a/src/megatron/bridge/models/apertus2/apertus2_bridge.py
++++ b/src/megatron/bridge/models/apertus2/apertus2_bridge.py
+@@ -296,6 +296,9 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
+             "add_qkv_bias": False,
+             "attention_output_gate": bool(getattr(hf_config, "attention_output_gate", False)),
+             "sandwich_norm": bool(getattr(hf_config, "sandwich_norm", False)),
++            # RMSNorm with a learnable gain on the embedding output, after the sqrt(hidden) scale
++            # (Megatron --embedding-norm; megachonk from iteration 90,000 on).
++            "embedding_norm": bool(getattr(hf_config, "embedding_norm", False)),
+             "scale_embeddings_by_sqrt_hidden": _multiplier_flag(
+                 embedding_multiplier, hidden_size**0.5, "embedding_multiplier"
+             ),
+@@ -476,6 +479,7 @@ class Apertus2Bridge(MegatronModelBridge[Any, Apertus2ModelProvider, GPTModel]):
+                 "topk_group": group_topk,
+                 "norm_topk_prob": topk > 1,
+                 "sandwich_norm": bool(getattr(provider, "sandwich_norm", False)),
++                "embedding_norm": bool(getattr(provider, "embedding_norm", False)),
+                 "moe_latent_size": getattr(provider, "moe_latent_size", None),
+                 "use_quantile_balancing": use_qb,
+                 "moe_router_quantile_balancing_method": qb_method,
+diff --git a/src/megatron/bridge/models/apertus2/apertus2_mapping.py b/src/megatron/bridge/models/apertus2/apertus2_mapping.py
+index 3f8d5edf..12b75a7a 100644
+--- a/src/megatron/bridge/models/apertus2/apertus2_mapping.py
++++ b/src/megatron/bridge/models/apertus2/apertus2_mapping.py
+@@ -239,6 +239,10 @@ def _model_mappings(config) -> MegatronMappingRegistry:
+         AutoMapping("output_layer.weight", "lm_head.weight"),
+         ReplicatedMapping("decoder.final_layernorm.weight", "model.norm.weight"),
+     ]
++    # RMSNorm with a learnable gain on the embedding output (Megatron --embedding-norm; megachonk from
++    # iteration 90,000 on), on the first pipeline stage.
++    if bool(getattr(config, "embedding_norm", False)):
++        mappings.append(ReplicatedMapping("embedding.embedding_norm.weight", "model.embedding_norm.weight"))
+     for index, layer_type in enumerate(layer_types):
+         layer = f"decoder.layers.{index}"
+         hf_layer = f"model.layers.{index}"
+-- 
+2.43.0
+

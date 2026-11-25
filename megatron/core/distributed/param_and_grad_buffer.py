@@ -8,7 +8,7 @@ import warnings
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -1343,11 +1343,21 @@ class _ParamAndGradBuffer:
             dp_cp_group=self.dp_cp_group,
         )
 
-    def scale_gradients(self, scaling_factor: float) -> None:
-        """Scale the gradient data by `scaling_factor`."""
-        self.grad_data *= scaling_factor
+    def scale_gradients(self, scaling_factor: Union[float, torch.Tensor]) -> None:
+        """Scale the gradient data by `scaling_factor`.
+
+        With --calculate-per-token-loss the factor is a CUDA tensor, while
+        --moe-offload-main-grad keeps some gradient buffers in host memory.
+        """
+
+        def _scalar_for(tensor: torch.Tensor):
+            if torch.is_tensor(scaling_factor):
+                return scaling_factor.to(tensor.device)
+            return scaling_factor
+
+        self.grad_data *= _scalar_for(self.grad_data)
         for grad in self.extra_main_grads:
-            grad *= scaling_factor
+            grad *= _scalar_for(grad)
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """

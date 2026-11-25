@@ -97,6 +97,24 @@ _metadata_fn: str = ".metadata"
 
 
 # dummy class needed to load mcore v0.15 checkpoints with optim. states
+
+_CPU_LOAD_GROUP = None
+
+
+def _cpu_load_group():
+    """Gloo group for torch.distributed.checkpoint's load planning.
+
+    On the default NCCL group, scatter_object_list puts every rank's pickled load plan into GPU memory on the
+    coordinator at once; for megachonk on 256 GPUs that ran rank 0 out of memory (KISTI jobs 1325717, 1325747).
+    MCORE_DCP_LOAD_GLOO=0 restores the default group.
+    """
+    global _CPU_LOAD_GROUP
+    if os.environ.get("MCORE_DCP_LOAD_GLOO", "1") == "0" or not torch.distributed.is_initialized():
+        return None
+    if _CPU_LOAD_GROUP is None:
+        _CPU_LOAD_GROUP = torch.distributed.new_group(backend="gloo")
+    return _CPU_LOAD_GROUP
+
 class MCoreMetadata:
     """ """
 
@@ -885,6 +903,7 @@ class TorchDistLoadShardedStrategy:
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
+            process_group=_cpu_load_group(),
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
