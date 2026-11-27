@@ -131,8 +131,13 @@ Add to the training command (`EXTRA_NETWORK_ARGS` in the size script):
 
 `--save-topk-logits-k` (default 256) and `--save-topk-logits-clip` (default 16.0) are optional.
 Saving is skipped, with a warning, with CUDA graphs on, MoE EP overlap on, or the TE cross-entropy
-implementation. The background writer has no backpressure: if the filesystem cannot absorb about
-0.5 GB per rank per iteration, queued writes accumulate in host memory.
+implementation. Each rank allows one background write at a time and waits for it before assembling
+the next dump. Slow storage can therefore stall a sampled step. Training waits for the final write
+before exiting.
+
+The output filesystem must support hard links. A dump is published atomically and writing to an
+existing iteration/rank file raises an error. Use a separate output directory when rerunning steps
+whose dumps already exist.
 
 ## Tests
 

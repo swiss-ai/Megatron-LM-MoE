@@ -6,13 +6,16 @@ python tests/unit_tests/transformer/test_topk_logit_saving_cpu.py
 """
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import os
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 import tempfile
 from typing import Tuple
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -52,6 +55,68 @@ class TopKLogitSavingTest(unittest.TestCase):
     def tearDown(self):
         saving.set_active(False)
         saving.wait()
+
+    def test_flush_waits_for_previous_write_before_concatenating(self):
+        logits = torch.tensor([[[1.0, 2.0, 3.0]]])
+        target = torch.tensor([[0]])
+        write_started = Event()
+        release_write = Event()
+        flush_waiting = Event()
+        write = saving._write
+        wait = saving.wait
+
+        def blocked_write(path, arrays):
+            if int(arrays["step"]) == 1:
+                write_started.set()
+                if not release_write.wait(timeout=10):
+                    raise TimeoutError("test did not release the first write")
+            write(path, arrays)
+
+        def observe_wait():
+            flush_waiting.set()
+            wait()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            saving, "_write", side_effect=blocked_write
+        ), ThreadPoolExecutor(max_workers=1) as caller:
+            run_step(logits, target, None, k=2, clip=16.0)
+            first_path = saving.flush(1, tmp, 0)
+            try:
+                self.assertTrue(write_started.wait(timeout=5))
+                run_step(logits, target, None, k=2, clip=16.0)
+                with patch.object(saving, "wait", side_effect=observe_wait), patch.object(
+                    saving.torch, "cat", wraps=torch.cat
+                ) as concatenate:
+                    second_flush = caller.submit(saving.flush, 2, tmp, 0)
+                    self.assertTrue(flush_waiting.wait(timeout=5))
+                    self.assertFalse(second_flush.done())
+                    concatenate.assert_not_called()
+                    self.assertFalse((Path(tmp) / "iter_0000002").exists())
+                    release_write.set()
+                    second_path = second_flush.result(timeout=5)
+            finally:
+                release_write.set()
+                saving.wait()
+
+            self.assertEqual(saving.decode(first_path)["step"], 1)
+            self.assertEqual(saving.decode(second_path)["step"], 2)
+
+    def test_existing_dump_is_preserved_and_collision_is_reported(self):
+        logits = torch.tensor([[[1.0, 2.0, 3.0]]])
+        with tempfile.TemporaryDirectory() as tmp:
+            run_step(logits, torch.tensor([[0]]), None, k=2, clip=16.0)
+            path = Path(saving.flush(7, tmp, 3))
+            saving.wait()
+            original_bytes = path.read_bytes()
+
+            run_step(logits + 10, torch.tensor([[1]]), None, k=2, clip=16.0)
+            self.assertEqual(Path(saving.flush(7, tmp, 3)), path)
+            with self.assertRaises(FileExistsError) as collision:
+                saving.wait()
+
+            self.assertEqual(collision.exception.filename, str(path))
+            self.assertEqual(path.read_bytes(), original_bytes)
+            self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_schedule(self):
         steps = [s for s in range(1, 41) if saving.should_save(s, 20, 3)]

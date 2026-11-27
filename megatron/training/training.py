@@ -3901,6 +3901,8 @@ def train(
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
 
+    topk_logit_saving.wait()
+
     ft_integration.on_checkpointing_start()
     # This will finalize all unfinalized async request and terminate
     # a persistent async worker if persistent ckpt worker is enabled

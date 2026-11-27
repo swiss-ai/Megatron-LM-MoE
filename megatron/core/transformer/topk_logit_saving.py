@@ -27,12 +27,13 @@ survive the forward, and the per-microbatch results are moved to the host immedi
 """
 
 import atexit
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import wraps
 import math
 import os
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -48,7 +49,7 @@ _vocab = 0
 _batch = 1
 _micro = 0
 _writer: Optional[ThreadPoolExecutor] = None
-_futures: list = []
+_write_future: Optional[Future] = None
 # Rows per top-k tile: bounds the sort workspace, not the (already allocated) logits.
 _TILE_ELEMENTS = 33554432
 
@@ -286,15 +287,27 @@ def record(
 
 
 def _write(path: str, arrays: Dict[str, np.ndarray]) -> None:
-    tmp = path + ".tmp.npz"
-    np.savez(tmp, **arrays)
-    os.replace(tmp, path)
+    tmp = f"{path}.{uuid4().hex}.tmp"
+    output = open(tmp, "xb")
+    try:
+        with output:
+            np.savez(output, **arrays)
+        # Publish the complete file atomically. link() fails if a writer already published path.
+        try:
+            os.link(tmp, path)
+        except FileExistsError as error:
+            raise FileExistsError(error.errno, "Top-k logit dump already exists", path) from error
+    finally:
+        os.unlink(tmp)
 
 
 def flush(step: int, out_dir: str, rank: int) -> Optional[str]:
     """Write this step's tokens as one file per rank (in the background) and clear the buffer."""
+    global _writer, _write_future
     if not _pending:
         return None
+    # Wait before allocating the concatenated arrays so queued dumps cannot accumulate.
+    wait()
     arrays = {name: torch.cat([p[name] for p in _pending]).numpy() for name in _pending[0]}
     arrays.update(
         step=np.int64(step),
@@ -307,18 +320,22 @@ def flush(step: int, out_dir: str, rank: int) -> Optional[str]:
     step_dir = os.path.join(out_dir, f"iter_{step:07d}")
     os.makedirs(step_dir, exist_ok=True)
     path = os.path.join(step_dir, f"rank_{rank:05d}.npz")
-    global _writer
     if _writer is None:
         _writer = ThreadPoolExecutor(max_workers=1)
         atexit.register(wait)
-    _futures.append(_writer.submit(_write, path, arrays))
+    _write_future = _writer.submit(_write, path, arrays)
     return path
 
 
 def wait() -> None:
-    """Block until queued writes finish; raises the first write error."""
-    while _futures:
-        _futures.pop(0).result()
+    """Wait for the outstanding dump and surface any write error."""
+    global _write_future
+    if _write_future is not None:
+        try:
+            _write_future.result()
+        finally:
+            if _write_future.done():
+                _write_future = None
 
 
 def decode(path: str) -> Dict[str, np.ndarray]:
