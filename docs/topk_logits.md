@@ -135,9 +135,9 @@ implementation. Each rank allows one background write at a time and waits for it
 the next dump. Slow storage can therefore stall a sampled step. Training waits for the final write
 before exiting.
 
-The output filesystem must support hard links. A dump is published atomically and writing to an
-existing iteration/rank file raises an error. Use a separate output directory when rerunning steps
-whose dumps already exist.
+Each completed dump is published atomically. If checkpoint replay regenerates the same
+iteration/rank file, the new dump replaces the previous one. Use separate output directories
+to keep dumps from different runs.
 
 ## Tests
 

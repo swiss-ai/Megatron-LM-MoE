@@ -101,7 +101,22 @@ class TopKLogitSavingTest(unittest.TestCase):
             self.assertEqual(saving.decode(first_path)["step"], 1)
             self.assertEqual(saving.decode(second_path)["step"], 2)
 
-    def test_existing_dump_is_preserved_and_collision_is_reported(self):
+    def test_replay_replaces_existing_dump(self):
+        logits = torch.tensor([[[1.0, 2.0, 3.0]]])
+        with tempfile.TemporaryDirectory() as tmp:
+            run_step(logits, torch.tensor([[0]]), None, k=2, clip=16.0)
+            path = Path(saving.flush(7, tmp, 3))
+            saving.wait()
+            self.assertEqual(saving.decode(path)["labels"].tolist(), [0])
+
+            run_step(logits + 10, torch.tensor([[1]]), None, k=2, clip=16.0)
+            self.assertEqual(Path(saving.flush(7, tmp, 3)), path)
+            saving.wait()
+
+            self.assertEqual(saving.decode(path)["labels"].tolist(), [1])
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_failed_replay_preserves_existing_dump(self):
         logits = torch.tensor([[[1.0, 2.0, 3.0]]])
         with tempfile.TemporaryDirectory() as tmp:
             run_step(logits, torch.tensor([[0]]), None, k=2, clip=16.0)
@@ -109,12 +124,16 @@ class TopKLogitSavingTest(unittest.TestCase):
             saving.wait()
             original_bytes = path.read_bytes()
 
-            run_step(logits + 10, torch.tensor([[1]]), None, k=2, clip=16.0)
-            self.assertEqual(Path(saving.flush(7, tmp, 3)), path)
-            with self.assertRaises(FileExistsError) as collision:
-                saving.wait()
+            def fail_mid_write(output, **arrays):
+                output.write(b"incomplete dump")
+                raise OSError("simulated write failure")
 
-            self.assertEqual(collision.exception.filename, str(path))
+            run_step(logits, torch.tensor([[1]]), None, k=2, clip=16.0)
+            with patch.object(saving.np, "savez", side_effect=fail_mid_write):
+                saving.flush(7, tmp, 3)
+                with self.assertRaisesRegex(OSError, "simulated write failure"):
+                    saving.wait()
+
             self.assertEqual(path.read_bytes(), original_bytes)
             self.assertEqual(list(path.parent.iterdir()), [path])
 

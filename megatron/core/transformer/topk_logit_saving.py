@@ -292,13 +292,11 @@ def _write(path: str, arrays: Dict[str, np.ndarray]) -> None:
     try:
         with output:
             np.savez(output, **arrays)
-        # Publish the complete file atomically. link() fails if a writer already published path.
-        try:
-            os.link(tmp, path)
-        except FileExistsError as error:
-            raise FileExistsError(error.errno, "Top-k logit dump already exists", path) from error
-    finally:
+        # A checkpoint replay can regenerate a dump for the same iteration and rank.
+        os.replace(tmp, path)
+    except BaseException:
         os.unlink(tmp)
+        raise
 
 
 def flush(step: int, out_dir: str, rank: int) -> Optional[str]:
